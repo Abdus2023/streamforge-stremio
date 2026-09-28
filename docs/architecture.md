@@ -23993,3 +23993,1366 @@ ARTIFACT STATUS       = NOT BOUND
 
 because none of these gates has yet been demonstrated by an actual CI
 execution in this conversation.
+
+## 610. Next: turn the addon into a real platform
+
+We have now defined:
+
+```text
+Identity
+Metadata
+Catalog
+Streams
+Subtitles
+Provider admission
+Provider runtime
+Evidence
+Caching
+Security
+Observability
+```
+
+The next problem is no longer another Stremio endpoint.
+
+It is the **platform control plane**:
+
+How do providers, policies, configuration, evidence, versions, and
+runtime state become one governed system without collapsing into a
+giant plugin manager?
+
+## 611. Control plane vs data plane
+
+Separate the architecture into two planes.
+
+```text
+                    ADDON PLATFORM
+                          │
+              ┌───────────┴───────────┐
+              │                       │
+        CONTROL PLANE             DATA PLANE
+              │                       │
+        declarations              requests
+        admission                 resolution
+        configuration              providers
+        policy                    candidates
+        registry                  metadata
+        lifecycle                 subtitles
+        evidence                  catalog
+        health
+```
+
+The distinction is fundamental.
+
+### Control plane
+
+Answers:
+
+```text
+What providers exist?
+Which are admitted?
+What capabilities do they declare?
+What policies apply?
+What configuration is active?
+What version is running?
+```
+
+### Data plane
+
+Answers:
+
+```text
+Given this request, what can the system return?
+```
+
+A stream request should not modify provider admission.
+
+## 612. Runtime registry
+
+The registry becomes a snapshot of admitted configuration.
+
+```ts
+interface RuntimeRegistry {
+  readonly generation: string;
+
+  readonly sources: readonly SourceAdapter[];
+
+  readonly metadata: readonly MetadataProvider[];
+
+  readonly subtitles: readonly SubtitleProvider[];
+
+  readonly catalogs: readonly CatalogProvider[];
+}
+```
+
+The critical addition is:
+
+```text
+generation
+```
+
+## 613. Configuration generation
+
+Suppose the operator changes:
+
+```text
+source A enabled
+```
+
+to:
+
+```text
+source A disabled
+```
+
+Requests already executing should not unpredictably observe half of
+the old configuration and half of the new one.
+
+Instead:
+
+```text
+Generation 41
+    │
+    ├── request A
+    ├── request B
+    └── request C
+
+configuration update
+
+Generation 42
+    │
+    ├── request D
+    └── request E
+```
+
+Each request gets a stable runtime snapshot.
+
+## 614. Immutable runtime snapshot
+
+```ts
+interface RuntimeSnapshot {
+  readonly generation: string;
+
+  readonly createdAt: string;
+
+  readonly sources: readonly AdmittedSource[];
+
+  readonly metadata: readonly AdmittedMetadataProvider[];
+
+  readonly subtitles: readonly AdmittedSubtitleProvider[];
+
+  readonly catalogs: readonly AdmittedCatalogProvider[];
+
+  readonly policy: RuntimePolicy;
+}
+```
+
+Once published:
+
+```text
+RuntimeSnapshot
+```
+
+is immutable.
+
+This makes request behavior much easier to reason about.
+
+## 615. Atomic configuration replacement
+
+The control plane should produce:
+
+```text
+Candidate Configuration
+        ↓
+Schema validation
+        ↓
+Provider declaration validation
+        ↓
+Admission evaluation
+        ↓
+Policy validation
+        ↓
+RuntimeSnapshot
+        ↓
+ATOMIC PUBLISH
+```
+
+Never:
+
+```text
+modify provider A
+modify provider B
+modify provider C
+...
+```
+
+incrementally in the live registry.
+
+That creates mixed generations.
+
+## 616. Configuration transaction
+
+Conceptually:
+
+```ts
+interface ConfigurationTransaction {
+  readonly baseGeneration: string;
+
+  readonly proposedGeneration: string;
+
+  validate(): Promise<ConfigurationValidation>;
+
+  commit(): Promise<RuntimeSnapshot>;
+}
+```
+
+The commit operation should fail if:
+
+```text
+baseGeneration !== currentlyPublishedGeneration
+```
+
+This gives us optimistic concurrency control.
+
+## 617. Configuration is not policy
+
+Keep:
+
+```text
+Configuration
+```
+
+separate from:
+
+```text
+Policy
+```
+
+For example:
+
+```text
+configuration:
+  timeout = 5000ms
+
+policy:
+  unauthorized candidate = reject
+```
+
+Changing the timeout does not redefine authorization.
+
+## 618. Runtime policy
+
+```ts
+interface RuntimePolicy {
+  readonly candidateAuthorization: "required";
+
+  readonly allowUnknownAuthorization: false;
+
+  readonly allowHttpPlayback: boolean;
+
+  readonly maxCatalogPageSize: number;
+
+  readonly maxCandidateCount: number;
+
+  readonly maxRedirects: number;
+}
+```
+
+Again, these values are illustrative.
+
+The architecture should not hard-code them as universally correct
+production settings.
+
+## 619. Policy evaluation
+
+Policy should ideally be pure:
+
+```ts
+evaluateCandidatePolicy(candidate, policy): PolicyDecision;
+```
+
+Result:
+
+```ts
+interface PolicyDecision {
+  readonly allowed: boolean;
+
+  readonly reasons: readonly string[];
+}
+```
+
+Therefore:
+
+```text
+same candidate + same policy = same decision
+```
+
+This becomes testable.
+
+## 620. Policy layering
+
+There should not be one giant policy function.
+
+Use layers:
+
+```text
+Global policy
+      ↓
+Resource policy
+      ↓
+Provider policy
+      ↓
+Request policy
+      ↓
+Candidate policy
+```
+
+Example:
+
+```text
+global:
+  unknown authorization rejected
+
+source:
+  HTTP forbidden
+
+request:
+  preferred language = fr
+
+candidate:
+  direct playback = true
+```
+
+Each layer has a defined responsibility.
+
+## 621. Policy precedence
+
+Conflicts must be deterministic.
+
+For security-sensitive rules:
+
+```text
+DENY
+  overrides ALLOW
+```
+
+For preference rules:
+
+```text
+specific preference
+  overrides default preference
+```
+
+Do not use an implicit "last configuration wins" model for security
+decisions.
+
+## 622. Feature flags
+
+Feature flags should not silently bypass gates.
+
+Bad:
+
+```text
+ENABLE_UNSAFE_SOURCE=true
+```
+
+Better:
+
+```text
+feature:
+  subtitle-v1 = enabled
+
+admission:
+  provider must still satisfy authorization
+```
+
+A feature flag can enable a capability.
+
+It should not manufacture authorization.
+
+## 623. Operator configuration
+
+Separate secrets from ordinary configuration.
+
+```text
+config/
+    public settings
+    policy
+
+secrets/
+    API tokens
+    credentials
+```
+
+Never put secrets into:
+
+```text
+manifest
+logs
+candidate provenance
+receipts
+catalog entries
+error messages
+```
+
+## 624. Secret provider boundary
+
+```ts
+interface SecretProvider {
+  get(secretRef: string): Promise<string>;
+}
+```
+
+Providers receive scoped access:
+
+```text
+SourceCredentialProvider
+```
+
+rather than:
+
+```text
+process.env
+```
+
+directly.
+
+This prevents adapters from becoming configuration authorities.
+
+## 625. Secret references
+
+Configuration contains:
+
+```json
+{
+  "credentialRef": "secret://owned-media/token"
+}
+```
+
+not:
+
+```json
+{
+  "token": "actual-secret"
+}
+```
+
+The runtime resolves the reference only when necessary.
+
+## 626. Secret redaction
+
+Create one canonical redactor.
+
+```ts
+interface SecretRedactor {
+  redact(value: unknown): unknown;
+}
+```
+
+Redaction should apply to:
+
+```text
+logs
+errors
+receipts
+diagnostics
+metrics labels
+HTTP headers
+URLs
+```
+
+Especially:
+
+```text
+Authorization
+Cookie
+Set-Cookie
+API keys
+Bearer tokens
+signed URLs
+```
+
+## 627. Signed URLs
+
+This creates an important distinction.
+
+A playback URL may itself contain sensitive authorization material:
+
+```text
+https://media.example/path?token=...
+```
+
+Therefore:
+
+```text
+candidate.url
+```
+
+can be usable by Stremio but must not necessarily be persisted in
+plaintext.
+
+The system may need:
+
+```ts
+interface CandidateEvidence {
+  readonly urlFingerprint: string;
+  readonly urlStored: boolean;
+}
+```
+
+rather than storing the raw URL in long-lived evidence.
+
+## 628. URL fingerprint
+
+For evidence:
+
+```text
+sha256(canonicalPlaybackURL)
+```
+
+can identify that two observations refer to the same URL without
+persisting the URL itself.
+
+But this fingerprint is not reversible proof of ownership or
+authorization.
+
+It is merely an identifier.
+
+## 629. Receipt architecture
+
+We now have several receipts:
+
+```text
+IdentityReceipt
+SourceExecutionReceipt
+MetadataReceipt
+SubtitleReceipt
+CatalogIngestionReceipt
+```
+
+Introduce a common envelope:
+
+```ts
+interface ReceiptEnvelope {
+  readonly receiptId: string;
+
+  readonly requestId?: string;
+
+  readonly generation: string;
+
+  readonly createdAt: string;
+
+  readonly kind: string;
+
+  readonly schemaVersion: string;
+}
+```
+
+Then subsystem-specific payloads remain strongly typed.
+
+## 630. Receipt ≠ truth
+
+This distinction should remain explicit:
+
+```text
+Receipt
+  = record that an operation/observation occurred
+
+Receipt
+  ≠ proof that the underlying claim is true
+```
+
+For example:
+
+```text
+"provider returned URL X"
+```
+
+is an observable fact.
+
+It does not prove:
+
+```text
+"URL X is legally authorized"
+```
+
+unless authorization evidence independently establishes that.
+
+## 631. Evidence IDs
+
+Evidence should have stable identifiers.
+
+```ts
+interface EvidenceRef {
+  readonly evidenceId: string;
+
+  readonly kind: string;
+
+  readonly digest: string;
+}
+```
+
+The digest should be calculated over a canonical representation.
+
+This is where the earlier evidence architecture becomes useful.
+
+## 632. Canonical evidence representation
+
+Conceptually:
+
+```text
+Observation
+   ↓
+Normalize
+   ↓
+Canonical serialization
+   ↓
+Digest
+   ↓
+EvidenceRecord
+```
+
+Avoid:
+
+```text
+JSON.stringify(object)
+```
+
+as a long-term canonicalization specification.
+
+Property ordering and representation details need an explicit
+canonicalization contract.
+
+## 633. Evidence envelope
+
+Separate:
+
+```text
+core fact
+```
+
+from:
+
+```text
+execution environment
+```
+
+For example:
+
+```ts
+interface EvidenceRecord<T> {
+  readonly core: T;
+
+  readonly evidenceId: string;
+
+  readonly algorithm: "sha256";
+
+  readonly observedAt: string;
+
+  readonly source: string;
+
+  readonly envelope?: {
+    readonly requestId?: string;
+    readonly generation?: string;
+    readonly runtimeVersion?: string;
+  };
+}
+```
+
+The core should remain deterministic.
+
+The envelope may vary between executions.
+
+## 634. Evidence levels
+
+We can now formalize statuses:
+
+```text
+OBSERVED
+DERIVED
+VERIFIED
+ANNOTATED
+```
+
+### OBSERVED
+
+Provider directly returned it.
+
+### DERIVED
+
+The system computed it.
+
+### VERIFIED
+
+An explicit verification procedure succeeded.
+
+### ANNOTATED
+
+A human/operator supplied additional context.
+
+These should never be silently collapsed.
+
+## 635. Example
+
+Provider returns:
+
+```text
+title = "Example Movie"
+```
+
+The system computes:
+
+```text
+normalizedTitle = "example movie"
+```
+
+An identity resolver establishes:
+
+```text
+IMDb tt1234567 ↔ TMDB 999
+```
+
+An operator supplies:
+
+```text
+source is operator-owned
+```
+
+The resulting evidence graph is:
+
+```text
+title
+  OBSERVED
+
+normalizedTitle
+  DERIVED
+
+identity mapping
+  VERIFIED
+
+ownership declaration
+  ANNOTATED / VERIFIED
+  depending on actual verification
+```
+
+The system must preserve these distinctions.
+
+## 636. Evidence graph
+
+The graph becomes:
+
+```text
+                         REQUEST
+                            │
+                            ▼
+                       OBSERVATION
+                            │
+                  ┌─────────┼─────────┐
+                  ▼         ▼         ▼
+              Identity   Metadata   Source
+              Evidence   Evidence   Evidence
+                  │         │         │
+                  └─────────┼─────────┘
+                            ▼
+                        DERIVATION
+                            │
+                 ┌──────────┼──────────┐
+                 ▼          ▼          ▼
+              Canonical   Catalog   Candidates
+                Media      View
+```
+
+This is the basis for reproducibility.
+
+## 637. Deterministic replay
+
+Now introduce replay.
+
+```ts
+interface ReplayInput {
+  readonly request: unknown;
+
+  readonly generation: string;
+
+  readonly evidence: readonly EvidenceRef[];
+}
+```
+
+Replay should answer:
+
+Given the same input evidence and the same algorithm version, does the
+derived result remain identical?
+
+This is different from rerunning external providers.
+
+## 638. Replay ≠ re-fetch
+
+Very important:
+
+```text
+REPLAY
+    uses recorded evidence
+
+LIVE EXECUTION
+    queries providers
+```
+
+A replay must not silently contact the Internet.
+
+Otherwise it ceases to be deterministic replay.
+
+## 639. Pure resolver core
+
+This suggests splitting resolution into:
+
+```text
+LIVE ADAPTERS
+     │
+     ▼
+OBSERVATIONS
+     │
+     ▼
+PURE CORE
+     │
+     ▼
+DERIVED RESULT
+```
+
+The pure core performs:
+
+```text
+validation
+authorization
+dedupe
+ranking
+reconciliation
+```
+
+This dramatically improves testing.
+
+## 640. Functional core / imperative shell
+
+The architecture is now:
+
+```text
+             IMPERATIVE SHELL
+       HTTP / network / clocks / storage
+                      │
+                      ▼
+               OBSERVATIONS
+                      │
+                      ▼
+               FUNCTIONAL CORE
+         validation / policy / ranking
+                      │
+                      ▼
+                 DERIVED VIEW
+```
+
+This is particularly compatible with the user's evidence-first model.
+
+## 641. Resolver kernel
+
+Extract a pure kernel:
+
+```ts
+interface ResolverKernel {
+  resolve(input: ResolverKernelInput): ResolverKernelOutput;
+}
+```
+
+Input:
+
+```ts
+interface ResolverKernelInput {
+  readonly media: CanonicalMedia;
+
+  readonly candidates: readonly SourceCandidate[];
+
+  readonly policy: RuntimePolicy;
+
+  readonly preferences: ResolutionPreferences;
+}
+```
+
+Output:
+
+```ts
+interface ResolverKernelOutput {
+  readonly accepted: readonly SourceCandidate[];
+
+  readonly rejected: readonly CandidateRejection[];
+
+  readonly ranking: readonly RankingDecision[];
+}
+```
+
+No:
+
+```text
+fetch
+clock
+randomness
+database
+logger
+environment
+```
+
+inside the kernel.
+
+## 642. Candidate rejection evidence
+
+Instead of simply:
+
+```ts
+return [];
+```
+
+preserve rejection reasons internally:
+
+```ts
+interface CandidateRejection {
+  readonly candidateId: string;
+
+  readonly reason:
+    | "invalid_url"
+    | "unauthorized"
+    | "not_direct_playback"
+    | "unsupported_media"
+    | "network_policy"
+    | "duplicate";
+}
+```
+
+This allows diagnostics without exposing sensitive details to
+Stremio.
+
+## 643. Public vs internal result
+
+Internally:
+
+```text
+accepted
+rejected
+failures
+evidence
+ranking
+```
+
+Externally:
+
+```json
+{
+  "streams": [
+    {
+      "name": "authorized-source",
+      "title": "1080p · mp4",
+      "url": "..."
+    }
+  ]
+}
+```
+
+The protocol response should remain deliberately small.
+
+## 644. Security boundary
+
+We can now identify the principal trust boundaries:
+
+```text
+Stremio client
+      │
+      │ untrusted request
+      ▼
+Protocol parser
+      │
+      ▼
+Application
+      │
+      │ controlled
+      ▼
+Provider runtime
+      │
+      │ untrusted provider data
+      ▼
+Validation / policy
+      │
+      ▼
+Derived result
+```
+
+Provider responses should be treated as hostile input.
+
+## 645. Threat model
+
+At minimum, consider:
+
+| Threat | Boundary |
+| --- | --- |
+| malformed Stremio request | protocol |
+| provider response injection | adapter |
+| SSRF | network runtime |
+| redirect abuse | HTTP runtime |
+| secret leakage | credential/logging |
+| malicious subtitle file | auxiliary runtime |
+| excessive catalog page | protocol |
+| provider amplification | rate/concurrency |
+| stale authorization | admission |
+| cache poisoning | cache |
+| identity collision | identity |
+| ranking manipulation | reconciliation/ranking |
+| replay inconsistency | evidence/core |
+
+## 646. Provider sandboxing
+
+The next architectural question is stronger isolation.
+
+A TypeScript provider running in-process can potentially access
+things that the interface does not formally expose if the
+implementation is compromised.
+
+Therefore:
+
+```text
+Level 1 in-process interfaces
+Level 2 restricted runtime
+Level 3 worker/process isolation
+Level 4 container isolation
+```
+
+Do not jump directly to Level 4.
+
+The appropriate isolation level depends on the provider trust model.
+
+## 647. Trusted vs untrusted providers
+
+Define:
+
+```ts
+type ProviderTrust = "operator_trusted" | "reviewed" | "untrusted";
+```
+
+Then admission can require:
+
+```text
+untrusted provider
+   + in-process execution
+   = rejected
+```
+
+if the deployment policy requires isolation.
+
+## 648. Provider package boundary
+
+A provider package should ideally export only:
+
+```text
+declareProvider()
+```
+
+rather than arbitrary runtime hooks.
+
+For example:
+
+```ts
+interface ProviderModule {
+  readonly declaration: SourceDeclaration;
+
+  create(dependencies: ProviderDependencies): SourceAdapter;
+}
+```
+
+This makes the provider construction boundary explicit.
+
+## 649. Dependency injection
+
+Provider dependencies should be explicit:
+
+```ts
+interface ProviderDependencies {
+  readonly http: SourceHttpClient;
+
+  readonly credentials: SourceCredentialProvider;
+
+  readonly clock: Clock;
+
+  readonly logger: ProviderLogger;
+}
+```
+
+No hidden globals.
+
+No:
+
+```text
+process.env
+global.fetch
+Date.now()
+console.log()
+```
+
+inside provider implementations.
+
+## 650. Clock boundary
+
+Introduce:
+
+```ts
+interface Clock {
+  now(): string;
+  nowMs(): number;
+}
+```
+
+Production:
+
+```text
+SystemClock
+```
+
+Tests:
+
+```text
+FakeClock
+```
+
+Replay:
+
+```text
+ReplayClock
+```
+
+This eliminates a major source of nondeterminism.
+
+## 651. Randomness boundary
+
+If ranking or IDs ever require randomness:
+
+```ts
+interface RandomSource {
+  bytes(length: number): Uint8Array;
+}
+```
+
+But deterministic core algorithms should preferably require no
+randomness at all.
+
+Receipt IDs can be generated at the shell boundary.
+
+## 652. ID generation
+
+Separate:
+
+```text
+identity
+```
+
+from:
+
+```text
+receipt ID
+```
+
+from:
+
+```text
+candidate ID
+```
+
+A candidate ID should be deterministic where possible:
+
+```text
+hash(
+  canonical media key
+  +
+  canonical URL
+  +
+  provider
+)
+```
+
+This improves deduplication and replay.
+
+## 653. Candidate identity
+
+Define:
+
+```ts
+function candidateKey(candidate: SourceCandidate): string {
+  return hashCanonical({
+    sourceId: candidate.sourceId,
+    media: candidate.media,
+    url: canonicalizeUrl(candidate.url)
+  });
+}
+```
+
+Then:
+
+```text
+candidateKey(A) === candidateKey(B)
+```
+
+means they represent the same candidate under the declared
+canonicalization rules.
+
+It does **not** mean the two provider observations were identical in
+every respect.
+
+## 654. Observation identity vs entity identity
+
+This distinction is now central:
+
+```text
+Observation ID
+    ↓
+identifies an observation
+
+Candidate ID
+    ↓
+identifies a derived candidate
+
+Canonical Media ID
+    ↓
+identifies an application-level media entity
+```
+
+Three namespaces.
+
+Never reuse one as another.
+
+## 655. Namespace discipline
+
+A good identifier format:
+
+```text
+evidence:sha256:...
+candidate:sha256:...
+media:...
+receipt:...
+generation:...
+```
+
+This makes accidental cross-domain use easier to detect.
+
+## 656. The complete control/data architecture
+
+```text
+                         CONTROL PLANE
+                               │
+              ┌────────────────┼────────────────┐
+              ▼                ▼                ▼
+        Configuration        Policy          Admission
+              │                │                │
+              └────────────────┼────────────────┘
+                               ▼
+                        RuntimeSnapshot
+                               │
+ ══════════════════════════════╪══════════════════════════════
+                               │
+                           DATA PLANE
+                               │
+                             Request
+                               │
+                               ▼
+                            Identity
+                               │
+                               ▼
+                        CanonicalMedia
+                               │
+             ┌─────────────────┼─────────────────┐
+             ▼                 ▼                 ▼
+          Catalog           Metadata          Playback
+                                                 │
+                                           ┌─────┴─────┐
+                                           ▼           ▼
+                                        Streams     Subtitles
+             │                 │                 │
+             └─────────────────┼─────────────────┘
+                               ▼
+                           Observations
+                               │
+                               ▼
+                        Functional Core
+                               │
+                               ▼
+                          Derived Views
+                               │
+                               ▼
+                            Stremio
+```
+
+## 657. The project has crossed another boundary
+
+Originally the project looked like:
+
+```text
+Stremio addon
+    ↓
+multiple stream sources
+```
+
+It has now become:
+
+```text
+                         Media Resolution Platform
+                                   │
+         ┌─────────────────────────┼─────────────────────────┐
+         ▼                         ▼                         ▼
+    Control Plane             Evidence Plane            Data Plane
+         │                         │                         │
+  configuration               observations               requests
+  admission                    receipts                 resolution
+  policy                       provenance                providers
+  lifecycle                    replay                    projections
+         │                         │                         │
+         └─────────────────────────┼─────────────────────────┘
+                                   ▼
+                               Stremio
+```
+
+That is the point at which the architecture becomes reusable beyond
+Stremio.
+
+Stremio becomes **one protocol frontend**, rather than the
+architecture itself.
+
+## 658. Next architectural milestone
+
+The next major step should therefore be:
+
+### **Protocol-neutral Media API**
+
+Instead of letting the application be structurally shaped by Stremio:
+
+```text
+Stremio → application
+```
+
+we invert the dependency:
+
+```text
+                         Media Platform
+                               │
+              ┌────────────────┼────────────────┐
+              ▼                ▼                ▼
+           Stremio          REST/JSON          CLI
+           adapter           API              tools
+```
+
+All three consume the same application contracts.
+
+That gives us:
+
+```text
+Stremio ≠ domain
+HTTP ≠ domain
+SDK ≠ domain
+```
+
+and opens the path toward a genuine **Popcorn-Time-style user
+experience without making Stremio the system's internal model**.
+
+The next section should define that protocol-neutral API, including
+its resource model, error algebra, pagination, request IDs,
+authorization boundaries, idempotency, versioning, and compatibility
+strategy.
