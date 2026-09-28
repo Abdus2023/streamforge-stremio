@@ -19029,3 +19029,1207 @@ That is where the abstract contracts become an actual runnable
 source, while keeping the source implementation replaceable by a
 licensed API, public-domain repository, or another explicitly
 authorized backend later.
+
+## 474. Concrete Source: `OwnedMediaAdapter`
+
+We can now implement the first non-fixture source without weakening
+any of the boundaries established above.
+
+The source is deliberately narrow:
+
+**A media library controlled by the operator, exposing an explicit
+index of authorized assets and playback URLs.**
+
+It is not a web scraper, torrent indexer, or generic Internet stream
+finder.
+
+The architecture becomes:
+
+```text
+                     Stremio
+                         │
+                         ▼
+                  Stream Handler
+                         │
+                         ▼
+                 Resolution Service
+                         │
+                         ▼
+                  CanonicalMedia
+                         │
+                         ▼
+                OwnedMediaAdapter
+                         │
+               ┌─────────┴─────────┐
+               ▼                   ▼
+        Library Identity       Library Assets
+            Index                  Index
+               │                   │
+               └─────────┬─────────┘
+                         ▼
+                  SourceCandidate
+                         │
+                         ▼
+                   Stremio URL
+```
+
+## 475. Library index contract
+
+The adapter should not know how the library stores its data.
+
+Define an application-facing repository:
+
+```ts
+export interface MediaLibrary {
+  findAssets(
+    canonicalId: string,
+    signal: AbortSignal
+  ): Promise<readonly LibraryAsset[]>;
+}
+```
+
+Asset:
+
+```ts
+export interface LibraryAsset {
+  readonly assetId: string;
+  readonly canonicalId: string;
+
+  readonly playbackUrl: string;
+
+  readonly mediaInfo?: {
+    readonly container?: string;
+    readonly codecs?: readonly string[];
+    readonly resolution?: number;
+    readonly bitrate?: number;
+    readonly sizeBytes?: number;
+    readonly durationMs?: number;
+  };
+
+  readonly language?: string;
+
+  readonly authorization: {
+    readonly status: "authorized" | "unauthorized" | "unknown";
+    readonly evidenceIds: readonly string[];
+  };
+}
+```
+
+The important invariant:
+
+```text
+LibraryAsset
+    │
+    ├── identity
+    ├── playback location
+    ├── technical metadata
+    └── authorization evidence
+```
+
+The asset itself remains a fact-bearing object.
+
+## 476. Repository implementations
+
+We can support multiple storage backends without changing the
+adapter.
+
+```text
+MediaLibrary
+    │
+    ├── JsonMediaLibrary
+    ├── SqliteMediaLibrary
+    ├── PostgresMediaLibrary
+    ├── ObjectStoreMediaLibrary
+    └── ApiMediaLibrary
+```
+
+The adapter sees only:
+
+```text
+findAssets(canonicalId, signal)
+```
+
+This means the first implementation can be extremely simple.
+
+## 477. JSON library for v0.1
+
+A practical first implementation is a static JSON manifest.
+
+Example:
+
+```json
+{
+  "assets": [
+    {
+      "assetId": "asset-001",
+      "canonicalId": "media:movie-001",
+      "playbackUrl": "https://media.example.org/library/movie-001.mp4",
+      "mediaInfo": {
+        "container": "mp4",
+        "resolution": 1080,
+        "bitrate": 8000000
+      },
+      "language": "en",
+      "authorization": {
+        "status": "authorized",
+        "evidenceIds": ["asset-authorization-001"]
+      }
+    }
+  ]
+}
+```
+
+This is not intended to be the final database design.
+
+It is valuable because it provides:
+
+```text
+deterministic input
++ zero external discovery
++ easy testing
++ easy reproducibility
+```
+
+That makes it suitable for the first real end-to-end implementation.
+
+## 478. JSON schema
+
+Do not deserialize arbitrary JSON directly into domain objects.
+
+Create an input schema.
+
+Using Zod:
+
+```ts
+const LibraryAssetSchema = z.object({
+  assetId: z.string().min(1),
+  canonicalId: z.string().min(1),
+  playbackUrl: z.string().url(),
+
+  mediaInfo: z
+    .object({
+      container: z.string().optional(),
+      codecs: z.array(z.string()).optional(),
+      resolution: z.number().int().positive().optional(),
+      bitrate: z.number().positive().optional(),
+      sizeBytes: z.number().int().nonnegative().optional(),
+      durationMs: z.number().int().nonnegative().optional()
+    })
+    .optional(),
+
+  language: z.string().optional(),
+
+  authorization: z.object({
+    status: z.enum(["authorized", "unauthorized", "unknown"]),
+    evidenceIds: z.array(z.string())
+  })
+});
+```
+
+Then:
+
+```ts
+const LibrarySchema = z.object({
+  assets: z.array(LibraryAssetSchema)
+});
+```
+
+The parser boundary becomes:
+
+```text
+JSON
+ │
+ ▼
+schema validation
+ │
+ ▼
+LibraryAsset
+```
+
+not:
+
+```text
+JSON → trust
+```
+
+## 479. Duplicate asset identity
+
+Two records should not silently represent the same asset.
+
+Define:
+
+```ts
+function assetKey(asset: LibraryAsset): string {
+  return asset.assetId;
+}
+```
+
+The library loader should reject:
+
+```text
+asset-001
+asset-001
+```
+
+unless the semantics explicitly permit versioning.
+
+This is preferable to silently selecting one.
+
+## 480. Canonical ID validation
+
+The library should not accept arbitrary canonical identifiers if the
+system has defined a canonical namespace.
+
+For v0.1:
+
+```ts
+type CanonicalMediaId = `media:${string}`;
+```
+
+Then:
+
+```ts
+function isCanonicalMediaId(value: string): value is CanonicalMediaId {
+  return /^media:[A-Za-z0-9._:-]+$/.test(value);
+}
+```
+
+This does **not** mean the identifier is universally canonical.
+
+It means:
+
+The application recognizes it as belonging to its canonical-ID
+namespace.
+
+That distinction should remain explicit.
+
+## 481. JSON repository
+
+The repository can then be:
+
+```ts
+export class JsonMediaLibrary implements MediaLibrary {
+  constructor(private readonly assets: readonly LibraryAsset[]) {}
+
+  async findAssets(
+    canonicalId: string,
+    signal: AbortSignal
+  ): Promise<readonly LibraryAsset[]> {
+    if (signal.aborted) {
+      throw new DOMException("Aborted", "AbortError");
+    }
+
+    return this.assets.filter(asset => asset.canonicalId === canonicalId);
+  }
+}
+```
+
+Notice what this implementation does **not** do:
+
+- no network access,
+- no scraping,
+- no guessing,
+- no title search,
+- no authorization inference.
+
+## 482. `OwnedMediaAdapter`
+
+The adapter now becomes thin:
+
+```ts
+export class OwnedMediaAdapter implements SourceAdapter {
+  readonly id = "owned-media-library";
+  readonly name = "Operator-Owned Media Library";
+
+  readonly capabilities = {
+    mediaTypes: ["movie", "series"] as const,
+
+    supportsMovies: true,
+    supportsSeries: true,
+    supportsEpisodes: true,
+
+    providesStreams: true,
+    providesSubtitles: false,
+    providesMetadata: false,
+
+    identityKinds: ["internal"] as const,
+
+    authorizationMode: "configured_owned" as const
+  };
+
+  constructor(private readonly library: MediaLibrary) {}
+
+  supportsMedia(media: MediaRef): boolean {
+    return media.type === "movie" || media.type === "series";
+  }
+
+  async resolve(
+    media: CanonicalMedia,
+    context: ResolveContext
+  ): Promise<readonly SourceCandidate[]> {
+    const assets = await this.library.findAssets(
+      media.canonicalId,
+      context.signal
+    );
+
+    return assets.map(asset => this.toCandidate(media.media, asset));
+  }
+
+  private toCandidate(media: MediaRef, asset: LibraryAsset): SourceCandidate {
+    return {
+      sourceId: this.id,
+      media,
+      url: asset.playbackUrl,
+      mediaInfo: asset.mediaInfo,
+      language: asset.language ?? "und",
+
+      provenance: {
+        adapterId: this.id
+      },
+
+      capabilities: {
+        directPlayback: true
+      },
+
+      authorization: {
+        status: asset.authorization.status,
+        evidenceIds: asset.authorization.evidenceIds
+      }
+    };
+  }
+}
+```
+
+The adapter is now primarily a **semantic translator**:
+
+```text
+LibraryAsset
+     ↓
+SourceCandidate
+```
+
+## 483. Why `CanonicalMedia` enters the adapter
+
+This is deliberate.
+
+The adapter does not receive:
+
+```text
+MediaRef
+```
+
+as its primary identity.
+
+It receives:
+
+```text
+CanonicalMedia
+```
+
+because source routing already established the identity.
+
+Thus:
+
+```text
+IMDb tt1234567
+       │
+       ▼
+Identity Resolver
+       │
+       ▼
+media:abc123
+       │
+       ▼
+OwnedMediaAdapter
+       │
+       ▼
+library lookup
+```
+
+The source cannot reinterpret the identity.
+
+## 484. Series assets
+
+Series need a stronger asset key.
+
+A movie:
+
+```text
+media:movie-001
+```
+
+is enough.
+
+An episode requires:
+
+```text
+media:series-001
+season=2
+episode=7
+```
+
+Therefore the library record needs:
+
+```ts
+interface LibraryAsset {
+  readonly assetId: string;
+  readonly canonicalId: string;
+
+  readonly episode?: {
+    readonly season: number;
+    readonly episode: number;
+  };
+
+  // ...
+}
+```
+
+Then lookup should be:
+
+```text
+findAssets(
+  canonicalId,
+  media,
+  signal
+)
+```
+
+rather than relying only on the series canonical ID.
+
+Better:
+
+```ts
+interface MediaLibrary {
+  findAssets(
+    media: MediaRef,
+    canonicalId: string,
+    signal: AbortSignal
+  ): Promise<readonly LibraryAsset[]>;
+}
+```
+
+Now:
+
+```text
+movie  → canonicalId
+series  → canonicalId + season + episode
+```
+
+cannot accidentally collapse into the same lookup.
+
+## 485. Asset matching invariant
+
+For an episode candidate:
+
+```text
+candidate.media.type = "series"
+candidate.media.id = request series ID
+candidate.media.season = asset.season
+candidate.media.episode = asset.episode
+```
+
+The adapter must not return:
+
+```text
+season 2 episode 6
+```
+
+for:
+
+```text
+season 2 episode 7
+```
+
+even if the same series contains both.
+
+This deserves a dedicated conformance test.
+
+## 486. Multiple authorized assets
+
+Suppose the library contains:
+
+```text
+movie-001 / 720p
+movie-001 / 1080p
+movie-001 / 2160p
+```
+
+The adapter returns all structurally valid authorized candidates.
+
+It should **not rank them**.
+
+That remains the resolver's responsibility.
+
+```text
+Adapter
+  ↓
+candidate A
+candidate B
+candidate C
+  ↓
+Resolver
+  ↓
+ranking
+```
+
+This preserves the separation:
+
+```text
+source discovery ≠ global preference
+```
+
+## 487. Source-local filtering
+
+Some filtering does belong inside the adapter.
+
+For example:
+
+```text
+asset authorization = unauthorized
+```
+
+can be omitted before creating a candidate.
+
+But there is value in preserving rejection evidence.
+
+A richer adapter result could eventually become:
+
+```ts
+interface SourceResolution {
+  readonly candidates: readonly SourceCandidate[];
+  readonly rejections: readonly SourceRejection[];
+}
+```
+
+For v0.1, keep the public adapter contract simple and let the central
+candidate authorization policy reject unauthorized candidates.
+
+That creates one authoritative authorization gate.
+
+## 488. Candidate URL validation
+
+The owned-media adapter must not trust its own library blindly.
+
+Even operator-owned configuration can contain mistakes.
+
+So:
+
+```text
+LibraryAsset.playbackUrl
+          │
+          ▼
+Candidate structural validation
+          │
+          ▼
+Network policy
+          │
+          ▼
+Candidate admission
+```
+
+For example:
+
+```text
+https://media.example.org/a.mp4
+```
+
+may pass.
+
+But:
+
+```text
+file:///etc/passwd
+```
+
+must not.
+
+And:
+
+```text
+http://127.0.0.1:8080/
+```
+
+should be rejected where the configured network policy disallows it.
+
+## 489. No credential-bearing playback URLs
+
+The library should reject:
+
+```text
+https://user:secret@example.org/movie.mp4
+```
+
+at ingestion time.
+
+This is stronger than waiting for candidate validation.
+
+```ts
+function validatePlaybackUrl(raw: string): URL {
+  const url = new URL(raw);
+
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    throw new Error("Unsupported playback scheme");
+  }
+
+  if (url.username || url.password) {
+    throw new Error("Embedded credentials are forbidden");
+  }
+
+  return url;
+}
+```
+
+The runtime network policy still remains the final enforcement layer.
+
+## 490. Library ingestion pipeline
+
+The complete source now has two separate pipelines.
+
+### Configuration pipeline
+
+```text
+JSON
+ │
+ ▼
+schema validation
+ │
+ ▼
+asset validation
+ │
+ ▼
+authorization evidence
+ │
+ ▼
+network validation
+ │
+ ▼
+library index
+```
+
+### Runtime pipeline
+
+```text
+CanonicalMedia
+ │
+ ▼
+library lookup
+ │
+ ▼
+LibraryAsset
+ │
+ ▼
+SourceCandidate
+ │
+ ▼
+central validation
+ │
+ ▼
+central authorization
+ │
+ ▼
+dedupe
+ │
+ ▼
+ranking
+```
+
+This avoids putting all policy into the adapter.
+
+## 491. Source runtime wrapper
+
+Now wrap the adapter.
+
+```ts
+interface SourceExecutor {
+  execute(
+    adapter: SourceAdapter,
+    media: CanonicalMedia,
+    context: ResolveContext
+  ): Promise<readonly SourceCandidate[]>;
+}
+```
+
+Implementation conceptually:
+
+```text
+SourceExecutor
+     │
+     ├── admission check
+     ├── circuit check
+     ├── limiter
+     ├── semaphore
+     ├── timeout
+     ├── execution
+     └── failure classification
+```
+
+The adapter itself remains unaware of:
+
+- circuit state,
+- global concurrency,
+- retry policy,
+- metrics,
+- request IDs.
+
+That belongs to runtime infrastructure.
+
+## 492. Error boundary
+
+Adapter exceptions should not escape directly into the Stremio
+handler.
+
+```text
+Adapter exception
+      │
+      ▼
+SourceExecutor
+      │
+      ▼
+Failure classification
+      │
+      ▼
+ResolutionFailure
+      │
+      ▼
+Resolver
+      │
+      ▼
+partial / failed / empty
+```
+
+For example:
+
+```ts
+interface SourceFailure {
+  readonly sourceId: string;
+
+  readonly code:
+    | "source_timeout"
+    | "source_aborted"
+    | "source_rate_limited"
+    | "source_circuit_open"
+    | "source_network_error"
+    | "source_invalid_response"
+    | "internal_error";
+
+  readonly retryable: boolean;
+}
+```
+
+## 493. `404` is not automatically failure
+
+For an owned library:
+
+```text
+findAssets(...)
+       │
+       ▼
+[]
+```
+
+means:
+
+```text
+source_empty
+```
+
+if the library lookup successfully established that no asset exists.
+
+But:
+
+```text
+database unavailable
+```
+
+means:
+
+```text
+source_network_error
+```
+
+or a source-specific infrastructure failure.
+
+And:
+
+```text
+lookup timed out
+```
+
+means:
+
+```text
+source_timeout
+```
+
+Thus:
+
+```text
+empty ≠ failure
+```
+
+remains preserved.
+
+## 494. Source-level receipt
+
+The runtime should eventually generate a receipt like:
+
+```ts
+interface SourceExecutionReceipt {
+  readonly receiptId: string;
+  readonly requestId: string;
+
+  readonly sourceId: string;
+
+  readonly canonicalId: string;
+
+  readonly startedAt: string;
+  readonly completedAt: string;
+
+  readonly outcome: "success" | "empty" | "failed" | "rejected";
+
+  readonly candidateCount: number;
+
+  readonly failureCode?: FailureCode;
+
+  readonly evidenceIds: readonly string[];
+}
+```
+
+Again:
+
+```text
+receipt = record of execution
+```
+
+not:
+
+```text
+receipt = proof that the media is true
+```
+
+## 495. End-to-end example
+
+Request:
+
+```text
+GET /stream/movie/tt1234567.json
+```
+
+Pipeline:
+
+```text
+Stremio
+  │
+  ▼
+parse
+  │
+  ▼
+MediaRef(tt1234567)
+  │
+  ▼
+identity resolver
+  │
+  ▼
+CanonicalMedia(media:movie-001)
+  │
+  ▼
+source router
+  │
+  ▼
+owned-media-library
+  │
+  ▼
+admitted?
+  │
+  ▼
+library.findAssets(movie-001)
+  │
+  ▼
+1080p asset
+2160p asset
+  │
+  ▼
+SourceCandidate[]
+  │
+  ▼
+validate
+  │
+  ▼
+authorize
+  │
+  ▼
+dedupe
+  │
+  ▼
+rank
+  │
+  ▼
+Stremio DTO
+```
+
+Final protocol representation:
+
+```json
+{
+  "streams": [
+    {
+      "name": "owned-media-library",
+      "title": "2160p · mp4",
+      "url": "https://media.example.org/library/movie-001-2160p.mp4"
+    },
+    {
+      "name": "owned-media-library",
+      "title": "1080p · mp4",
+      "url": "https://media.example.org/library/movie-001-1080p.mp4"
+    }
+  ]
+}
+```
+
+The exact URLs above are illustrative only.
+
+## 496. What the addon still does not know
+
+Even after this succeeds, the addon has established only a limited
+set of facts:
+
+```text
+PROVED within application
+────────────────────────────
+
+request parsed
+identity resolved according to configured identity evidence
+source admitted
+library returned asset
+asset passed structural validation
+asset authorization status accepted
+candidate ranked
+```
+
+It has **not** established:
+
+```text
+NOT PROVED
+────────────────────────────
+
+that every external metadata claim is true
+that a third party owns the media
+that the remote server will remain available
+that the URL will work indefinitely
+that every Stremio client supports the stream
+that playback will succeed
+that the media is legally usable outside the configured
+authorization scope
+```
+
+This is exactly where:
+
+**NO EVIDENCE → NO VERIFIED CLAIM**
+
+becomes useful.
+
+## 497. Repository update
+
+The proposed tree now becomes:
+
+```text
+src/
+├── addon/
+│   ├── manifest.ts
+│   ├── parser.ts
+│   └── stream-handler.ts
+│
+├── application/
+│   └── resolver.ts
+│
+├── domain/
+│   ├── media.ts
+│   ├── candidate.ts
+│   ├── failure.ts
+│   └── result.ts
+│
+├── identity/
+│   ├── types.ts
+│   ├── resolver.ts
+│   ├── registry.ts
+│   ├── normalize.ts
+│   ├── graph.ts
+│   ├── confidence.ts
+│   └── cache.ts
+│
+├── adapters/
+│   ├── interface.ts
+│   ├── registry.ts
+│   ├── admission.ts
+│   │
+│   └── owned-media/
+│       ├── adapter.ts
+│       ├── declaration.ts
+│       ├── library.ts
+│       ├── json-library.ts
+│       ├── schema.ts
+│       └── url-policy.ts
+│
+├── resolver/
+│   ├── validate.ts
+│   ├── policy.ts
+│   ├── dedupe.ts
+│   └── rank.ts
+│
+├── runtime/
+│   ├── executor.ts
+│   ├── timeout.ts
+│   ├── semaphore.ts
+│   ├── limiter.ts
+│   ├── breaker.ts
+│   ├── cache.ts
+│   ├── inflight.ts
+│   └── http.ts
+│
+└── observability/
+    ├── logger.ts
+    ├── metrics.ts
+    ├── receipts.ts
+    └── health.ts
+```
+
+## 498. New tests
+
+The first real adapter now gets a dedicated suite:
+
+```text
+test/adapters/owned-media/
+├── declaration.test.ts
+├── schema.test.ts
+├── library.test.ts
+├── adapter.test.ts
+├── authorization.test.ts
+├── series.test.ts
+├── url-policy.test.ts
+└── conformance.test.ts
+```
+
+Minimum assertions:
+
+```text
+[ ] valid movie asset resolves
+[ ] absent movie produces empty
+[ ] valid episode resolves
+[ ] wrong episode does not resolve
+[ ] duplicate asset IDs rejected
+[ ] malformed library JSON rejected
+[ ] unknown authorization rejected
+[ ] unauthorized asset rejected
+[ ] embedded credentials rejected
+[ ] unsupported URL scheme rejected
+[ ] candidate sourceId correct
+[ ] canonicalId preserved
+[ ] multiple assets preserved
+[ ] adapter does not perform ranking
+[ ] AbortSignal propagates
+[ ] adapter cannot bypass admission
+```
+
+## 499. Integration test that actually matters
+
+The highest-value test is no longer merely:
+
+```text
+adapter.resolve(...)
+```
+
+It is:
+
+```text
+HTTP request
+    ↓
+real Stremio SDK
+    ↓
+stream handler
+    ↓
+application resolver
+    ↓
+identity
+    ↓
+admission
+    ↓
+owned library
+    ↓
+candidate validation
+    ↓
+authorization
+    ↓
+ranking
+    ↓
+HTTP response
+```
+
+The test should assert the actual wire contract:
+
+```text
+GET /manifest.json
+```
+
+and:
+
+```text
+GET /stream/movie/tt1234567.json
+```
+
+with the actual SDK server.
+
+That is the point where the protocol contract becomes **execution
+evidence**.
+
+## 500. Major milestone
+
+The system has crossed an important architectural boundary:
+
+```text
+                  BEFORE
+                      │
+           abstract source adapters
+                      │
+                      ▼
+                   AFTER
+                      │
+        governed executable source
+                      │
+        ┌─────────────┼─────────────┐
+        ▼             ▼             ▼
+     identity      admission      runtime
+        │             │             │
+        └─────────────┼─────────────┘
+                      ▼
+               authorized library
+                      │
+                      ▼
+                SourceCandidate
+                      │
+                      ▼
+                  Stremio
+```
+
+### Current evidence status
+
+| Component | Status |
+| --- | --- |
+| Stremio protocol model | **DEFINED** |
+| SDK integration shape | **VERIFIED from documentation** |
+| Identity model | **DEFINED** |
+| Identity reconciliation | **DEFINED** |
+| Source admission | **DEFINED** |
+| Source runtime | **DEFINED** |
+| Owned-media source contract | **DEFINED** |
+| JSON library design | **DEFINED** |
+| Candidate authorization | **DEFINED** |
+| Actual implementation | **OPEN** |
+| Actual tests | **OPEN** |
+| Actual CI run | **OPEN** |
+| Real deployment | **OPEN** |
+
+The next layer is **metadata as a separate evidence graph**, because
+the current system can resolve a canonical media identity but still
+lacks a principled way to obtain title, year, artwork, genres,
+episode names, runtime, and other metadata without turning metadata
+providers into accidental identity authorities.
