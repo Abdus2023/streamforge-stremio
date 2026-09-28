@@ -4888,3 +4888,1219 @@ Stremio Stream[]
 ```
 
 and establish the first genuine **end-to-end conformance baseline**.
+
+## 118. Safe HTTP + cache + Stremio conformance
+
+The next layer closes the gap between the abstract resolver and an
+actually deployable addon.
+
+The important boundary is:
+
+```text
+                 ┌─────────────────────┐
+                 │    Stremio request   │
+                 └──────────┬──────────┘
+                             │
+                             ▼
+                     MediaRef parser
+                             │
+                             ▼
+                        Resolver
+                             │
+                 ┌───────────┴───────────┐
+                 │                       │
+                 ▼                       ▼
+              Cache                 Source runtime
+                                         │
+                                ┌────────┼────────┐
+                                ▼        ▼        ▼
+                              limit   breaker   timeout
+                                         │
+                                         ▼
+                                   Safe HTTP
+                                         │
+                                         ▼
+                                   Source API
+```
+
+The critical principle remains:
+
+**The HTTP client is a trust boundary, not merely a convenience wrapper
+around `fetch()`.**
+
+## 119. Safe HTTP contract
+
+Create:
+
+```text
+src/runtime/http.ts
+```
+
+The adapter should not receive raw `fetch`.
+
+```ts
+export interface SafeHttpClient {
+  getJson<T>(url: string, options?: HttpOptions): Promise<T>;
+
+  getText(url: string, options?: HttpOptions): Promise<string>;
+}
+
+export interface HttpOptions {
+  readonly signal?: AbortSignal;
+  readonly headers?: Record<string, string>;
+  readonly maxBytes?: number;
+  readonly maxRedirects?: number;
+}
+```
+
+This gives us one place to enforce:
+
+```text
+URL validation
+redirect validation
+timeouts
+response-size limits
+content-type checks
+header policy
+abort propagation
+logging
+```
+
+## 120. URL validation
+
+Start conservatively.
+
+```ts
+const ALLOWED_PROTOCOLS = new Set(["http:", "https:"]);
+
+export function validateHttpUrl(input: string): URL {
+  const url = new URL(input);
+
+  if (!ALLOWED_PROTOCOLS.has(url.protocol)) {
+    throw new Error("unsupported_url_protocol");
+  }
+
+  if (url.username || url.password) {
+    throw new Error("url_credentials_forbidden");
+  }
+
+  return url;
+}
+```
+
+Reject:
+
+```text
+file:
+ftp:
+data:
+javascript:
+blob:
+ssh:
+```
+
+and URLs containing embedded credentials.
+
+## 121. SSRF policy
+
+The first version should explicitly classify addresses.
+
+```ts
+type AddressClass =
+  | "public"
+  | "loopback"
+  | "private"
+  | "link_local"
+  | "reserved"
+  | "unknown";
+```
+
+Do not blindly implement:
+
+```ts
+if (hostname === "localhost")
+```
+
+because:
+
+```text
+localhost
+127.0.0.1
+127.0.0.2
+::1
+0.0.0.0
+10.x.x.x
+172.16.x.x
+192.168.x.x
+169.254.x.x
+```
+
+are not the complete problem.
+
+## 122. DNS rebinding
+
+The difficult case is:
+
+```text
+evil.example
+     │
+     ├── DNS lookup #1 → public IP
+     │
+     └── DNS lookup #2 → 127.0.0.1
+```
+
+Therefore:
+
+validating the hostname string alone is not SSRF protection.
+
+And:
+
+resolving the hostname once and then using a separate HTTP stack can
+still leave a race.
+
+For production, the HTTP implementation should control DNS resolution
+and connection establishment.
+
+That is a **deployment-security requirement**, not something the
+domain layer should pretend to solve.
+
+## 123. Safer baseline
+
+For the first public release, adopt this policy:
+
+```text
+Server-side fetching:
+    only explicitly configured/trusted origins
+
+Provider-returned URLs:
+    emitted to Stremio
+    NOT automatically proxied by addon
+```
+
+This is substantially safer than allowing arbitrary remote URLs to
+become server-side fetch targets.
+
+## 124. Redirects
+
+A safe client must not validate only the initial URL.
+
+Bad:
+
+```text
+GET https://trusted.example
+        ↓
+302 http://127.0.0.1
+```
+
+Therefore either:
+
+```text
+automatic redirects = disabled
+```
+
+or manually validate every redirect.
+
+For v0.1:
+
+```text
+redirect: "manual"
+```
+
+is preferable.
+
+Then:
+
+```text
+response.status = 3xx
+        │
+        ▼
+Location header
+        │
+        ▼
+validateHttpUrl()
+        │
+        ▼
+SSRF policy
+        │
+        ▼
+next request
+```
+
+## 125. Response-size limit
+
+Never assume an API response is small.
+
+```ts
+const MAX_JSON_BYTES = 2 * 1024 * 1024;
+```
+
+A malicious or broken source returning:
+
+```text
+500 MB JSON
+```
+
+should not consume the addon process.
+
+The HTTP layer should enforce a byte ceiling while reading.
+
+Conceptually:
+
+```ts
+async function readLimited(
+  response: Response,
+  maxBytes: number
+): Promise<Uint8Array> {
+  if (!response.body) {
+    return new Uint8Array();
+  }
+
+  const reader = response.body.getReader();
+
+  const chunks: Uint8Array[] = [];
+
+  let total = 0;
+
+  while (true) {
+    const { value, done } = await reader.read();
+
+    if (done) break;
+
+    total += value.byteLength;
+
+    if (total > maxBytes) {
+      await reader.cancel();
+
+      throw new Error("response_too_large");
+    }
+
+    chunks.push(value);
+  }
+
+  const result = new Uint8Array(total);
+
+  let offset = 0;
+
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  return result;
+}
+```
+
+## 126. Content-type validation
+
+If `getJson()` is requested:
+
+```text
+expected: application/json
+          application/*+json
+```
+
+A source returning:
+
+```text
+text/html
+```
+
+should not silently become a JSON parse attempt.
+
+That distinction belongs in failure classification.
+
+```text
+HTTP 200 + HTML       ≠ valid JSON response
+```
+
+## 127. HTTP failure taxonomy
+
+Expand the previous status model:
+
+```ts
+export type AdapterStatus =
+  | "success"
+  | "empty"
+  | "timeout"
+  | "aborted"
+  | "rate_limited"
+  | "circuit_open"
+  | "invalid_response"
+  | "http_error"
+  | "network_error"
+  | "error";
+```
+
+This gives the observability layer useful semantics.
+
+## 128. Never collapse HTTP status into success
+
+This:
+
+```ts
+if (response.ok) {
+  return response.json();
+}
+```
+
+is insufficient.
+
+You need:
+
+```text
+HTTP status
++ content type
++ body validity
++ schema validity
+```
+
+before producing source candidates.
+
+The pipeline becomes:
+
+```text
+HTTP response
+    │
+    ▼
+transport validation
+    │
+    ▼
+content validation
+    │
+    ▼
+schema validation
+    │
+    ▼
+adapter normalization
+    │
+    ▼
+SourceCandidate[]
+```
+
+## 129. Zod belongs at the adapter boundary
+
+External data is untrusted.
+
+Example:
+
+```ts
+const ExternalRecord = z.object({
+  id: z.string(),
+  url: z.string(),
+  title: z.string().optional(),
+  size: z.number().optional()
+});
+```
+
+Then:
+
+```ts
+const parsed = ExternalRecord.safeParse(record);
+
+if (!parsed.success) {
+  throw new Error("invalid_source_record");
+}
+```
+
+Only after this should you construct:
+
+```text
+SourceCandidate
+```
+
+The domain model should not be polluted with provider-specific
+optional garbage.
+
+## 130. Cache interface
+
+Now define:
+
+```text
+src/runtime/cache.ts
+```
+
+```ts
+export interface CacheStore<T> {
+  get(key: string): Promise<CacheEntry<T> | null>;
+
+  set(key: string, entry: CacheEntry<T>): Promise<void>;
+
+  delete(key: string): Promise<void>;
+}
+```
+
+Start with memory.
+
+```ts
+export class MemoryCache<T> implements CacheStore<T> {
+  private readonly map = new Map<string, CacheEntry<T>>();
+
+  async get(key: string) {
+    return this.map.get(key) ?? null;
+  }
+
+  async set(key: string, entry: CacheEntry<T>) {
+    this.map.set(key, entry);
+  }
+
+  async delete(key: string) {
+    this.map.delete(key);
+  }
+}
+```
+
+## 131. Don't cache authorization assumptions
+
+This is important.
+
+Avoid:
+
+```text
+cache: "URL X is authorized"
+```
+
+unless the authorization evidence itself has a defined validity
+period.
+
+Instead cache the source observation:
+
+```text
+source record
+observedAt
+provider evidence
+```
+
+and derive current policy separately.
+
+Why?
+
+Because:
+
+```text
+observation
+```
+
+and:
+
+```text
+authorization decision
+```
+
+have different lifetimes.
+
+## 132. Cache candidates, not final Stremio streams
+
+Prefer:
+
+```text
+cache
+    ↓
+SourceCandidate[]
+    ↓
+current policy
+    ↓
+current deduplication
+    ↓
+current ranking
+    ↓
+Stremio
+```
+
+instead of caching:
+
+```text
+Stremio Stream[]
+```
+
+This allows policy/ranking changes without invalidating the entire
+cache.
+
+## 133. Cache key versioning
+
+Add a namespace:
+
+```ts
+const CACHE_VERSION = "candidate-v1";
+```
+
+Then:
+
+```ts
+function makeCacheKey(key: SourceCacheKey): string {
+  return [
+    CACHE_VERSION,
+    key.adapterId,
+    key.mediaId,
+    key.season ?? "",
+    key.episode ?? "",
+    key.language
+  ].join("|");
+}
+```
+
+When the candidate schema changes:
+
+```text
+candidate-v1
+    ↓
+candidate-v2
+```
+
+instead of silently interpreting old data under the new schema.
+
+## 134. Stale cache policy
+
+Use:
+
+```ts
+export interface CachePolicy {
+  readonly freshMs: number;
+  readonly staleMs: number;
+}
+```
+
+Example:
+
+```text
+fresh = 5 minutes
+stale = 30 minutes
+```
+
+Then:
+
+```text
+0 ───────── 5m ───────────── 30m
+│            │                 │
+│  FRESH     │     STALE       │ DEAD
+│            │                 │
+└────────────┴─────────────────┘
+```
+
+## 135. Stale data must remain marked stale
+
+Never:
+
+```ts
+return candidates;
+```
+
+without indicating their age internally.
+
+Instead:
+
+```ts
+interface ResolutionSource {
+  readonly candidates: readonly SourceCandidate[];
+
+  readonly freshness: "live" | "fresh_cache" | "stale_cache";
+}
+```
+
+This preserves evidence provenance.
+
+## 136. In-flight request deduplication
+
+Add:
+
+```ts
+class InflightRegistry<T> {
+  private readonly map = new Map<string, Promise<T>>();
+
+  async run(key: string, factory: () => Promise<T>): Promise<T> {
+    const existing = this.map.get(key);
+
+    if (existing) {
+      return existing;
+    }
+
+    const promise = factory();
+
+    this.map.set(key, promise);
+
+    try {
+      return await promise;
+    } finally {
+      this.map.delete(key);
+    }
+  }
+}
+```
+
+Now ten simultaneous requests can share one source call.
+
+## 137. Important cancellation caveat
+
+Do not let request A cancel the shared operation needed by requests
+B–J.
+
+This is a subtle bug.
+
+Bad:
+
+```text
+A ─┐
+B ─┤
+C ─┼── shared operation
+D ─┤
+E ─┘
+
+A disconnects
+     ↓
+ABORT
+     ↓
+everyone loses
+```
+
+The shared operation needs its **own lifecycle**.
+
+Then each caller decides whether it still wants the result.
+
+This is another reason not to blindly pass one HTTP request's
+`AbortSignal` into a globally shared cache operation.
+
+## 138. Stremio protocol boundary
+
+Now freeze the protocol boundary.
+
+The resolver returns:
+
+```text
+readonly SourceCandidate[]
+```
+
+The Stremio adapter converts only:
+
+```text
+SourceCandidate
+        ↓
+StremioStream
+```
+
+Example:
+
+```ts
+interface StremioStream {
+  readonly name?: string;
+  readonly title?: string;
+  readonly url: string;
+  readonly behaviorHints?: {
+    readonly notWebReady?: boolean;
+  };
+}
+```
+
+The mapper should not perform:
+
+```text
+HTTP
+policy
+deduplication
+ranking
+authorization
+metadata lookup
+```
+
+It should be boring.
+
+That's intentional.
+
+## 139. Stream mapper
+
+```ts
+export function toStremioStream(candidate: SourceCandidate): StremioStream {
+  const resolution =
+    candidate.mediaInfo.width && candidate.mediaInfo.height
+      ? `${candidate.mediaInfo.width}x${candidate.mediaInfo.height}`
+      : undefined;
+
+  return {
+    name: candidate.sourceId,
+
+    title: [
+      resolution,
+      candidate.mediaInfo.videoCodec,
+      candidate.mediaInfo.audioCodec
+    ]
+      .filter(Boolean)
+      .join(" • "),
+
+    url: candidate.location.url
+  };
+}
+```
+
+No hidden source lookup.
+
+No proxy.
+
+No ranking.
+
+No mutation.
+
+## 140. Series parsing
+
+Freeze the ID grammar explicitly.
+
+For example:
+
+```text
+movie: tt1234567
+
+series: tt1234567:1:4
+```
+
+Parser:
+
+```ts
+export interface ParsedStremioId {
+  readonly imdbId: string;
+  readonly season?: number;
+  readonly episode?: number;
+}
+
+export function parseId(type: MediaType, id: string): ParsedStremioId {
+  if (type === "movie") {
+    if (!/^tt\d+$/.test(id)) {
+      throw new Error("invalid_movie_id");
+    }
+
+    return {
+      imdbId: id
+    };
+  }
+
+  const match = /^(tt\d+):(\d+):(\d+)$/.exec(id);
+
+  if (!match) {
+    throw new Error("invalid_series_id");
+  }
+
+  return {
+    imdbId: match[1],
+    season: Number(match[2]),
+    episode: Number(match[3])
+  };
+}
+```
+
+The grammar should have tests before adding more accepted formats.
+
+## 141. Unknown versus invalid
+
+Don't do:
+
+```ts
+parseInt("abc");
+```
+
+and let it become:
+
+```text
+NaN
+```
+
+`NaN` is neither a meaningful season nor a useful UNKNOWN state.
+
+Instead:
+
+```text
+malformed input
+    = INVALID
+
+missing optional information
+    = UNKNOWN / ABSENT
+```
+
+This follows the same semantic discipline as the evidence
+architecture.
+
+## 142. Stremio handler
+
+Conceptually:
+
+```ts
+export async function handleStream(type: MediaType, id: string) {
+  const media = parseStremioMedia(type, id);
+
+  const result = await resolver.resolve(media);
+
+  return {
+    streams: result.candidates.map(toStremioStream)
+  };
+}
+```
+
+That's nearly all it should contain.
+
+## 143. Empty results
+
+Empty result must not hide the reason.
+
+Internally:
+
+```text
+streams = []
+```
+
+but diagnostics retain:
+
+```json
+{
+  "status": "empty",
+  "adapters": [
+    {
+      "id": "source-a",
+      "status": "empty"
+    },
+    {
+      "id": "source-b",
+      "status": "timeout"
+    },
+    {
+      "id": "source-c",
+      "status": "circuit_open"
+    }
+  ]
+}
+```
+
+Stremio gets:
+
+```json
+{
+  "streams": []
+}
+```
+
+Operational telemetry gets the richer evidence.
+
+## 144. Do not leak internal diagnostics through Stremio
+
+This distinction matters.
+
+Internal:
+
+```text
+adapter errors
+URLs
+request IDs
+authorization evidence
+timings
+```
+
+should not automatically become public Stremio metadata.
+
+The addon protocol is a presentation boundary.
+
+## 145. End-to-end test
+
+Now construct the first real conformance test.
+
+```ts
+it("resolves an eligible candidate into a Stremio stream", async () => {
+  const adapter = new FakeAdapter([
+    makeCandidate({
+      sourceId: "fixture",
+      authorization: {
+        status: "authorized"
+      },
+      capabilities: {
+        directPlayback: true
+      }
+    })
+  ]);
+
+  registry.register(adapter);
+
+  const result = await resolver.resolve({
+    type: "movie",
+    id: "tt1234567"
+  });
+
+  expect(result.candidates).toHaveLength(1);
+
+  const stream = toStremioStream(result.candidates[0]);
+
+  expect(stream.url).toBe("https://example.test/video.mp4");
+});
+```
+
+This test proves the **kernel contract**, not real-world source
+availability.
+
+## 146. Failure isolation test
+
+```ts
+it("does not fail the entire resolution when one adapter times out", async () => {
+  registry.register(new TimeoutAdapter());
+
+  registry.register(new SuccessfulAdapter());
+
+  const result = await resolver.resolve(media);
+
+  expect(result.candidates.length).toBeGreaterThan(0);
+
+  expect(result.executions.some(x => x.status === "timeout")).toBe(true);
+});
+```
+
+This is a critical invariant.
+
+## 147. Policy invariant
+
+```ts
+it("never emits unknown-authorization candidates", async () => {
+  const candidate = makeCandidate({
+    authorization: {
+      status: "unknown"
+    }
+  });
+
+  const result = await resolveWith(candidate);
+
+  expect(result.candidates).toHaveLength(0);
+});
+```
+
+This should be treated as a security invariant, not merely a unit
+test.
+
+## 148. Deterministic ranking invariant
+
+Given:
+
+```text
+A = 1080p
+B = 720p
+C = 1080p
+```
+
+and otherwise equal:
+
+```text
+A sourceId = alpha
+C sourceId = zeta
+```
+
+the order must always be:
+
+```text
+A
+C
+B
+```
+
+independent of:
+
+```text
+adapter execution completion order
+network timing
+Map insertion order
+Promise scheduling
+```
+
+This is exactly the kind of property worth property-based testing
+later.
+
+## 149. Runtime test matrix
+
+Freeze this matrix:
+
+| Condition | Expected status |
+| --- | --- |
+| Valid response | `success` |
+| Valid response, zero candidates | `empty` |
+| Timeout | `timeout` |
+| Parent cancellation | `aborted` |
+| Rate limit exhausted | `rate_limited` |
+| Breaker open | `circuit_open` |
+| Invalid JSON | `invalid_response` |
+| HTTP 500 | `http_error` |
+| Connection failure | `network_error` |
+| Unexpected exception | `error` |
+
+This is far better than:
+
+```text
+success / error
+```
+
+because the latter destroys operational evidence.
+
+## 150. Conformance properties
+
+The resolver should now satisfy these invariants:
+
+```text
+P1  Unauthorized candidates are never emitted.
+
+P2  Unknown authorization is never treated as authorized.
+
+P3  Adapter failure does not erase successful results
+    from other adapters.
+
+P4  Timeout cancels the underlying operation.
+
+P5  Global cancellation propagates to active adapters.
+
+P6  Concurrency never exceeds configured capacity.
+
+P7  Circuit-open sources are not executed.
+
+P8  Ranking is deterministic.
+
+P9  Deduplication is deterministic.
+
+P10 Stremio mapping performs no source resolution.
+
+P11 Cached candidates pass through current policy.
+
+P12 Stale cache is distinguishable from live data.
+
+P13 Arbitrary provider URLs are not automatically proxied
+    through the addon server.
+```
+
+These are more valuable than a large collection of superficial tests.
+
+## 151. First architecture freeze
+
+At this point the system has four explicit authority layers:
+
+```text
+                    AUTHORITY
+                           │
+                          ▼
+               ┌──────────────────────┐
+              │ Policy / Eligibility  │
+              └──────────┬───────────┘
+                         │
+                         ▼
+              ┌──────────────────────┐
+              │ Resolver              │
+              │ aggregation authority │
+              └──────────┬───────────┘
+                         │
+                         ▼
+              ┌──────────────────────┐
+              │ Runtime               │
+              │ execution authority   │
+              └──────────┬───────────┘
+                         │
+                         ▼
+              ┌──────────────────────┐
+              │ Stremio adapter       │
+              │ presentation only     │
+              └──────────────────────┘
+```
+
+And three things remain deliberately outside that authority chain:
+
+```text
+Provider claims
+    ≠ Authorization truth
+
+HTTP success
+    ≠ Playback success
+
+Stremio rendering
+    ≠ Source validity
+```
+
+## 152. R2 release gate
+
+```text
+R2 — Safe Resolution Runtime
+────────────────────────────────────
+
+DOMAIN
+[✓] MediaRef
+[✓] SourceCandidate
+[✓] Failure model
+
+ADAPTER
+[✓] SourceAdapter
+[✓] Registry
+[✓] External schema validation
+
+RESOLUTION
+[✓] Parallel execution
+[✓] Failure isolation
+[✓] Policy
+[✓] Dedup
+[✓] Deterministic ranking
+
+RUNTIME
+[✓] Abort propagation
+[✓] Per-source timeout
+[✓] Global timeout
+[✓] Concurrency limiter
+[✓] Rate limiter
+[✓] Circuit breaker
+[✓] In-flight deduplication
+
+HTTP
+[✓] URL protocol validation
+[✓] Credential rejection
+[✓] Response-size boundary
+[✓] Content-type validation
+[✓] Redirect policy
+[ ] Production-grade DNS/IP binding
+
+CACHE
+[✓] Candidate cache abstraction
+[✓] Fresh/stale/dead semantics
+[✓] Versioned cache keys
+[✓] Current-policy revalidation
+
+STREMIO
+[✓] ID parser
+[✓] Candidate mapper
+[✓] Empty-result behavior
+[✓] Protocol boundary
+
+OBSERVABILITY
+[✓] Request IDs
+[✓] Structured events
+[✓] Basic metrics
+[✓] Liveness
+[✓] Readiness
+
+TESTING
+[✓] Failure isolation
+[✓] Policy invariant
+[✓] Ranking determinism
+[✓] Runtime status matrix
+[ ] Full integration suite
+[ ] Container smoke test
+[ ] CI release evidence
+```
+
+### Status
+
+**R2 = PARTIALLY VERIFIED / implementation blueprint**
+
+It is not yet a release claim because the actual repository, tests, CI
+execution, and container behavior have not been executed here.
+
+The next major layer is **metadata + subtitles + catalog identity
+resolution**, because source aggregation is only useful when the addon
+can reliably connect:
+
+```text
+Stremio catalog item
+        ↓
+IMDb/TMDB/etc. identity
+        ↓
+movie / series / season / episode
+        ↓
+source query
+        ↓
+eligible streams
+        ↓
+subtitle tracks
+```
+
+That layer introduces a second major problem: **identity resolution is
+not the same thing as source discovery**, and conflating them will
+eventually produce incorrect matches.
