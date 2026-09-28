@@ -7154,3 +7154,1181 @@ The next step is to build the **actual Stremio addon surface**:
 manifest generation, `/manifest.json`, catalog/meta/stream/subtitle
 handlers, deterministic request parsing, and an integration test that
 treats Stremio itself as the external protocol contract.
+
+## 187. Stremio protocol surface
+
+Now we cross the final architectural boundary: the internal
+aggregation kernel must become a real Stremio addon without allowing
+the protocol layer to contaminate the domain.
+
+The target is:
+
+```text
+                    HTTP
+                     │
+                     ▼
+               /manifest.json
+                     │
+         ┌───────────┼───────────┐
+         ▼           ▼           ▼
+      /catalog     /meta       /stream
+                                   │
+                                   ▼
+                               Resolver
+                                   │
+                                   ▼
+                           SourceCandidate[]
+                                   │
+                                   ▼
+                            Stremio streams
+```
+
+And later:
+
+```text
+/stream
+/subtitles
+```
+
+## 188. Manifest is a contract
+
+The manifest should describe only capabilities actually implemented.
+
+Do not advertise:
+
+```text
+catalog
+meta
+stream
+subtitle
+```
+
+because they are planned.
+
+Advertise only what is currently executable.
+
+Conceptually:
+
+```ts
+export const manifest = {
+  id: "com.example.authorized-aggregator",
+  version: "0.1.0",
+  name: "Authorized Source Aggregator",
+  description: "Aggregates eligible playback sources.",
+  resources: ["stream"],
+  types: ["movie", "series"],
+  idPrefixes: ["tt"]
+};
+```
+
+The exact SDK typing should be validated against the installed
+`stremio-addon-sdk` version during implementation rather than assuming
+a remembered SDK type definition is current.
+
+That distinction matters because:
+
+```text
+architecture contract
+    ≠
+third-party SDK API contract
+```
+
+## 189. Manifest generation should be pure
+
+Don't construct it dynamically from runtime state.
+
+Bad:
+
+```text
+source A unavailable
+    ↓
+remove stream capability
+```
+
+The manifest describes **what the addon implements**, not today's
+source health.
+
+Therefore:
+
+```text
+manifest
+    = static capability declaration
+```
+
+while:
+
+```text
+health
+    = current runtime state
+```
+
+## 190. Version semantics
+
+Use:
+
+```text
+addon version
+```
+
+for the addon contract.
+
+Use separate versions for:
+
+```text
+candidate schema
+identity schema
+cache schema
+```
+
+For example:
+
+```text
+addon:       0.3.0
+candidate:   v2
+identity:    v1
+cache:       candidate-v2
+```
+
+Do not use one version number to imply all schemas are identical.
+
+## 191. Request parsing boundary
+
+The HTTP layer gives you strings.
+
+The domain requires typed values.
+
+Therefore:
+
+```text
+HTTP string
+    ↓
+Stremio parser
+    ↓
+validated protocol request
+    ↓
+domain MediaRef
+```
+
+Define:
+
+```ts
+export interface StreamRequest {
+  readonly type: "movie" | "series";
+  readonly id: string;
+}
+```
+
+Then:
+
+```ts
+export function parseStreamRequest(type: string, id: string): StreamRequest {
+  if (type !== "movie" && type !== "series") {
+    throw new Error("unsupported_media_type");
+  }
+
+  if (!id) {
+    throw new Error("missing_media_id");
+  }
+
+  return {
+    type,
+    id
+  };
+}
+```
+
+The parser should reject malformed input before invoking identity
+resolution.
+
+## 192. Separate protocol ID from domain ID
+
+This is subtle but important.
+
+Stremio might provide:
+
+```text
+tt1234567:1:4
+```
+
+The domain should receive:
+
+```json
+{
+  "type": "series",
+  "id": "tt1234567",
+  "season": 1,
+  "episode": 4
+}
+```
+
+Don't pass the raw string through the entire system.
+
+That would make every internal layer understand Stremio syntax.
+
+## 193. Domain parser
+
+```ts
+export function toMediaRef(request: StreamRequest): MediaRef {
+  if (request.type === "movie") {
+    return {
+      type: "movie",
+      id: request.id
+    };
+  }
+
+  const parts = request.id.split(":");
+
+  if (parts.length !== 3) {
+    throw new Error("invalid_series_id");
+  }
+
+  const [seriesId, seasonRaw, episodeRaw] = parts;
+
+  const season = Number(seasonRaw);
+
+  const episode = Number(episodeRaw);
+
+  if (
+    !Number.isInteger(season) ||
+    season < 1 ||
+    !Number.isInteger(episode) ||
+    episode < 1
+  ) {
+    throw new Error("invalid_episode_coordinates");
+  }
+
+  return {
+    type: "series",
+    id: seriesId,
+    season,
+    episode
+  };
+}
+```
+
+Now the rest of the application doesn't care that the original request
+came from Stremio.
+
+## 194. Error taxonomy at the protocol edge
+
+Don't turn everything into HTTP 500.
+
+Distinguish:
+
+```text
+400
+invalid request
+
+404
+unsupported resource / not found
+
+200 + empty streams
+valid request, no eligible sources
+
+500
+internal failure
+```
+
+The exact behavior should follow the SDK's expected resource-handler
+semantics.
+
+The important principle is:
+
+**A valid media request with zero eligible streams is not necessarily
+an application failure.**
+
+## 195. Stream handler
+
+The stream handler should be tiny.
+
+```ts
+export async function handleStream(request: StreamRequest) {
+  const media = toMediaRef(request);
+
+  const result = await resolver.resolve(media);
+
+  return {
+    streams: result.candidates.map(toStremioStream)
+  };
+}
+```
+
+Notice what isn't here:
+
+```text
+HTTP
+ranking
+dedup
+authorization
+source selection
+retry
+cache
+```
+
+All of those already belong elsewhere.
+
+## 196. Why the handler must stay boring
+
+A protocol handler that grows into:
+
+```text
+500-line stream handler
+```
+
+is an architectural warning.
+
+It usually means:
+
+```text
+domain logic + runtime logic + protocol logic
+```
+
+have become coupled.
+
+The desired shape is:
+
+```text
+handler
+    = parse
+    + delegate
+    + map
+```
+
+## 197. Catalog handler
+
+Catalog is different.
+
+It should not ask every source:
+
+```text
+"What movies do you have?"
+```
+
+on every request.
+
+That creates:
+
+```text
+Stremio
+    ↓
+catalog
+    ↓
+all providers
+    ↓
+expensive discovery
+```
+
+Instead use a defined catalog authority.
+
+For example:
+
+```text
+CatalogProvider
+```
+
+```ts
+export interface CatalogProvider {
+  list(request: CatalogRequest): Promise<readonly CatalogItem[]>;
+}
+```
+
+This provider could represent:
+
+- a curated public-domain catalog
+- a user's authorized library
+- a metadata-backed catalog
+
+but the contract remains the same.
+
+## 198. Catalog is not source discovery
+
+This distinction is critical.
+
+```text
+Catalog: "What titles should Stremio display?"
+
+Source discovery: "What eligible playback resources exist for this title?"
+```
+
+They may use related providers but they are not the same operation.
+
+A title can appear in a catalog while currently having:
+
+```text
+0 eligible sources
+```
+
+and a source can exist for a title that is not part of your catalog.
+
+## 199. Meta handler
+
+Meta should return descriptive information.
+
+```ts
+export interface MetaProvider {
+  get(media: CanonicalMedia): Promise<Meta>;
+}
+```
+
+For example:
+
+```ts
+export interface Meta {
+  readonly id: string;
+  readonly type: "movie" | "series";
+  readonly name: string;
+  readonly poster?: string;
+  readonly description?: string;
+  readonly year?: number;
+}
+```
+
+Again:
+
+```text
+metadata ≠ playback authorization
+```
+
+## 200. Metadata provider policy
+
+Metadata sources can be treated differently from stream sources.
+
+For example:
+
+```text
+Metadata: possibly public metadata API
+
+Streams: only explicitly eligible/authorized sources
+```
+
+This is a useful architectural separation.
+
+## 201. The complete request lifecycle
+
+A movie request:
+
+```text
+GET /stream/movie/tt1234567.json
+             │
+             ▼
+      protocol parser
+             │
+             ▼
+       MediaRef(movie)
+             │
+             ▼
+      identity resolver
+             │
+             ▼
+       CanonicalMedia
+             │
+             ▼
+       source registry
+             │
+      ┌──────┼──────┐
+      ▼      ▼      ▼
+      A      B      C
+      │      │      │
+      ▼      ▼      ▼
+   runtime runtime runtime
+      │      │      │
+      └──────┼──────┘
+             ▼
+      SourceCandidate[]
+             │
+             ▼
+        validation
+             │
+             ▼
+          policy
+             │
+             ▼
+          dedupe
+             │
+             ▼
+          ranking
+             │
+             ▼
+       Stremio streams
+```
+
+That is the complete control flow.
+
+## 202. Series request
+
+For:
+
+```text
+tt1234567:2:7
+```
+
+the pipeline becomes:
+
+```text
+series request
+     │
+     ▼
+series identity
+     │
+     ▼
+episode coordinate
+     │
+     ▼
+SourceQuery {
+    series,
+    season: 2,
+    episode: 7
+}
+     │
+     ▼
+source adapters
+```
+
+An adapter must not accidentally query:
+
+```text
+tt1234567
+```
+
+without preserving:
+
+```text
+season = 2
+episode = 7
+```
+
+That deserves an explicit test.
+
+## 203. Test: episode isolation
+
+```ts
+it("preserves season and episode", async () => {
+  const adapter = new RecordingAdapter();
+
+  registry.register(adapter);
+
+  await resolver.resolve({
+    type: "series",
+    id: "tt1234567",
+    season: 2,
+    episode: 7
+  });
+
+  expect(adapter.lastQuery).toMatchObject({
+    media: {
+      season: 2,
+      episode: 7
+    }
+  });
+});
+```
+
+This catches a surprisingly damaging class of bugs.
+
+## 204. Stremio integration test
+
+Now don't test only internal functions.
+
+Test the actual HTTP boundary.
+
+Conceptually:
+
+```text
+test
+    ↓
+start addon server
+    ↓
+GET /manifest.json
+    ↓
+GET /stream/movie/...
+    ↓
+parse JSON
+    ↓
+assert protocol shape
+```
+
+This is the first test that actually validates:
+
+```text
+our code + SDK + HTTP server + manifest + handler
+```
+
+## 205. Manifest contract test
+
+```ts
+it("serves a valid manifest", async () => {
+  const response = await fetch(`${baseUrl}/manifest.json`);
+
+  expect(response.status).toBe(200);
+
+  const manifest = await response.json();
+
+  expect(manifest.id).toBeTruthy();
+
+  expect(manifest.version).toBeTruthy();
+
+  expect(manifest.resources).toContain("stream");
+
+  expect(manifest.types).toContain("movie");
+});
+```
+
+This should become a release gate.
+
+## 206. Stream contract test
+
+```ts
+it("returns Stremio-compatible streams", async () => {
+  const response = await fetch(`${baseUrl}/stream/movie/tt1234567.json`);
+
+  expect(response.status).toBe(200);
+
+  const body = await response.json();
+
+  expect(Array.isArray(body.streams)).toBe(true);
+
+  for (const stream of body.streams) {
+    expect(typeof stream.url).toBe("string");
+  }
+});
+```
+
+The test deliberately avoids requiring a particular real source.
+
+It tests the protocol contract.
+
+## 207. Contract fixtures
+
+Create:
+
+```text
+test/
+└── fixtures/
+    ├── movie.json
+    ├── series.json
+    ├── candidate.json
+    ├── subtitle.json
+    └── manifest.json
+```
+
+Fixtures should represent:
+
+```text
+valid
+invalid
+ambiguous
+empty
+partial
+```
+
+not just happy paths.
+
+## 208. Golden protocol fixtures
+
+A powerful approach is:
+
+```text
+input fixture
+      ↓
+resolver
+      ↓
+normalized output
+      ↓
+canonical JSON
+      ↓
+compare
+```
+
+For deterministic outputs, this gives a simple regression mechanism.
+
+But don't snapshot volatile values such as:
+
+```text
+timestamps
+request IDs
+latency
+```
+
+unless explicitly normalized.
+
+## 209. Canonical JSON
+
+For protocol fixtures, stable serialization helps.
+
+The test should normalize:
+
+```text
+object key order
+dynamic timestamps
+IDs
+```
+
+before comparison.
+
+For stronger artifact evidence, use canonical JSON rather than relying
+on incidental JavaScript object ordering.
+
+## 210. Adapter conformance suite
+
+Every adapter should pass the same tests.
+
+Define:
+
+```ts
+interface AdapterFactory {
+  create(): SourceAdapter;
+}
+```
+
+Then a shared suite:
+
+```text
+describeAdapterContract(createAdapter)
+```
+
+Tests:
+
+```text
+supports()
+resolve()
+timeout
+abort
+malformed response
+empty result
+authorization status
+candidate normalization
+```
+
+Now adding a source means:
+
+```text
+implement adapter + pass conformance suite
+```
+
+rather than inventing bespoke tests.
+
+## 211. Adapter ≠ permission
+
+Even if an adapter passes every structural test:
+
+```text
+adapter conformance = PASS
+```
+
+that does not mean:
+
+```text
+source authorization = PASS
+```
+
+The latter must be established by the adapter's configured source
+policy and evidence.
+
+This distinction should remain visible in CI.
+
+## 212. Source configuration
+
+A source adapter should declare its authorization model.
+
+```ts
+export interface SourcePolicy {
+  readonly authorizationMode:
+    | "configured_owned"
+    | "public_domain"
+    | "licensed"
+    | "unknown";
+}
+```
+
+Then startup can reject:
+
+```text
+authorizationMode = "unknown"
+```
+
+for production deployments if desired.
+
+This is stronger than hoping policy is respected at runtime.
+
+## 213. Configuration admission
+
+Use a startup gate:
+
+```text
+config
+    ↓
+validate
+    ↓
+policy admission
+    ↓
+construct adapter
+```
+
+not:
+
+```text
+construct adapter
+    ↓
+discover later that configuration is unsafe
+```
+
+So:
+
+```text
+INVALID CONFIGURATION
+        ↓
+startup failure
+```
+
+rather than:
+
+```text
+runtime surprises
+```
+
+## 214. Source registry admission
+
+The registry can become:
+
+```ts
+export interface AdapterAdmission {
+  readonly allowed: boolean;
+  readonly reasons: readonly string[];
+}
+```
+
+Then:
+
+```text
+register(adapter, admission)
+```
+
+or better:
+
+```text
+validate adapter configuration
+        ↓
+admitted adapter
+        ↓
+registry
+```
+
+The registry should contain only operationally admitted adapters.
+
+## 215. No dynamic arbitrary adapters
+
+Avoid an endpoint such as:
+
+```text
+POST /add-source
+{
+  "url": "..."
+}
+```
+
+unless you have a very strong trust model.
+
+Otherwise the addon becomes:
+
+```text
+remote SSRF executor
+```
+
+The source registry should normally be configured by deployment
+configuration, not by arbitrary HTTP callers.
+
+## 216. Security boundary map
+
+At this point:
+
+```text
+                    UNTRUSTED
+                        │
+              ┌─────────┴─────────┐
+              │                   │
+       Stremio request       Provider response
+              │                   │
+              ▼                   ▼
+        parser/validator     schema validation
+              │                   │
+              └─────────┬─────────┘
+                        ▼
+                   domain types
+                        │
+                        ▼
+                     policy
+                        │
+                        ▼
+                   eligible data
+                        │
+                        ▼
+                   presentation
+```
+
+Every boundary transforms untrusted representation into a constrained
+internal representation.
+
+## 217. Failure taxonomy for the whole addon
+
+We can now unify errors.
+
+```ts
+export type FailureCode =
+  | "invalid_request"
+  | "identity_not_found"
+  | "identity_ambiguous"
+  | "source_empty"
+  | "source_timeout"
+  | "source_aborted"
+  | "source_rate_limited"
+  | "source_circuit_open"
+  | "source_invalid_response"
+  | "source_network_error"
+  | "candidate_invalid"
+  | "candidate_not_authorized"
+  | "internal_error";
+```
+
+Do not expose all of these directly to Stremio.
+
+They are internal diagnostic semantics.
+
+## 218. Result envelope
+
+Instead of returning only arrays internally:
+
+```ts
+export interface ResolverResult<T> {
+  readonly status: "success" | "empty" | "partial" | "failed";
+
+  readonly value: readonly T[];
+
+  readonly failures: readonly Failure[];
+
+  readonly sourceCount: number;
+
+  readonly durationMs: number;
+}
+```
+
+This lets the system distinguish:
+
+```text
+zero sources because none exist
+```
+
+from:
+
+```text
+zero sources because every provider failed
+```
+
+That distinction is operationally crucial.
+
+## 219. Example
+
+Case A:
+
+```text
+source A → empty
+source B → empty
+source C → empty
+```
+
+Result:
+
+```text
+status = empty
+```
+
+Case B:
+
+```text
+source A → timeout
+source B → network error
+source C → circuit open
+```
+
+Result:
+
+```text
+status = failed
+```
+
+Case C:
+
+```text
+source A → success
+source B → timeout
+source C → empty
+```
+
+Result:
+
+```text
+status = partial
+```
+
+All three could produce:
+
+```json
+{
+  "streams": []
+}
+```
+
+at the Stremio boundary, but they are **not the same internal event**.
+
+## 220. This is where observability becomes evidence architecture
+
+We can now formalize:
+
+```text
+Protocol result
+    ≠ Resolver result
+    ≠ Adapter result
+    ≠ HTTP result
+```
+
+For example:
+
+```text
+HTTP: 200
+Adapter: success
+Resolver: partial
+Policy: 3 candidates rejected
+Final: 2 streams
+```
+
+That's much more useful than a single boolean:
+
+```text
+success: true
+```
+
+## 221. End-to-end state machine
+
+The addon is now approximately:
+
+```text
+REQUEST
+   │
+   ▼
+PARSE
+   │
+   ├── invalid ───────────────→ REJECT
+   │
+   ▼
+IDENTIFY
+   │
+   ├── ambiguous ────────────→ NO_RESOLUTION
+   │
+   ├── not found ────────────→ NO_RESOLUTION
+   │
+   ▼
+DISCOVER
+   │
+   ▼
+NORMALIZE
+   │
+   ▼
+VALIDATE
+   │
+   ▼
+AUTHORIZE
+   │
+   ├── rejected ─────────────→ DISCARD
+   │
+   ▼
+DEDUP
+   │
+   ▼
+RANK
+   │
+   ▼
+MAP
+   │
+   ▼
+STREMIO RESPONSE
+```
+
+This is now a complete semantic pipeline.
+
+## 222. R4 — Protocol Conformance Gate
+
+```text
+R4
+────────────────────────────────────────
+
+MANIFEST
+[✓] Static capability declaration
+[✓] Versioned
+[✓] Type declarations
+[ ] SDK-version compile verification
+
+PARSING
+[✓] Movie IDs
+[✓] Series IDs
+[✓] Season/episode preservation
+[✓] Invalid input rejection
+
+STREAM
+[✓] Handler boundary
+[✓] Candidate → stream mapping
+[✓] Empty result semantics
+[ ] Live SDK integration test
+
+CATALOG
+[✓] Contract
+[ ] Provider implementation
+
+META
+[✓] Contract
+[ ] Provider implementation
+
+SUBTITLE
+[✓] Domain model
+[✓] Resolver architecture
+[ ] Protocol implementation
+
+ERRORS
+[✓] Internal failure taxonomy
+[✓] Partial/empty/failed distinction
+
+SECURITY
+[✓] No arbitrary source registration
+[✓] No automatic media proxy
+[✓] Protocol/domain separation
+
+TESTING
+[✓] Unit contracts
+[✓] End-to-end test design
+[ ] Actual CI execution
+[ ] Container smoke test
+```
+
+### Status
+
+**R4 = ARCHITECTURALLY DEFINED / NOT EXECUTION-VERIFIED**
+
+The next major step is no longer another abstraction layer. It is the
+**actual executable reference implementation**:
+
+```text
+package.json
+tsconfig.json
+src/index.ts
+manifest
+domain
+runtime
+resolver
+one explicitly authorized/public-domain adapter
+tests
+Dockerfile
+compose.yaml
+CI
+```
+
+Then we can freeze the first **`v0.1.0-conformance` baseline**, run the
+entire suite, and only after evidence exists begin adding additional
+source adapters.
