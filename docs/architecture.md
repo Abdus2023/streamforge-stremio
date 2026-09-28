@@ -6104,3 +6104,1053 @@ subtitle tracks
 That layer introduces a second major problem: **identity resolution is
 not the same thing as source discovery**, and conflating them will
 eventually produce incorrect matches.
+
+## 153. Identity resolution: the missing layer
+
+We now have a working conceptual stream pipeline, but there is a
+deeper problem:
+
+```text
+"Which movie is this?"
+```
+
+is not the same question as:
+
+```text
+"Where can I play it?"
+```
+
+The system should therefore become:
+
+```text
+                    Stremio
+                        │
+                        ▼
+                  Request Parser
+                        │
+                        ▼
+                 Identity Resolver
+                        │
+                        ▼
+                  Canonical MediaRef
+                        │
+                        ▼
+                 Source Aggregator
+                        │
+               ┌────────┴────────┐
+               ▼                 ▼
+            Streams           Subtitles
+```
+
+This is important because a source can be perfectly reachable while
+referring to the **wrong work**.
+
+## 154. Identity is evidence, not a string
+
+Do not treat:
+
+```text
+tt1234567
+```
+
+as magically proving identity.
+
+Instead model identity evidence.
+
+```ts
+export type IdentityKind = "imdb" | "tmdb" | "tvdb" | "internal";
+
+export interface ExternalIdentity {
+  readonly kind: IdentityKind;
+  readonly value: string;
+}
+```
+
+Then:
+
+```ts
+export interface MediaIdentity {
+  readonly canonical?: ExternalIdentity;
+
+  readonly aliases: readonly ExternalIdentity[];
+
+  readonly evidence: readonly IdentityEvidence[];
+}
+```
+
+## 155. Identity evidence
+
+```ts
+export interface IdentityEvidence {
+  readonly provider: string;
+
+  readonly matchedBy:
+    | "exact_id"
+    | "external_id"
+    | "title_year"
+    | "title_episode"
+    | "manual";
+
+  readonly confidence: "verified" | "probable" | "ambiguous";
+
+  readonly observedAt: string;
+}
+```
+
+The word `confidence` here is **not** a probabilistic claim.
+
+It describes the evidence classification.
+
+## 156. Never silently resolve ambiguity
+
+Suppose the user requests:
+
+```text
+The Office
+```
+
+There can be multiple works.
+
+Bad:
+
+```text
+"The Office" → arbitrary result
+```
+
+Better:
+
+```text
+title match
+    ↓
+multiple candidates
+    ↓
+AMBIGUOUS
+```
+
+For Stremio, the catalog/metadata layer should ideally provide a
+stable external identifier before stream resolution.
+
+## 157. Canonical media identity
+
+Create:
+
+```ts
+export interface CanonicalMedia {
+  readonly type: "movie" | "series";
+
+  readonly canonicalId: string;
+
+  readonly imdbId?: string;
+
+  readonly tmdbId?: string;
+
+  readonly title: string;
+
+  readonly year?: number;
+
+  readonly season?: number;
+
+  readonly episode?: number;
+}
+```
+
+This becomes the input to source aggregation.
+
+## 158. Movie and episode identity
+
+Do not model:
+
+```text
+series: tt123
+```
+
+as sufficient for an episode.
+
+Instead:
+
+```text
+Series:
+  canonical series identity
+
+Episode:
+  series identity
+  season
+  episode
+```
+
+Therefore:
+
+```ts
+export interface EpisodeRef {
+  readonly series: CanonicalMedia;
+  readonly season: number;
+  readonly episode: number;
+}
+```
+
+This prevents a source adapter from accidentally resolving the entire
+series when the user requested S02E04.
+
+## 159. Identity normalization
+
+Create:
+
+```text
+src/identity/
+├── resolver.ts
+├── normalize.ts
+├── evidence.ts
+├── parser.ts
+└── types.ts
+```
+
+The identity resolver's job:
+
+```text
+external ID
+    ↓
+validate
+    ↓
+normalize
+    ↓
+lookup aliases
+    ↓
+canonical identity
+```
+
+It should not retrieve streams.
+
+## 160. Source adapter contract changes
+
+Earlier:
+
+```ts
+resolve(media: MediaRef);
+```
+
+Now we can make the contract more explicit:
+
+```ts
+export interface SourceQuery {
+  readonly media: CanonicalMedia;
+}
+
+export interface SourceAdapter {
+  readonly id: string;
+
+  supports(media: CanonicalMedia): boolean;
+
+  resolve(query: SourceQuery, ctx: ResolveContext): Promise<SourceCandidate[]>;
+}
+```
+
+The adapter receives a normalized identity.
+
+This prevents every adapter from implementing its own IMDb/TMDB
+parsing.
+
+## 161. Identity aliases
+
+A movie might have:
+
+```text
+IMDb: tt1234567
+
+TMDB: 12345
+
+internal: movie:12345
+```
+
+These are not three movies.
+
+They are:
+
+```text
+              canonical work
+              /      |       \
+          IMDb     TMDB    internal
+```
+
+The identity resolver owns that relationship.
+
+## 162. Identity conflicts
+
+Suppose:
+
+```text
+IMDb → Movie A
+TMDB → Movie B
+```
+
+Do not arbitrarily choose.
+
+Return:
+
+```ts
+export type IdentityResolution =
+  | {
+      readonly status: "resolved";
+      readonly media: CanonicalMedia;
+    }
+  | {
+      readonly status: "ambiguous";
+      readonly candidates: readonly CanonicalMedia[];
+    }
+  | {
+      readonly status: "not_found";
+    };
+```
+
+This is exactly where preserving UNKNOWN/AMBIGUOUS prevents silent
+corruption.
+
+## 163. Metadata is a separate capability
+
+The addon may eventually expose:
+
+```text
+catalog
+meta
+stream
+subtitle
+```
+
+These should remain separate handlers.
+
+```text
+Catalog
+    ↓
+"What exists?"
+
+Meta
+    ↓
+"What is this?"
+
+Stream
+    ↓
+"Where can I play it?"
+
+Subtitle
+    ↓
+"What subtitle tracks exist?"
+```
+
+Don't make `stream` responsible for metadata.
+
+## 164. Catalog strategy
+
+There are two possible architectures.
+
+### A. Curated catalog
+
+```text
+your catalog
+    ↓
+stable IDs
+```
+
+Useful for:
+
+- public-domain media
+- user-owned libraries
+- explicitly authorized collections
+
+### B. Metadata catalog
+
+```text
+metadata provider
+    ↓
+canonical catalog
+```
+
+The addon doesn't host the media.
+
+It only exposes metadata and resolves authorized playback sources.
+
+## 165. Catalog identity should be deterministic
+
+A catalog item should have:
+
+```ts
+interface CatalogItem {
+  readonly id: string;
+  readonly type: "movie" | "series";
+  readonly name: string;
+  readonly poster?: string;
+  readonly year?: number;
+}
+```
+
+The ID must remain stable.
+
+Bad:
+
+```text
+id = title.toLowerCase()
+```
+
+because titles can collide.
+
+Better:
+
+```text
+imdb:tt1234567
+```
+
+or another explicitly defined canonical namespace.
+
+## 166. Namespace IDs
+
+Use prefixes internally:
+
+```text
+imdb:tt1234567
+tmdb:123456
+internal:movie:abc123
+```
+
+This avoids ambiguity between numeric identifiers.
+
+```ts
+export interface NamespacedId {
+  readonly namespace: "imdb" | "tmdb" | "internal";
+
+  readonly value: string;
+}
+```
+
+## 167. Subtitle architecture
+
+Subtitles should not be bolted onto `SourceCandidate`.
+
+They are a separate resource.
+
+```ts
+export interface SubtitleCandidate {
+  readonly id: string;
+
+  readonly media: MediaRef;
+
+  readonly url: string;
+
+  readonly language: string;
+
+  readonly format: "srt" | "vtt" | "ass" | "ssa" | "unknown";
+
+  readonly hearingImpaired?: boolean;
+
+  readonly forced?: boolean;
+
+  readonly provenance: {
+    readonly adapter: string;
+    readonly observedAt: string;
+  };
+
+  readonly authorization: {
+    readonly status: "authorized" | "unknown" | "denied";
+  };
+}
+```
+
+Again:
+
+```text
+stream authorization
+```
+
+and:
+
+```text
+subtitle authorization
+```
+
+are separate facts.
+
+## 168. Subtitle pipeline
+
+Use the same architecture:
+
+```text
+Subtitle sources
+      ↓
+Adapters
+      ↓
+Normalize
+      ↓
+Validate
+      ↓
+Policy
+      ↓
+Dedup
+      ↓
+Rank
+      ↓
+Stremio subtitle mapper
+```
+
+Do not create a second completely different architecture.
+
+## 169. Subtitle ranking
+
+Possible deterministic ordering:
+
+```text
+1. requested language
+2. exact language/region match
+3. forced preference
+4. hearing-impaired preference
+5. format
+6. source ID
+```
+
+But configuration matters.
+
+For example:
+
+```ts
+export interface SubtitlePreferences {
+  readonly languages: readonly string[];
+
+  readonly preferForced: boolean;
+
+  readonly preferHearingImpaired: boolean;
+}
+```
+
+## 170. Language matching
+
+Do not compare:
+
+```text
+"en" === "en-US"
+```
+
+as a simple string equality rule.
+
+Normalize language tags.
+
+Conceptually:
+
+```text
+en
+│
+├── en-US
+├── en-GB
+├── en-AU
+└── en-CA
+```
+
+The preference algorithm can distinguish:
+
+```text
+exact match
+regional match
+language-only match
+```
+
+## 171. Subtitle deduplication
+
+Two subtitle providers can produce the same track.
+
+Canonicalize:
+
+```text
+media + language + forced + hearing-impaired + normalized URL
+```
+
+But URL equality alone is insufficient.
+
+Two URLs can represent identical subtitles.
+
+For stronger deduplication:
+
+```text
+download authorized subtitle
+      ↓
+content hash
+      ↓
+deduplicate
+```
+
+Only do this when the source policy explicitly permits retrieving the
+subtitle data.
+
+## 172. Don't download arbitrary subtitle URLs through the addon
+
+The same security rule applies:
+
+```text
+provider
+    ↓
+subtitle URL
+```
+
+does not automatically mean:
+
+```text
+addon server
+    ↓
+download URL
+```
+
+unless that origin is permitted by the HTTP policy.
+
+Prefer returning a direct URL to the client when possible.
+
+## 173. Stream and subtitle provenance
+
+Eventually the UI should be able to communicate:
+
+```text
+Source A
+1080p
+H.264
+English audio
+```
+
+and:
+
+```text
+Subtitle B
+English
+SRT
+```
+
+without leaking internal implementation details.
+
+This suggests a presentation model.
+
+## 174. Presentation metadata
+
+Add optional fields:
+
+```ts
+export interface CandidatePresentation {
+  readonly label?: string;
+
+  readonly languageLabel?: string;
+
+  readonly qualityLabel?: string;
+}
+```
+
+But keep these derived:
+
+```text
+SourceCandidate
+     │
+     ▼
+presentation derivation
+```
+
+not manually duplicated across adapters.
+
+## 175. Quality semantics
+
+Don't treat:
+
+```text
+1080p
+```
+
+as proof of actual video resolution.
+
+It is a metadata claim unless verified.
+
+Therefore:
+
+```text
+mediaInfo.width
+mediaInfo.height
+```
+
+may have evidence status later:
+
+```ts
+readonly evidence:
+  "source_declared"
+  | "observed"
+  | "verified";
+```
+
+This is more rigorous.
+
+## 176. Candidate evidence
+
+Extend:
+
+```ts
+export interface FieldEvidence {
+  readonly origin: "source_declared" | "observed" | "derived";
+
+  readonly observedAt?: string;
+}
+```
+
+Then:
+
+```ts
+export interface MediaInfo {
+  readonly width?: number;
+  readonly height?: number;
+
+  readonly evidence?: {
+    readonly resolution?: FieldEvidence;
+  };
+}
+```
+
+This prevents the UI from confusing:
+
+```text
+provider says 1080p
+```
+
+with:
+
+```text
+we measured 1080p
+```
+
+## 177. Stream probing
+
+If later desired:
+
+```text
+Candidate
+    ↓
+optional probe
+    ↓
+observed metadata
+```
+
+But probing should never silently replace the source declaration.
+
+Store:
+
+```text
+declared: 1080p
+observed: 1920×1080
+```
+
+rather than mutating history.
+
+## 178. Metadata cache
+
+Metadata has a different TTL from stream candidates.
+
+For example conceptually:
+
+```text
+catalog: long TTL
+
+metadata: long TTL
+
+source candidates: short TTL
+
+health: very short TTL
+```
+
+Therefore don't use one universal cache.
+
+```ts
+interface CacheNamespace {
+  readonly name: string;
+  readonly freshMs: number;
+  readonly staleMs: number;
+}
+```
+
+## 179. Identity cache
+
+Identity resolution is especially suitable for caching.
+
+```text
+"tt1234567"
+    ↓
+canonical identity
+```
+
+The result changes much less frequently than:
+
+```text
+available stream URLs
+```
+
+Therefore identity results can use a long-lived cache namespace,
+separate from and much longer than the source-candidate cache.
+
+## 180. Identity failure cache
+
+Be careful caching:
+
+```text
+NOT_FOUND
+```
+
+forever.
+
+A temporary provider outage could masquerade as:
+
+```text
+media doesn't exist
+```
+
+Instead classify:
+
+```text
+NOT_FOUND
+PROVIDER_UNAVAILABLE
+INVALID_INPUT
+AMBIGUOUS
+```
+
+and use different cache policies.
+
+## 181. Complete domain topology
+
+The project now becomes:
+
+```text
+                         ┌───────────────┐
+                          │    Stremio    │
+                          └───────┬───────┘
+                                  │
+                ┌─────────────────┼─────────────────┐
+                │                 │                 │
+                ▼                 ▼                 ▼
+             Catalog             Meta             Stream
+                │                                   │
+                └──────────────┬────────────────────┘
+                               ▼
+                      Identity Resolver
+                               │
+                               ▼
+                      Canonical Media
+                               │
+              ┌────────────────┴────────────────┐
+              ▼                                 ▼
+        Stream Resolver                  Subtitle Resolver
+              │                                 │
+              ▼                                 ▼
+         Source adapters                    Sub adapters
+              │                                 │
+              └──────────────┬──────────────────┘
+                             ▼
+                     Runtime substrate
+```
+
+## 182. Repository evolution
+
+```text
+src/
+├── addon/
+│   ├── catalog-handler.ts
+│   ├── meta-handler.ts
+│   ├── stream-handler.ts
+│   ├── subtitle-handler.ts
+│   ├── manifest.ts
+│   └── parser.ts
+│
+├── domain/
+│   ├── media.ts
+│   ├── identity.ts
+│   ├── candidate.ts
+│   ├── subtitle.ts
+│   ├── failure.ts
+│   └── result.ts
+│
+├── identity/
+│   ├── resolver.ts
+│   ├── normalize.ts
+│   ├── evidence.ts
+│   └── cache.ts
+│
+├── adapters/
+│   ├── streams/
+│   │   ├── interface.ts
+│   │   ├── registry.ts
+│   │   └── ...
+│   │
+│   ├── subtitles/
+│   │   ├── interface.ts
+│   │   ├── registry.ts
+│   │   └── ...
+│   │
+│   └── metadata/
+│       ├── interface.ts
+│       └── ...
+│
+├── resolver/
+│   ├── stream-resolver.ts
+│   ├── subtitle-resolver.ts
+│   ├── normalize.ts
+│   ├── validate.ts
+│   ├── policy.ts
+│   ├── dedupe.ts
+│   └── rank.ts
+│
+├── runtime/
+│   ├── timeout.ts
+│   ├── semaphore.ts
+│   ├── limiter.ts
+│   ├── breaker.ts
+│   ├── cache.ts
+│   ├── http.ts
+│   └── inflight.ts
+│
+└── observability/
+    ├── logger.ts
+    ├── metrics.ts
+    └── health.ts
+```
+
+## 183. The crucial abstraction: Resolver ≠ Provider
+
+We can now state the architecture more formally.
+
+```text
+Resolver = policy-governed composition of observations
+
+Provider adapter = translator from external representation to
+                    internal candidate
+```
+
+Therefore:
+
+```text
+Provider adapter MUST NOT decide:
+    global ranking
+    global authorization policy
+    global deduplication
+    Stremio representation
+```
+
+And:
+
+```text
+Resolver MUST NOT know:
+    provider JSON schema
+    provider-specific pagination
+    provider-specific field names
+```
+
+That is the interface contract.
+
+## 184. Authorization boundary
+
+The complete chain should now be:
+
+```text
+External source
+      │
+      ▼
+Observation
+      │
+      ▼
+Candidate
+      │
+      ▼
+Authorization evidence
+      │
+      ▼
+Policy decision
+      │
+      ▼
+Eligible candidate
+      │
+      ▼
+Ranking
+      │
+      ▼
+Stremio
+```
+
+Never:
+
+```text
+URL found
+    ↓
+therefore authorized
+```
+
+## 185. What this means for the Popcorn-Time-style experience
+
+The UX can still be:
+
+```text
+Movie
+    ↓
+play
+    ↓
+multiple sources
+    ↓
+quality/language choices
+```
+
+But the backend semantics are cleaner:
+
+```text
+Popcorn-Time-style UX
+        ≠
+Popcorn-Time-style acquisition mechanism
+```
+
+The aggregator can support authorized/public-domain/user-owned sources
+without embedding unauthorized scraping or bypass mechanisms.
+
+## 186. R3 release gate
+
+```text
+R3 — Identity + Resource Model
+────────────────────────────────────
+
+IDENTITY
+[✓] Namespaced IDs
+[✓] Canonical media
+[✓] Movie identity
+[✓] Episode identity
+[✓] Identity evidence
+[✓] Ambiguity preservation
+[✓] Identity cache semantics
+
+METADATA
+[✓] Catalog model
+[✓] Meta model
+[ ] Metadata adapter implementation
+
+STREAMS
+[✓] Candidate model
+[✓] Policy
+[✓] Ranking
+[✓] Stremio mapper
+
+SUBTITLES
+[✓] Independent candidate model
+[✓] Language semantics
+[✓] Policy boundary
+[✓] Ranking design
+[ ] Adapter implementation
+[ ] Stremio subtitle integration
+
+SECURITY
+[✓] Server-side proxy avoided by default
+[✓] URL credentials rejected
+[✓] Redirect boundary defined
+[✓] Response-size boundary
+[ ] DNS/IP binding implementation
+
+TESTING
+[✓] Identity invariants defined
+[✓] Stream invariants defined
+[ ] Subtitle conformance tests
+[ ] Metadata conformance tests
+[ ] Full Stremio integration
+```
+
+**Status: PROVISIONAL architecture; not execution-verified.**
+
+The next step is to build the **actual Stremio addon surface**:
+manifest generation, `/manifest.json`, catalog/meta/stream/subtitle
+handlers, deterministic request parsing, and an integration test that
+treats Stremio itself as the external protocol contract.
