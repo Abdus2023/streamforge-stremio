@@ -3611,3 +3611,1280 @@ health/readiness endpoints
 
 After that, the Stremio addon becomes a relatively thin shell around a
 hardened aggregation engine rather than the engine itself.
+
+## 86. Runtime substrate: make source resolution production-grade
+
+The next layer should make the resolver **bounded, cancellable,
+observable, and resistant to a bad source**.
+
+The execution contract becomes:
+
+```text
+                   resolve(media)
+                         │
+                         ▼
+                 ┌──────────────┐
+                 │ Source       │
+                 │ Registry     │
+                 └──────┬───────┘
+                        │
+                  applicable[]
+                        │
+                        ▼
+               ┌─────────────────┐
+               │ Execution Guard │
+               └────────┬────────┘
+                        │
+         ┌──────────────┼──────────────┐
+         ▼              ▼              ▼
+    concurrency     rate limit     breaker
+         │              │              │
+         └──────────────┼──────────────┘
+                        ▼
+                     timeout
+                        │
+                        ▼
+                  adapter.resolve()
+                        │
+                        ▼
+                     result
+```
+
+The key rule:
+
+**A source adapter gets a bounded opportunity to produce evidence. It
+does not get control over the resolver.**
+
+## 87. Cancellation first
+
+A timeout without cancellation is incomplete.
+
+This is bad:
+
+```ts
+await Promise.race([adapter.resolve(), timeout()]);
+```
+
+because `adapter.resolve()` may continue running after the resolver has
+already moved on.
+
+Instead, propagate `AbortSignal`.
+
+```ts
+export interface ResolveContext {
+  readonly signal: AbortSignal;
+  readonly timeoutMs: number;
+  readonly preferredLanguages: readonly string[];
+}
+```
+
+HTTP requests should receive it:
+
+```ts
+const response = await fetch(url, { signal: ctx.signal });
+```
+
+## 88. Per-adapter timeout
+
+Create:
+
+```text
+src/runtime/timeout.ts
+```
+
+```ts
+export async function withTimeout<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  timeoutMs: number,
+  parentSignal?: AbortSignal
+): Promise<T> {
+  const controller = new AbortController();
+
+  const onAbort = () => controller.abort(parentSignal?.reason);
+
+  if (parentSignal) {
+    if (parentSignal.aborted) {
+      controller.abort(parentSignal.reason);
+    } else {
+      parentSignal.addEventListener("abort", onAbort, { once: true });
+    }
+  }
+
+  const timer = setTimeout(() => {
+    controller.abort(new Error("timeout"));
+  }, timeoutMs);
+
+  try {
+    return await operation(controller.signal);
+  } finally {
+    clearTimeout(timer);
+
+    parentSignal?.removeEventListener("abort", onAbort);
+  }
+}
+```
+
+Now:
+
+```text
+request cancellation
+        │
+        ├── client disconnects
+        │
+        ├── global timeout
+        │
+        └── source timeout
+               │
+               ▼
+           AbortSignal
+               │
+               ▼
+           HTTP request
+```
+
+## 89. Global versus source timeout
+
+Don't use one timeout for everything.
+
+Define:
+
+```ts
+export interface RuntimeLimits {
+  readonly totalMs: number;
+  readonly perSourceMs: number;
+  readonly maxSources: number;
+}
+```
+
+For example:
+
+```text
+Total request budget         4000 ms
+           │
+      ┌─────┴─────┐
+      │           │
+  source A      source B
+   1200ms        1200ms
+```
+
+The source timeout should be smaller than the overall request budget.
+
+## 90. Global cancellation
+
+At the resolver level:
+
+```ts
+const controller = new AbortController();
+
+const timer = setTimeout(
+  () => controller.abort(new Error("resolution_timeout")),
+  config.totalTimeoutMs
+);
+
+try {
+  // resolve
+} finally {
+  clearTimeout(timer);
+}
+```
+
+Now every source receives the same upper-level cancellation.
+
+## 91. Concurrency limiter
+
+Suppose you eventually have:
+
+```text
+25 source adapters
+```
+
+Calling all 25 simultaneously is unnecessary.
+
+Implement a bounded scheduler.
+
+```ts
+export class Semaphore {
+  private active = 0;
+
+  private readonly queue: (() => void)[] = [];
+
+  constructor(private readonly capacity: number) {}
+
+  async acquire(): Promise<() => void> {
+    if (this.active < this.capacity) {
+      this.active++;
+      return () => this.release();
+    }
+
+    await new Promise<void>(resolve => this.queue.push(resolve));
+
+    this.active++;
+
+    return () => this.release();
+  }
+
+  private release(): void {
+    this.active--;
+
+    const next = this.queue.shift();
+
+    next?.();
+  }
+}
+```
+
+Usage:
+
+```ts
+const release = await semaphore.acquire();
+
+try {
+  return await adapter.resolve(media, ctx);
+} finally {
+  release();
+}
+```
+
+## 92. Why the semaphore belongs outside adapters
+
+The adapter should not know:
+
+```text
+"I am source #7 and the process allows six concurrent requests."
+```
+
+That's runtime policy.
+
+Therefore:
+
+```text
+Adapter
+    ↓
+pure source-specific operation
+
+Runtime
+    ↓
+global resource governance
+```
+
+This preserves adapter portability.
+
+## 93. Per-source concurrency
+
+You may eventually need both:
+
+```text
+global concurrency
+        +
+per-source concurrency
+```
+
+Example:
+
+```text
+Global = 8
+
+Source A = max 2
+Source B = max 2
+Source C = max 1
+Source D = max 3
+```
+
+This prevents one popular adapter from consuming the entire process.
+
+## 94. Rate limiter
+
+Rate limiting is different from concurrency.
+
+```text
+Concurrency: "How many requests may be running?"
+
+Rate limit: "How frequently may requests start?"
+```
+
+A simple token bucket is appropriate.
+
+```ts
+export class TokenBucket {
+  private tokens: number;
+
+  private lastRefill = Date.now();
+
+  constructor(
+    private readonly capacity: number,
+    private readonly refillPerSecond: number
+  ) {
+    this.tokens = capacity;
+  }
+
+  tryConsume(): boolean {
+    this.refill();
+
+    if (this.tokens < 1) {
+      return false;
+    }
+
+    this.tokens--;
+
+    return true;
+  }
+
+  private refill(): void {
+    const now = Date.now();
+
+    const elapsed = (now - this.lastRefill) / 1000;
+
+    this.tokens = Math.min(
+      this.capacity,
+      this.tokens + elapsed * this.refillPerSecond
+    );
+
+    this.lastRefill = now;
+  }
+}
+```
+
+For the first release, returning a controlled `rate_limited` result is
+preferable to an uncontrolled queue that can inflate latency.
+
+## 95. Circuit breaker
+
+Now make the earlier breaker production-safe.
+
+```ts
+type BreakerState = "closed" | "open" | "half-open";
+
+export class CircuitBreaker {
+  private state: BreakerState = "closed";
+
+  private failures = 0;
+
+  private openedAt = 0;
+
+  constructor(
+    private readonly threshold = 5,
+    private readonly cooldownMs = 30_000
+  ) {}
+
+  getState(): BreakerState {
+    this.transitionIfReady();
+
+    return this.state;
+  }
+
+  allowRequest(): boolean {
+    this.transitionIfReady();
+
+    if (this.state === "open") {
+      return false;
+    }
+
+    if (this.state === "half-open") {
+      this.state = "open";
+      return true;
+    }
+
+    return true;
+  }
+
+  success(): void {
+    this.state = "closed";
+    this.failures = 0;
+    this.openedAt = 0;
+  }
+
+  failure(): void {
+    this.failures++;
+
+    if (this.failures >= this.threshold) {
+      this.state = "open";
+      this.openedAt = Date.now();
+    }
+  }
+
+  private transitionIfReady(): void {
+    if (
+      this.state === "open" &&
+      Date.now() - this.openedAt >= this.cooldownMs
+    ) {
+      this.state = "half-open";
+    }
+  }
+}
+```
+
+The semantics are:
+
+```text
+CLOSED
+  │
+  │ repeated failures
+  ▼
+OPEN
+  │
+  │ cooldown
+  ▼
+HALF-OPEN
+  │
+  ├── success → CLOSED
+  │
+  └── failure → OPEN
+```
+
+## 96. Don't count every failure equally
+
+A malformed provider response is different from a temporary network
+failure.
+
+Define:
+
+```ts
+type FailureClass =
+  | "timeout"
+  | "network"
+  | "rate_limit"
+  | "server"
+  | "invalid_response"
+  | "authorization"
+  | "empty";
+```
+
+Then configure breaker behavior.
+
+For example:
+
+```text
+timeout          → breaker failure
+network          → breaker failure
+HTTP 500         → breaker failure
+invalid response → breaker failure
+
+empty            → NOT breaker failure
+authorization    → NOT necessarily breaker failure
+```
+
+An empty catalog doesn't mean the provider is broken.
+
+## 97. Execution guard
+
+Now combine the pieces.
+
+```ts
+interface SourceRuntime {
+  readonly semaphore: Semaphore;
+  readonly bucket: TokenBucket;
+  readonly breaker: CircuitBreaker;
+}
+```
+
+Execution:
+
+```ts
+async function executeGuarded(
+  adapter: SourceAdapter,
+  runtime: SourceRuntime,
+  media: MediaRef,
+  ctx: ResolveContext
+) {
+  if (!runtime.breaker.allowRequest()) {
+    return {
+      status: "circuit_open" as const,
+      candidates: []
+    };
+  }
+
+  if (!runtime.bucket.tryConsume()) {
+    return {
+      status: "rate_limited" as const,
+      candidates: []
+    };
+  }
+
+  const release = await runtime.semaphore.acquire();
+
+  try {
+    const candidates = await withTimeout(
+      signal =>
+        adapter.resolve(media, {
+          ...ctx,
+          signal
+        }),
+      ctx.timeoutMs,
+      ctx.signal
+    );
+
+    runtime.breaker.success();
+
+    return {
+      status: "success" as const,
+      candidates
+    };
+  } catch (error) {
+    runtime.breaker.failure();
+
+    return {
+      status: classifyFailure(error),
+      candidates: []
+    };
+  } finally {
+    release();
+  }
+}
+```
+
+Now the source cannot bypass runtime governance.
+
+## 98. Cache architecture
+
+Caching should happen at two levels.
+
+```text
+                   Resolver
+                       │
+              ┌────────┴────────┐
+              ▼                 ▼
+        Identity cache     Source cache
+              │                 │
+           metadata        candidates
+```
+
+A third cache is operational:
+
+```text
+health cache
+```
+
+## 99. Cache key
+
+Never use just:
+
+```text
+"movie:tt123"
+```
+
+for source results.
+
+Include relevant configuration:
+
+```ts
+interface SourceCacheKey {
+  readonly adapterId: string;
+  readonly mediaId: string;
+  readonly season?: number;
+  readonly episode?: number;
+  readonly language: string;
+}
+```
+
+Serialize deterministically:
+
+```ts
+function cacheKey(key: SourceCacheKey): string {
+  return [
+    key.adapterId,
+    key.mediaId,
+    key.season ?? "",
+    key.episode ?? "",
+    key.language
+  ].join(":");
+}
+```
+
+## 100. Cache state
+
+Don't make cache semantics binary.
+
+```ts
+type CacheState = "miss" | "fresh" | "stale";
+```
+
+A record:
+
+```ts
+interface CacheEntry<T> {
+  readonly value: T;
+
+  readonly createdAt: number;
+
+  readonly expiresAt: number;
+
+  readonly staleUntil: number;
+}
+```
+
+Then:
+
+```text
+created
+    │
+    ├──────── fresh ────────┐
+    │                       │
+    ▼                       ▼
+expires                 stale
+                            │
+                            ▼
+                        staleUntil
+                            │
+                            ▼
+                          dead
+```
+
+## 101. Stale-while-revalidate
+
+For a source query:
+
+```text
+cache fresh
+    │
+    └── return immediately
+
+cache stale
+    │
+    ├── return stale
+    │
+    └── refresh asynchronously
+
+cache dead
+    │
+    └── synchronous source query
+```
+
+This can significantly reduce perceived latency.
+
+But expose freshness internally:
+
+```ts
+interface CachedResolution<T> {
+  readonly value: T;
+  readonly state: "fresh" | "stale";
+}
+```
+
+Never pretend stale evidence is fresh.
+
+## 102. Cache stampede protection
+
+Without protection:
+
+```text
+100 users
+    │
+    ▼
+same uncached movie
+    │
+    ▼
+100 requests to provider
+```
+
+Instead maintain an in-flight map:
+
+```ts
+const inflight = new Map<string, Promise<unknown>>();
+```
+
+Conceptually:
+
+```text
+Request A ──┐
+Request B ──┤
+Request C ──┼──→ same promise
+Request D ──┤
+Request E ──┘
+```
+
+Only one provider request occurs.
+
+## 103. HTTP client boundary
+
+Don't allow adapters to use arbitrary `fetch()` everywhere.
+
+Provide:
+
+```ts
+interface SafeHttpClient {
+  getJson<T>(url: string, options?: RequestOptions): Promise<T>;
+
+  head(url: string, options?: RequestOptions): Promise<ResponseMetadata>;
+}
+```
+
+Then centralize:
+
+```text
+timeouts
+redirect rules
+maximum response size
+headers
+logging
+SSRF protection
+abort handling
+```
+
+This is a major security boundary.
+
+## 104. SSRF protection
+
+If your addon ever accepts user-configured endpoints, distinguish:
+
+```text
+trusted configured origin
+```
+
+from:
+
+```text
+arbitrary URL returned by provider
+```
+
+Never assume:
+
+```text
+"the provider gave me this URL"
+```
+
+means it is safe for your server to fetch.
+
+A server-side fetcher must consider:
+
+```text
+127.0.0.1
+localhost
+RFC1918 ranges
+link-local
+IPv6 loopback
+IPv6 private ranges
+metadata endpoints
+DNS rebinding
+redirects
+```
+
+A strong architecture is:
+
+```text
+Provider API
+     │
+     ▼
+metadata only
+     │
+     ▼
+Stremio
+     │
+     ▼
+client-side playback
+```
+
+whenever direct playback makes server-side proxying unnecessary.
+
+That substantially reduces your attack surface.
+
+## 105. Don't build a media proxy into v0.1
+
+A common temptation is:
+
+```text
+Stremio
+   ↓
+Addon
+   ↓
+your server
+   ↓
+source
+```
+
+But if Stremio can play:
+
+```text
+Stremio
+   ↓
+source
+```
+
+prefer the latter.
+
+The addon becomes:
+
+```text
+control plane
+```
+
+rather than:
+
+```text
+media data plane
+```
+
+This reduces:
+
+- bandwidth cost
+- server CPU
+- privacy exposure
+- legal complexity
+- failure modes
+- SSRF surface
+
+## 106. Observability
+
+Define structured events.
+
+```ts
+interface ResolutionEvent {
+  readonly requestId: string;
+
+  readonly mediaId: string;
+
+  readonly mediaType: string;
+
+  readonly adapterId?: string;
+
+  readonly status: string;
+
+  readonly durationMs: number;
+
+  readonly candidateCount?: number;
+}
+```
+
+Log JSON rather than prose.
+
+Example:
+
+```json
+{
+  "event": "adapter.resolve",
+  "requestId": "01K...",
+  "adapterId": "user-library",
+  "status": "success",
+  "durationMs": 184,
+  "candidateCount": 2
+}
+```
+
+## 107. Metrics
+
+Minimum metrics:
+
+```text
+resolver_requests_total
+resolver_success_total
+resolver_empty_total
+resolver_failure_total
+
+adapter_requests_total
+adapter_success_total
+adapter_timeout_total
+adapter_rate_limit_total
+adapter_error_total
+
+adapter_latency_ms
+
+cache_hit_total
+cache_miss_total
+cache_stale_total
+
+candidate_seen_total
+candidate_rejected_total
+candidate_emitted_total
+```
+
+Dimensions should be bounded.
+
+Good:
+
+```text
+adapter=user-library
+```
+
+Bad:
+
+```text
+url=https://random-user-generated-url...
+```
+
+Never allow unbounded user data to become metric labels.
+
+## 108. Health versus readiness
+
+Use two concepts.
+
+### Liveness
+
+Is the process alive?
+
+```text
+GET /health/live
+```
+
+Response:
+
+```json
+{
+  "status": "ok"
+}
+```
+
+### Readiness
+
+Can this instance serve requests?
+
+```text
+GET /health/ready
+```
+
+Example:
+
+```json
+{
+  "status": "ready",
+  "version": "0.1.0"
+}
+```
+
+A temporary source failure should generally **not** make the entire
+addon unready.
+
+That's an important distinction.
+
+## 109. Source health
+
+Expose operational state:
+
+```json
+{
+  "sources": {
+    "user-library": {
+      "state": "healthy"
+    },
+    "public-domain": {
+      "state": "degraded"
+    }
+  }
+}
+```
+
+But don't leak:
+
+```text
+API credentials
+private endpoint URLs
+user account IDs
+authorization headers
+```
+
+## 110. Request IDs
+
+Every inbound request gets:
+
+```text
+request_id
+```
+
+Then:
+
+```text
+Stremio request
+    │
+    ├── adapter A
+    ├── adapter B
+    └── adapter C
+          │
+          └── same request_id
+```
+
+This makes a production failure traceable:
+
+```text
+request 01K...
+  adapter A: 180ms success
+  adapter B: 3500ms timeout
+  adapter C: 240ms success
+```
+
+## 111. Metrics do not become evidence of correctness
+
+This distinction matters:
+
+```text
+"source succeeded 99.2%"
+```
+
+is operational evidence.
+
+It does **not** prove:
+
+```text
+"source is authorized."
+```
+
+Likewise:
+
+```text
+HTTP 200
+```
+
+doesn't prove:
+
+```text
+media exists
+```
+
+and:
+
+```text
+stream URL returned
+```
+
+doesn't prove:
+
+```text
+playback succeeds
+```
+
+Keep those semantics separate.
+
+## 112. Playback verification
+
+Do not attempt full playback verification for every request.
+
+It is expensive.
+
+Instead distinguish:
+
+```text
+DISCOVERED
+    ↓
+STRUCTURALLY_VALID
+    ↓
+AUTHORIZED
+    ↓
+DIRECT_PLAYBACK_CAPABLE
+    ↓
+OPTIONALLY_PROBED
+    ↓
+OBSERVED_PLAYBACK_SUCCESS
+```
+
+Only the first four are normally needed to emit a stream.
+
+If you later add probing:
+
+```text
+HEAD / range request
+```
+
+record it as evidence rather than changing the candidate's fundamental
+identity.
+
+## 113. Source health versus candidate health
+
+Another important separation:
+
+```text
+Source health
+    = provider operational condition
+
+Candidate validity
+    = this particular stream's properties
+```
+
+A healthy provider can return a broken candidate.
+
+A degraded provider can still return a valid candidate.
+
+Do not conflate them.
+
+## 114. Configuration model
+
+Use validated environment configuration.
+
+```ts
+import { z } from "zod";
+
+const ConfigSchema = z.object({
+  PORT: z.coerce.number().int().min(1).max(65535).default(7000),
+
+  TOTAL_TIMEOUT_MS: z.coerce.number().int().positive().default(4000),
+
+  SOURCE_TIMEOUT_MS: z.coerce.number().int().positive().default(2500),
+
+  MAX_CONCURRENCY: z.coerce.number().int().positive().default(6)
+});
+```
+
+Then:
+
+```ts
+export const config = ConfigSchema.parse(process.env);
+```
+
+Configuration errors should fail at startup.
+
+Not halfway through a user request.
+
+## 115. Runtime composition
+
+Now `index.ts` becomes dependency composition rather than business
+logic.
+
+```text
+index.ts
+
+config
+   ↓
+logger
+   ↓
+HTTP client
+   ↓
+registry
+   ↓
+runtime managers
+   ↓
+resolver
+   ↓
+Stremio adapter
+   ↓
+server
+```
+
+The business logic is elsewhere.
+
+This makes testing much easier.
+
+## 116. Final runtime tree
+
+```text
+src/
+├── addon/
+│   ├── manifest.ts
+│   ├── parser.ts
+│   └── stream-handler.ts
+│
+├── domain/
+│   ├── media.ts
+│   ├── candidate.ts
+│   ├── failure.ts
+│   └── result.ts
+│
+├── adapters/
+│   ├── interface.ts
+│   ├── registry.ts
+│   └── ...
+│
+├── resolver/
+│   ├── resolver.ts
+│   ├── execute.ts
+│   ├── normalize.ts
+│   ├── validate.ts
+│   ├── policy.ts
+│   ├── dedupe.ts
+│   └── rank.ts
+│
+├── runtime/
+│   ├── semaphore.ts
+│   ├── limiter.ts
+│   ├── breaker.ts
+│   ├── timeout.ts
+│   ├── cache.ts
+│   └── http.ts
+│
+├── observability/
+│   ├── logger.ts
+│   ├── metrics.ts
+│   └── health.ts
+│
+└── config/
+    └── config.ts
+```
+
+At this point the architecture has a very clean separation:
+
+```text
+DOMAIN
+   ↓
+What is a media source?
+
+ADAPTERS
+   ↓
+How does a particular provider expose it?
+
+RUNTIME
+   ↓
+How do we safely execute providers?
+
+RESOLVER
+   ↓
+How do we combine results?
+
+POLICY
+   ↓
+What is eligible?
+
+RANKER
+   ↓
+What order?
+
+STREMIO
+   ↓
+How do we present the result?
+```
+
+## 117. Release gate R1
+
+The first meaningful implementation milestone is now:
+
+```text
+R1 — Aggregation Kernel
+────────────────────────────────
+
+[✓] MediaRef
+[✓] SourceCandidate
+[✓] SourceAdapter
+[✓] Registry
+[✓] Validation
+[✓] Policy
+[✓] Dedup
+[✓] Deterministic ranking
+[✓] Failure isolation
+
+[✓] AbortSignal propagation
+[✓] Timeout
+[✓] Bounded concurrency
+[✓] Rate limiting
+[✓] Circuit breaker
+
+[ ] Persistent cache
+[ ] Safe HTTP client
+[ ] SSRF tests
+[ ] Metrics
+[ ] Health endpoints
+[ ] Stremio integration test
+[ ] Container smoke test
+```
+
+The next gate should therefore be **the safe HTTP/cache subsystem plus
+the complete Stremio protocol test harness**.
+
+That is where we can test the full chain:
+
+```text
+Stremio request
+      ↓
+parse
+      ↓
+resolver
+      ↓
+adapter
+      ↓
+safe HTTP
+      ↓
+candidate
+      ↓
+policy
+      ↓
+dedup
+      ↓
+rank
+      ↓
+Stremio Stream[]
+```
+
+and establish the first genuine **end-to-end conformance baseline**.
