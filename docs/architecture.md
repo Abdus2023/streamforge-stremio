@@ -25356,3 +25356,1218 @@ The next section should define that protocol-neutral API, including
 its resource model, error algebra, pagination, request IDs,
 authorization boundaries, idempotency, versioning, and compatibility
 strategy.
+
+## 659. Protocol-Neutral Media API
+
+The system should now stop treating Stremio as the primary
+architectural boundary.
+
+Stremio becomes an **adapter** over a protocol-neutral application
+API.
+
+```text
+                    MEDIA PLATFORM
+                          │
+                  Application API
+                          │
+         ┌────────────────┼────────────────┐
+         ▼                ▼                ▼
+      Stremio          HTTP/JSON          CLI
+       adapter           API             tools
+```
+
+This is the point where the project can evolve beyond a Stremio addon
+without rewriting the core.
+
+## 660. The API resource model
+
+The public application model should expose a small number of stable
+concepts:
+
+```text
+Media
+Identity
+Catalog
+Metadata
+Stream
+Subtitle
+Search
+```
+
+But these should not become seven unrelated APIs.
+
+They all operate around:
+
+```text
+CanonicalMedia
+```
+
+Conceptually:
+
+```text
+Media
+├── identities
+├── metadata
+├── catalog projections
+├── stream candidates
+└── subtitle candidates
+```
+
+## 661. API operations
+
+The initial protocol-neutral API:
+
+```text
+GET /v1/media/{id}
+GET /v1/media/{id}/metadata
+GET /v1/media/{id}/streams
+GET /v1/media/{id}/subtitles
+
+GET /v1/catalog/{catalogId}
+GET /v1/search
+```
+
+These are **application API routes**, not necessarily the final HTTP
+implementation.
+
+The important boundary is:
+
+```text
+HTTP route
+   ↓
+request DTO
+   ↓
+application command/query
+```
+
+## 662. Commands vs queries
+
+Use CQRS terminology carefully.
+
+### Queries
+
+```text
+get media
+get metadata
+get streams
+get subtitles
+catalog
+search
+```
+
+They should not mutate authoritative state.
+
+### Commands
+
+```text
+refresh catalog
+reload configuration
+enable provider
+disable provider
+rebuild index
+```
+
+These belong to an operator/control API, not the public playback API.
+
+## 663. Public API vs control API
+
+Separate them physically:
+
+```text
+PUBLIC
+/v1/media
+/v1/catalog
+/v1/search
+
+CONTROL
+/internal/config
+/internal/providers
+/internal/catalog
+/internal/evidence
+/internal/health
+```
+
+Never expose control-plane operations through the public
+Stremio-facing surface.
+
+## 664. Request envelope
+
+Every application request gets a correlation ID:
+
+```ts
+interface RequestContext {
+  readonly requestId: string;
+
+  readonly deadline: Deadline;
+
+  readonly signal: AbortSignal;
+
+  readonly preferredLanguages: readonly string[];
+}
+```
+
+The HTTP adapter creates it.
+
+The application does not parse HTTP headers.
+
+## 665. Caller identity
+
+Eventually the API may support authentication.
+
+Keep that separate from media authorization:
+
+```ts
+interface CallerContext {
+  readonly callerId?: string;
+
+  readonly scopes: readonly string[];
+}
+```
+
+Then:
+
+```text
+Caller authorization
+        ≠ Media authorization
+```
+
+A user being authorized to call the API does not prove that a
+playback candidate is authorized for distribution.
+
+## 666. Error algebra
+
+Do not make every failure:
+
+```json
+{
+  "error": "something went wrong"
+}
+```
+
+Define machine-readable errors:
+
+```ts
+type ApiErrorCode =
+  | "invalid_request"
+  | "unsupported_media"
+  | "identity_not_found"
+  | "identity_not_resolved"
+  | "identity_ambiguous"
+  | "resource_not_found"
+  | "provider_unavailable"
+  | "deadline_exceeded"
+  | "rate_limited"
+  | "not_authorized"
+  | "internal_error";
+```
+
+## 667. Error envelope
+
+```ts
+interface ApiError {
+  readonly code: ApiErrorCode;
+
+  readonly message: string;
+
+  readonly requestId: string;
+
+  readonly retryable: boolean;
+}
+```
+
+Example:
+
+```json
+{
+  "code": "deadline_exceeded",
+  "message": "The resolution deadline expired.",
+  "requestId": "req_01...",
+  "retryable": true
+}
+```
+
+The message is human-readable.
+
+The code is machine-readable.
+
+## 668. Do not leak provider internals
+
+Bad:
+
+```json
+{
+  "error": "TMDBAdapterFetchError: ECONNRESET at..."
+}
+```
+
+Better:
+
+```json
+{
+  "code": "provider_unavailable",
+  "requestId": "req_..."
+}
+```
+
+Detailed provider diagnostics belong in controlled observability
+channels.
+
+## 669. HTTP status mapping
+
+The application error and HTTP status remain separate concepts.
+
+For example:
+
+```text
+invalid_request
+      ↓
+400
+
+rate_limited
+      ↓
+429
+
+not_authorized
+      ↓
+403
+
+resource_not_found
+      ↓
+404
+
+deadline_exceeded
+      ↓
+504
+```
+
+But:
+
+```text
+stream resolver returned zero candidates
+```
+
+does **not necessarily** mean HTTP 404.
+
+A valid media request can have:
+
+```json
+{
+  "streams": []
+}
+```
+
+## 670. Partial success
+
+This is particularly important for aggregation.
+
+Suppose:
+
+```text
+source A → success
+source B → timeout
+source C → success
+```
+
+The application result:
+
+```text
+status = partial
+```
+
+should not become:
+
+```text
+HTTP 500
+```
+
+The public API can return:
+
+```json
+{
+  "status": "partial",
+  "streams": ["..."]
+}
+```
+
+while omitting internal failure details unless the API contract
+explicitly exposes them.
+
+## 671. Stable result envelope
+
+Use:
+
+```ts
+interface ResourceResult<T> {
+  readonly status: "success" | "empty" | "partial";
+
+  readonly items: readonly T[];
+
+  readonly requestId: string;
+}
+```
+
+For streams:
+
+```text
+items = SourceCandidate[]
+```
+
+For subtitles:
+
+```text
+items = SubtitleCandidate[]
+```
+
+For catalog:
+
+```text
+items = CatalogEntry[]
+```
+
+But don't force all resource-specific metadata into a generic envelope
+if it makes the type less precise.
+
+## 672. Pagination response
+
+```ts
+interface PageResult<T> {
+  readonly items: readonly T[];
+
+  readonly page: {
+    readonly skip: number;
+    readonly limit: number;
+    readonly hasMore: boolean;
+  };
+
+  readonly requestId: string;
+}
+```
+
+Again:
+
+```text
+skip >= 0
+1 <= limit <= configured maximum
+```
+
+must be validated before reaching the application.
+
+## 673. Cursor pagination later
+
+Offset pagination is sufficient initially.
+
+But the abstraction should avoid assuming it is eternal.
+
+Future:
+
+```text
+skip/limit
+```
+
+could evolve toward:
+
+```text
+cursor
+```
+
+without changing the domain.
+
+This is another reason pagination belongs to the protocol/application
+boundary rather than the media domain.
+
+## 674. Media lookup
+
+A protocol-neutral request:
+
+```ts
+interface MediaLookupRequest {
+  readonly identity: ExternalIdentity;
+}
+```
+
+Application flow:
+
+```text
+ExternalIdentity
+      ↓
+Identity Resolver
+      ↓
+CanonicalMedia
+```
+
+Response:
+
+```ts
+interface MediaLookupResult {
+  readonly status: "resolved" | "not_found" | "not_resolved" | "ambiguous";
+
+  readonly media?: CanonicalMedia;
+}
+```
+
+No `null` ambiguity.
+
+## 675. Canonical media API representation
+
+The public API should be cautious about exposing internal identity
+details.
+
+Potential representation:
+
+```json
+{
+  "id": "media:abc123",
+  "type": "movie",
+  "title": "Example Movie",
+  "identities": [
+    {
+      "kind": "imdb",
+      "value": "tt1234567"
+    }
+  ]
+}
+```
+
+But:
+
+```text
+media:abc123
+```
+
+should not be interpreted as a globally meaningful identifier.
+
+It is an identifier inside this platform's canonical namespace.
+
+## 676. API versioning
+
+Start with:
+
+```text
+/v1/
+```
+
+Do not version every resource independently.
+
+Prefer:
+
+```text
+/v1/media
+/v1/search
+/v1/catalog
+```
+
+Then introduce:
+
+```text
+/v2/
+```
+
+only for incompatible contract changes.
+
+## 677. Schema version ≠ API version
+
+These are different:
+
+```text
+API version: v1
+
+Evidence schema: evidence/1
+Receipt schema: receipt/1
+Provider declaration: provider/1
+```
+
+Changing an internal evidence schema does not necessarily require
+changing the public API.
+
+## 678. Compatibility contract
+
+For `/v1`:
+
+Allowed:
+
+```text
+add optional response field
+add new provider
+improve internal ranking
+```
+
+Potentially breaking:
+
+```text
+rename required field
+change field meaning
+remove field
+change identity semantics
+change authorization semantics
+```
+
+Compatibility should be tested rather than assumed.
+
+## 679. JSON schema
+
+The API should eventually have machine-readable schemas:
+
+```text
+schemas/
+├── media.schema.json
+├── stream.schema.json
+├── subtitle.schema.json
+├── metadata.schema.json
+├── catalog.schema.json
+├── search.schema.json
+└── error.schema.json
+```
+
+These schemas become protocol artifacts.
+
+## 680. Contract testing
+
+Now we can introduce:
+
+```text
+API Contract Tests
+```
+
+Tests verify:
+
+```text
+request schema
+response schema
+error schema
+required fields
+field types
+compatibility
+```
+
+This protects external consumers from accidental refactoring.
+
+## 681. Stremio becomes a compatibility test
+
+The Stremio adapter should now be tested as:
+
+```text
+Stremio Request
+      ↓
+Stremio Adapter
+      ↓
+Application API
+      ↓
+Domain
+      ↓
+Stremio Adapter
+      ↓
+Stremio Response
+```
+
+This creates a clean compatibility boundary.
+
+## 682. Protocol adapter interface
+
+```ts
+interface ProtocolAdapter {
+  readonly id: string;
+
+  handle(request: unknown, context: RequestContext): Promise<unknown>;
+}
+```
+
+But don't make the entire application depend on this generic
+interface.
+
+Concrete adapters should be strongly typed internally.
+
+## 683. Stremio adapter
+
+Conceptually:
+
+```ts
+class StremioProtocolAdapter {
+  constructor(private readonly app: MediaApplication) {}
+
+  async stream(args: StremioStreamArgs) {
+    const request = parseStremioStream(args);
+
+    const result = await this.app.resolveStreams(request, context);
+
+    return mapToStremioStreams(result);
+  }
+}
+```
+
+The Stremio SDK stays at this boundary.
+
+## 684. Native HTTP API adapter
+
+Similarly:
+
+```ts
+class MediaHttpController {
+  constructor(private readonly app: MediaApplication) {}
+
+  async getStreams(request: HttpRequest) {
+    const command = parseHttpStreamRequest(request);
+
+    const result = await this.app.resolveStreams(command, context);
+
+    return mapToApiStreams(result);
+  }
+}
+```
+
+Two protocols.
+
+One application.
+
+## 685. CLI adapter
+
+This becomes useful for diagnostics:
+
+```text
+media-platform resolve-stream tt1234567
+```
+
+or:
+
+```text
+media-platform inspect-identity tt1234567
+```
+
+The CLI should call the same application contracts.
+
+Not:
+
+```text
+CLI → private database
+```
+
+## 686. Diagnostic CLI
+
+A particularly useful command set:
+
+```text
+media-platform identity inspect ...
+media-platform metadata inspect ...
+media-platform streams resolve ...
+media-platform subtitles resolve ...
+media-platform catalog inspect ...
+media-platform provider list
+media-platform provider inspect
+media-platform evidence inspect
+media-platform replay ...
+```
+
+This gives us a human-accessible interface to the same architecture.
+
+## 687. Operator API
+
+The control plane can eventually expose:
+
+```text
+/internal/providers
+/internal/providers/{id}
+/internal/config
+/internal/generations
+/internal/evidence
+/internal/replay
+/internal/catalog/rebuild
+```
+
+These endpoints must be authenticated and preferably
+network-isolated.
+
+They should never be advertised in the Stremio manifest.
+
+## 688. Configuration generation endpoint
+
+An operator could inspect:
+
+```json
+{
+  "generation": "42",
+  "createdAt": "...",
+  "providers": 7,
+  "sources": 2,
+  "metadata": 3,
+  "subtitles": 2
+}
+```
+
+This is useful operationally.
+
+But it should be treated as a **derived runtime view**.
+
+The authoritative configuration remains the configuration artifact
+that produced generation 42.
+
+## 689. Runtime generation provenance
+
+Every receipt should reference:
+
+```text
+generation = "42"
+```
+
+Therefore:
+
+```text
+request
+   ↓
+generation 42
+   ↓
+provider set
+   ↓
+result
+```
+
+A later investigation can determine which provider configuration was
+active.
+
+## 690. Reproducibility chain
+
+The complete chain becomes:
+
+```text
+SOURCE CONFIG
+      │
+      ▼
+CONFIG DIGEST
+      │
+      ▼
+RUNTIME GENERATION
+      │
+      ▼
+REQUEST
+      │
+      ▼
+OBSERVATIONS
+      │
+      ▼
+PURE DERIVATION
+      │
+      ▼
+RESULT
+```
+
+This is considerably stronger than ordinary application logging.
+
+## 691. Configuration digest
+
+Compute a digest over canonical configuration:
+
+```ts
+interface ConfigurationIdentity {
+  readonly generation: string;
+
+  readonly digest: string;
+
+  readonly schemaVersion: string;
+}
+```
+
+The digest should exclude secrets.
+
+For example:
+
+```text
+provider declaration + capabilities + policy + limits
+```
+
+but not:
+
+```text
+actual API token
+```
+
+## 692. Artifact identity
+
+The release artifact itself should eventually have:
+
+```text
+source commit
+package-lock digest
+build metadata
+container digest
+configuration schema
+```
+
+This creates:
+
+```text
+CODE
+  ↓
+BUILD
+  ↓
+ARTIFACT
+  ↓
+CONFIGURATION
+  ↓
+GENERATION
+  ↓
+REQUEST
+  ↓
+RESULT
+```
+
+Now an observed stream can be traced back through the complete system
+lineage.
+
+## 693. This is the point to introduce a platform manifest
+
+There are now two different manifests:
+
+### Stremio manifest
+
+Protocol-facing:
+
+```text
+/manifest.json
+```
+
+### Platform manifest
+
+System-facing:
+
+```ts
+interface PlatformManifest {
+  readonly schemaVersion: string;
+
+  readonly platformVersion: string;
+
+  readonly capabilities: readonly string[];
+
+  readonly providers: readonly string[];
+
+  readonly configurationDigest: string;
+}
+```
+
+Do not confuse them.
+
+```text
+Stremio manifest
+    = client capability contract
+
+Platform manifest
+    = runtime composition identity
+```
+
+## 694. Composition root
+
+All of this finally converges at the composition root.
+
+```text
+src/index.ts
+
+Config
+   ↓
+Policy
+   ↓
+SecretProvider
+   ↓
+HTTP runtime
+   ↓
+Provider declarations
+   ↓
+Admission
+   ↓
+Registries
+   ↓
+RuntimeSnapshot
+   ↓
+Application
+   ↓
+Protocol adapters
+```
+
+This is where dependencies are assembled.
+
+No hidden global singleton should be necessary.
+
+## 695. Composition root pseudocode
+
+```ts
+const config = loadConfig();
+
+const policy = createPolicy(config);
+
+const secrets = createSecretProvider(config);
+
+const runtime = createProviderRuntime({
+  config,
+  policy,
+  secrets
+});
+
+const providers = loadProviders({
+  runtime
+});
+
+const snapshot = buildRuntimeSnapshot({
+  config,
+  policy,
+  providers
+});
+
+const application = createApplication({
+  snapshot,
+  runtime
+});
+
+const stremio = createStremioAdapter(application);
+
+startStremio(stremio);
+```
+
+This is intentionally conceptual until the concrete dependency graph
+is implemented and typechecked.
+
+## 696. No global provider singleton
+
+Avoid:
+
+```ts
+export const providers = ...;
+```
+
+because that makes:
+
+```text
+tests
+replay
+multi-generation runtime
+```
+
+harder.
+
+Instead:
+
+```text
+Application
+   ↓
+RuntimeSnapshot
+```
+
+makes dependencies explicit.
+
+## 697. Hot reload
+
+If configuration reload is eventually supported:
+
+```text
+old snapshot
+     │
+     │ requests continue
+     ▼
+new snapshot published
+     │
+     ▼
+new requests
+```
+
+Do not mutate the old snapshot.
+
+Garbage collection can eventually reclaim it when no requests
+reference it.
+
+## 698. Generation lifecycle
+
+```text
+PROPOSED
+   ↓
+VALIDATED
+   ↓
+ADMITTED
+   ↓
+PUBLISHED
+   ↓
+ACTIVE
+   ↓
+SUPERSEDED
+   ↓
+RETIRED
+```
+
+A failed configuration never reaches `PUBLISHED`.
+
+## 699. Control-plane gate
+
+Introduce:
+
+```text
+GATE-CONTROL-PLANE-01
+────────────────────────────
+
+[ ] configuration schema
+[ ] policy schema
+[ ] provider declaration loading
+[ ] deterministic admission
+[ ] immutable runtime snapshot
+[ ] generation identity
+[ ] configuration digest
+[ ] atomic publication
+[ ] old-generation isolation
+[ ] secret separation
+[ ] secret redaction
+[ ] control/public boundary
+[ ] operator authentication boundary
+[ ] configuration compatibility
+[ ] generation provenance
+[ ] reload tests
+[ ] failed-generation rollback
+```
+
+Status:
+
+```text
+GATE-CONTROL-PLANE-01 = OPEN
+```
+
+## 700. The architecture now has a complete vertical slice
+
+We can finally draw the whole thing:
+
+```text
+                         ┌───────────────┐
+                          │   STREMIO     │
+                          └───────┬───────┘
+                                  │
+                          Protocol Adapter
+                                  │
+                                  ▼
+                     ┌────────────────────────┐
+                     │   MEDIA APPLICATION    │
+                     └───────────┬────────────┘
+                                 │
+                      ┌──────────┼──────────┐
+                      ▼          ▼          ▼
+                   Identity   Metadata    Streams
+                      │          │          │
+                      │          │       Subtitles
+                      │          │          │
+                      └──────────┼──────────┘
+                                 ▼
+                          Provider Runtime
+                                 │
+                     ┌───────────┼───────────┐
+                     ▼           ▼           ▼
+                 Admission    Network     Limits
+                     │           │           │
+                     └───────────┼───────────┘
+                                 ▼
+                            Providers
+                                 │
+                                 ▼
+                          Observations
+                                 │
+                                 ▼
+                         Functional Core
+                                 │
+                     ┌───────────┼───────────┐
+                     ▼           ▼           ▼
+                  Validate    Authorize   Derive
+                     │           │           │
+                     └───────────┼───────────┘
+                                 ▼
+                          Protocol Views
+```
+
+Above it:
+
+```text
+                 CONTROL PLANE
+                       │
+        Config → Policy → Admission
+                       │
+                       ▼
+                Runtime Generation
+```
+
+Beside it:
+
+```text
+                 EVIDENCE PLANE
+                       │
+         Observations → Receipts → Replay
+```
+
+## 701. What comes next
+
+At this point, another abstract subsystem would have diminishing
+value.
+
+The next phase should be **construction** rather than more
+architecture:
+
+```text
+ARCHITECTURE
+     ✓
+     │
+     ▼
+FORMAL CONTRACTS
+     │
+     ▼
+IMPLEMENTATION
+     │
+     ▼
+CONFORMANCE TESTS
+     │
+     ▼
+INTEGRATION
+     │
+     ▼
+ACTUAL CI EXECUTION
+     │
+     ▼
+RELEASE GATE
+     │
+     ▼
+TAG
+```
+
+The concrete next milestone should therefore be:
+
+### **V0.1 implementation freeze**
+
+with a deliberately narrow capability set:
+
+```text
+STREMIO
+├── /manifest
+└── /stream
+
+CORE
+├── MediaRef
+├── CanonicalMedia
+├── Identity
+├── SourceCandidate
+└── ResolutionResult
+
+RUNTIME
+├── timeout
+├── cancellation
+├── concurrency
+├── rate limiting
+├── circuit breaker
+└── SSRF/network policy
+
+PROVIDER
+└── operator-owned media library
+
+EVIDENCE
+├── observations
+├── receipts
+└── generation identity
+
+NOT YET ADVERTISED
+├── /catalog
+├── /meta
+└── /subtitles
+```
+
+That is deliberate scope control: **build one end-to-end authorized
+playback path to conformance before enabling the larger platform
+surface.**
+
+`GATE-V0.1-S1` should remain **OPEN** until the actual repository is
+built and the checks are executed. No implementation or CI evidence
+has yet been produced in this conversation.
