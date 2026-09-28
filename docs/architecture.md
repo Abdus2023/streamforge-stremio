@@ -21402,3 +21402,1135 @@ The crucial principle remains unchanged throughout:
 **Persist observations and execution facts; derive representations
 from them; never let a convenient representation silently become
 authority.**
+
+## 531. Subtitles: the first auxiliary playback capability
+
+Subtitles should reuse the same architecture rather than creating a
+parallel, ad-hoc subsystem.
+
+The conceptual pipeline is:
+
+```text
+CanonicalMedia
+      │
+      ▼
+Subtitle Routing
+      │
+      ▼
+Provider Admission
+      │
+      ▼
+Provider Execution
+      │
+      ▼
+SubtitleObservation
+      │
+      ▼
+Validate
+      │
+      ▼
+Authorize
+      │
+      ▼
+Dedupe
+      │
+      ▼
+Rank
+      │
+      ▼
+Stremio Subtitle DTO
+```
+
+The key distinction is:
+
+```text
+subtitle observation
+    ≠ subtitle truth
+    ≠ subtitle authorization
+    ≠ subtitle quality
+```
+
+## 532. Subtitle domain model
+
+Start with a domain object independent of Stremio:
+
+```ts
+export type SubtitleFormat = "srt" | "vtt" | "ass" | "ssa" | "unknown";
+
+export interface SubtitleCandidate {
+  readonly id: string;
+
+  readonly media: MediaRef;
+
+  readonly url: string;
+
+  readonly language: string;
+
+  readonly format: SubtitleFormat;
+
+  readonly hearingImpaired: boolean;
+
+  readonly forced: boolean;
+
+  readonly provenance: {
+    readonly providerId: string;
+  };
+
+  readonly authorization: {
+    readonly status: "authorized" | "unauthorized" | "unknown";
+
+    readonly evidenceIds: readonly string[];
+  };
+}
+```
+
+The `forced` field is important.
+
+A forced subtitle track can have different semantics from a normal
+subtitle track.
+
+## 533. Language normalization
+
+Language strings are notoriously inconsistent.
+
+A provider might return:
+
+```text
+en
+eng
+EN
+en-US
+English
+```
+
+These should not be compared as arbitrary strings.
+
+Introduce a normalized representation:
+
+```ts
+interface LanguageTag {
+  readonly normalized: string;
+  readonly original: string;
+}
+```
+
+For example:
+
+```text
+"EN-US"
+   ↓
+"en-US"
+```
+
+and:
+
+```text
+"eng"
+   ↓
+"en"
+```
+
+where the normalization mapping is explicitly defined.
+
+Do not silently claim:
+
+```text
+English = American English
+```
+
+unless the normalization policy supports that equivalence.
+
+## 534. BCP 47 boundary
+
+Internally, use a normalized language-tag model rather than making
+every subsystem understand raw provider strings.
+
+```ts
+interface NormalizedLanguage {
+  readonly language: string;
+  readonly region?: string;
+  readonly script?: string;
+}
+```
+
+Example:
+
+```text
+en
+en-US
+fr
+fr-FR
+ar
+ar-TN
+```
+
+The provider's original value remains provenance.
+
+Therefore:
+
+```text
+original = "English"
+normalized = "en"
+```
+
+is preferable to destroying the original value.
+
+## 535. Subtitle observation
+
+Provider output:
+
+```ts
+interface SubtitleObservation {
+  readonly providerId: string;
+
+  readonly observedAt: string;
+
+  readonly status: "success" | "not_found" | "not_resolved" | "ambiguous";
+
+  readonly subtitles: readonly SubtitleObservationItem[];
+}
+```
+
+And:
+
+```ts
+interface SubtitleObservationItem {
+  readonly id: string;
+
+  readonly url: string;
+
+  readonly language: string;
+
+  readonly format?: SubtitleFormat;
+
+  readonly hearingImpaired?: boolean;
+
+  readonly forced?: boolean;
+
+  readonly evidenceIds: readonly string[];
+}
+```
+
+Again:
+
+```text
+provider output
+     ↓
+observation
+     ↓
+central validation
+```
+
+## 536. Subtitle provider contract
+
+```ts
+interface SubtitleProvider {
+  readonly id: string;
+
+  readonly capabilities: {
+    readonly mediaTypes: readonly MediaType[];
+    readonly languages: readonly string[];
+    readonly formats: readonly SubtitleFormat[];
+    readonly supportsForced: boolean;
+    readonly supportsHearingImpaired: boolean;
+  };
+
+  resolve(
+    media: CanonicalMedia,
+    context: SubtitleResolveContext
+  ): Promise<SubtitleObservation>;
+}
+```
+
+The provider does not know about:
+
+```text
+Stremio HTTP
+Stremio JSON
+Express
+Fastify
+SDK objects
+```
+
+## 537. Episode matching
+
+Subtitles for a series must be matched to the exact episode.
+
+This is a critical invariant.
+
+Given:
+
+```text
+series = media:series-001
+season = 2
+episode = 7
+```
+
+a subtitle provider must not return a track belonging to:
+
+```text
+season 2 episode 6
+```
+
+merely because the series ID matches.
+
+The subtitle identity therefore includes:
+
+```ts
+interface SubtitleMediaKey {
+  readonly canonicalId: string;
+
+  readonly season?: number;
+  readonly episode?: number;
+}
+```
+
+For movies:
+
+```text
+canonicalId
+```
+
+For episodes:
+
+```text
+canonicalId + season + episode
+```
+
+## 538. Subtitle URL validation
+
+A subtitle URL goes through the same security pipeline:
+
+```text
+provider
+   │
+   ▼
+URL parse
+   │
+   ▼
+scheme validation
+   │
+   ▼
+credential rejection
+   │
+   ▼
+host policy
+   │
+   ▼
+redirect policy
+   │
+   ▼
+candidate
+```
+
+A valid subtitle URL is not automatically an authorized subtitle URL.
+
+## 539. Subtitle authorization
+
+The candidate should carry authorization evidence:
+
+```text
+authorization: {
+  status: "authorized",
+  evidenceIds: [
+    "subtitle:asset-123"
+  ]
+}
+```
+
+The central policy remains:
+
+```text
+unknown
+   ↓
+REJECT
+```
+
+This prevents a provider from implicitly upgrading:
+
+```text
+"I found a URL"
+```
+
+into:
+
+```text
+"you may distribute this URL."
+```
+
+## 540. Subtitle deduplication
+
+Two providers may return the same subtitle.
+
+Raw URLs can differ:
+
+```text
+https://a.example/sub.srt
+https://a.example/sub.srt#download
+```
+
+Normalize before deduplication.
+
+But URL equality isn't always enough.
+
+A stronger key can include:
+
+```text
+media + language + forced + hearing-impaired + canonicalized URL
+```
+
+Do not deduplicate two genuinely different subtitle tracks merely
+because they share a language.
+
+## 541. Subtitle ranking
+
+Ranking should be explicit.
+
+Possible preference dimensions:
+
+```text
+1. preferred language
+2. exact language/region match
+3. forced/non-forced requirement
+4. hearing-impaired preference
+5. format
+6. provider/source
+```
+
+But the resolver should distinguish:
+
+```text
+user preference
+```
+
+from:
+
+```text
+authorization
+```
+
+A preferred subtitle cannot override authorization.
+
+## 542. User language preferences
+
+The request context already contains:
+
+```ts
+preferredLanguages: readonly string[];
+```
+
+For example:
+
+```text
+["fr", "en", "ar"]
+```
+
+Ranking can use this preference.
+
+It should not modify provider observations.
+
+```text
+OBSERVED: language = en
+
+DERIVED: preferred-language score = 2
+```
+
+This distinction matters for evidence.
+
+## 543. Hearing-impaired preference
+
+Represent it explicitly:
+
+```ts
+interface SubtitlePreferences {
+  readonly preferredLanguages: readonly string[];
+
+  readonly preferHearingImpaired: boolean;
+
+  readonly preferForced: boolean;
+}
+```
+
+Then ranking becomes deterministic.
+
+Example:
+
+```text
+Candidate A
+language = fr
+HI = false
+
+Candidate B
+language = fr
+HI = true
+
+preferHI = true
+
+B ranks ahead of A
+```
+
+The ranking result is a derived preference, not a claim that B is
+objectively better.
+
+## 544. Subtitle format conversion
+
+Do **not** initially convert:
+
+```text
+ASS → VTT
+SRT → VTT
+SSA → SRT
+```
+
+inside the addon.
+
+That introduces:
+
+- parsing complexity,
+- encoding issues,
+- styling loss,
+- timing transformations,
+- new failure modes.
+
+For v0.1:
+
+```text
+provider format
+      ↓
+Stremio-compatible representation
+```
+
+If conversion is later required:
+
+```text
+SubtitleConverter
+```
+
+should become a separate subsystem with its own conformance suite.
+
+## 545. Subtitle content size
+
+If the addon only returns URLs:
+
+```text
+addon → URL
+```
+
+it does not need to download subtitle contents.
+
+If future functionality requires parsing subtitle files, introduce
+strict limits:
+
+```text
+max subtitle bytes
+max lines
+max cue count
+max processing time
+```
+
+Never let a provider-controlled file become an unbounded parser
+workload.
+
+## 546. Subtitle Stremio mapping
+
+Keep the protocol mapper isolated.
+
+Conceptually:
+
+```ts
+function toStremioSubtitle(candidate: SubtitleCandidate): StremioSubtitle {
+  return {
+    id: candidate.id,
+    url: candidate.url,
+    lang: candidate.language
+  };
+}
+```
+
+Additional fields should be mapped only if the current Stremio
+protocol contract supports them.
+
+The domain model should not be distorted merely to match the
+protocol.
+
+## 547. `/subtitles` handler
+
+The handler should remain thin:
+
+```text
+HTTP
+ │
+ ▼
+parse
+ │
+ ▼
+MediaRef
+ │
+ ▼
+identity
+ │
+ ▼
+CanonicalMedia
+ │
+ ▼
+subtitle resolver
+ │
+ ▼
+SubtitleCandidate[]
+ │
+ ▼
+Stremio mapper
+ │
+ ▼
+HTTP
+```
+
+No provider logic belongs in the HTTP handler.
+
+## 548. Empty subtitles
+
+A valid request with no subtitles should produce:
+
+```json
+{
+  "subtitles": []
+}
+```
+
+assuming that is the protocol's expected response shape for the
+deployed SDK/API contract.
+
+Do not turn:
+
+```text
+no subtitles found
+```
+
+into:
+
+```text
+HTTP 500
+```
+
+unless the protocol contract explicitly requires an error.
+
+## 549. Subtitle failure matrix
+
+| Provider condition | Domain outcome |
+| --- | --- |
+| subtitles found | success |
+| no subtitles | not_found / empty |
+| timeout | not_resolved |
+| rate limit | not_resolved |
+| ambiguous episode mapping | ambiguous |
+| malformed response | failure |
+| unauthorized candidate | candidate rejected |
+
+Again:
+
+```text
+not_found ≠ not_resolved
+```
+
+## 550. Subtitle provider admission
+
+Subtitle providers should use the same admission machinery.
+
+```text
+Provider Declaration
+        │
+        ▼
+Capability Validation
+        │
+        ▼
+Authorization Evidence
+        │
+        ▼
+Network Policy
+        │
+        ▼
+Admission Decision
+```
+
+We should not create:
+
+```text
+special subtitle trust rules
+```
+
+just because subtitles are "secondary."
+
+## 551. Shared provider runtime
+
+At this point it becomes useful to generalize the runtime.
+
+Instead of:
+
+```text
+SourceRuntime
+MetadataRuntime
+SubtitleRuntime
+```
+
+with duplicated infrastructure, create:
+
+```text
+ProviderRuntime<T>
+```
+
+The runtime handles:
+
+```text
+admission
+circuit
+rate limit
+concurrency
+timeout
+cancellation
+network policy
+observability
+```
+
+while the provider supplies domain semantics.
+
+```text
+                 ProviderRuntime
+                        │
+         ┌──────────────┼──────────────┐
+         ▼              ▼              ▼
+       Source        Metadata       Subtitle
+      Provider       Provider        Provider
+```
+
+## 552. Generic provider runtime contract
+
+```ts
+interface ProviderRuntime {
+  execute<T>(
+    providerId: string,
+    operation: (context: ProviderExecutionContext) => Promise<T>,
+    options: ProviderExecutionOptions
+  ): Promise<ProviderExecutionResult<T>>;
+}
+```
+
+Options:
+
+```ts
+interface ProviderExecutionOptions {
+  readonly timeoutMs: number;
+  readonly signal: AbortSignal;
+}
+```
+
+Result:
+
+```ts
+type ProviderExecutionResult<T> =
+  | {
+      readonly status: "success";
+      readonly value: T;
+    }
+  | {
+      readonly status: "failed";
+      readonly failure: SourceFailure;
+    };
+```
+
+For a production implementation, this generic result should
+eventually be made domain-neutral rather than reusing `SourceFailure`;
+the important point is the abstraction, not the provisional type
+name.
+
+## 553. One runtime, different semantics
+
+The runtime knows:
+
+```text
+timeout
+rate limit
+circuit
+network
+```
+
+The provider knows:
+
+```text
+404 means NOT_FOUND
+```
+
+or:
+
+```text
+response field "tracks" contains subtitles
+```
+
+This creates a clean division:
+
+```text
+Transport semantics
+        │
+        ▼
+Provider semantics
+        │
+        ▼
+Domain semantics
+```
+
+## 554. Provider registry
+
+The original `SourceRegistry` can eventually become:
+
+```ts
+interface ProviderRegistry {
+  readonly sources: SourceRegistry;
+  readonly metadata: MetadataProviderRegistry;
+  readonly subtitles: SubtitleProviderRegistry;
+}
+```
+
+Or a typed generic registry:
+
+```text
+ProviderRegistry<SourceProvider>
+ProviderRegistry<MetadataProvider>
+ProviderRegistry<SubtitleProvider>
+```
+
+Avoid one untyped registry containing arbitrary plugin objects.
+
+That would weaken compile-time guarantees.
+
+## 555. Capability matrix
+
+The system can now expose an internal capability matrix:
+
+| Provider | Identity | Metadata | Streams | Subtitles |
+| --- | --- | --- | --- | --- |
+| Identity provider A | ✓ | — | — | — |
+| Owned media | internal | — | ✓ | — |
+| Metadata provider A | ✓ required | ✓ | — | — |
+| Subtitle provider A | internal | — | — | ✓ |
+
+This matrix is **derived from declarations**.
+
+It should not be manually maintained.
+
+## 556. Dynamic manifest generation remains prohibited
+
+Do not automatically turn that matrix into:
+
+```text
+/manifest.json
+```
+
+on every request.
+
+The manifest is a stable protocol declaration.
+
+Instead:
+
+```text
+provider registry
+      ↓
+build-time/config-time validation
+      ↓
+manifest capability set
+```
+
+Then release the declared capability set.
+
+This prevents runtime provider fluctuations from producing an
+unstable protocol contract.
+
+## 557. Subtitles and metadata can share identity evidence
+
+Once:
+
+```text
+CanonicalMedia
+```
+
+exists, both systems can reuse it.
+
+```text
+                    CanonicalMedia
+                          │
+               ┌──────────┴──────────┐
+               ▼                     ▼
+          Metadata                Subtitles
+               │                     │
+               ▼                     ▼
+        observations             observations
+```
+
+This avoids repeatedly solving identity resolution for every
+subsystem.
+
+Identity becomes a shared foundation.
+
+## 558. But do not share mutable conclusions blindly
+
+A cached identity resolution should not automatically be treated as
+eternal.
+
+Therefore:
+
+```text
+Identity Cache
+       │
+       ▼
+CanonicalMedia
+       │
+       ├── metadata request
+       ├── stream request
+       └── subtitle request
+```
+
+but each subsystem records:
+
+```text
+which identity evidence it relied upon
+```
+
+This is essential for reproducibility.
+
+## 559. Request-level correlation
+
+One Stremio request may now generate:
+
+```text
+requestId = req-123
+
+identity:
+    observation-1
+    observation-2
+
+metadata:
+    provider-A
+    provider-B
+
+source:
+    owned-library
+
+subtitles:
+    provider-C
+```
+
+A single request receipt can connect them:
+
+```text
+ResolutionReceipt
+    │
+    ├── identity receipts
+    ├── metadata receipts
+    ├── source receipts
+    └── subtitle receipts
+```
+
+This gives us an execution graph rather than a flat log stream.
+
+## 560. Evidence graph
+
+The architecture is now approaching:
+
+```text
+Request
+  │
+  ├──────── Identity Evidence
+  │              │
+  │              ▼
+  │        CanonicalMedia
+  │              │
+  │        ┌─────┼─────┐
+  │        ▼     ▼     ▼
+  │      Meta  Source  Subs
+  │        │     │      │
+  │        ▼     ▼      ▼
+  │    Observ. Candidates Tracks
+  │        │     │      │
+  └────────┴─────┴──────┘
+             │
+             ▼
+          Derived
+           Views
+```
+
+This is much closer to an auditable aggregation engine than a
+conventional "addon scraper."
+
+## 561. Updated repository
+
+```text
+src/
+├── addon/
+│   ├── manifest.ts
+│   ├── parser.ts
+│   ├── stream-handler.ts
+│   ├── meta-handler.ts
+│   └── subtitle-handler.ts
+│
+├── application/
+│   ├── resolver.ts
+│   ├── metadata-resolver.ts
+│   └── subtitle-resolver.ts
+│
+├── domain/
+│   ├── media.ts
+│   ├── candidate.ts
+│   ├── failure.ts
+│   ├── result.ts
+│   ├── metadata.ts
+│   └── subtitle.ts
+│
+├── identity/
+│   └── ...
+│
+├── providers/
+│   ├── registry.ts
+│   ├── runtime.ts
+│   │
+│   ├── sources/
+│   │   ├── interface.ts
+│   │   ├── admission.ts
+│   │   └── owned-media/
+│   │       └── ...
+│   │
+│   ├── metadata/
+│   │   ├── interface.ts
+│   │   ├── reconciliation.ts
+│   │   └── ...
+│   │
+│   └── subtitles/
+│       ├── interface.ts
+│       ├── normalization.ts
+│       ├── dedupe.ts
+│       ├── rank.ts
+│       └── ...
+│
+├── runtime/
+│   └── ...
+│
+└── observability/
+    └── ...
+```
+
+The previous `adapters/` directory can either remain as a
+compatibility name or be renamed to `providers/`. I would prefer
+**providers** at this stage because the system now clearly contains
+multiple provider classes rather than only stream-source adapters.
+
+## 562. New conformance layer
+
+We now need three provider conformance suites:
+
+```text
+Provider Conformance
+│
+├── SourceProvider
+│
+├── MetadataProvider
+│
+└── SubtitleProvider
+```
+
+Shared tests:
+
+```text
+[ ] unique provider ID
+[ ] declaration valid
+[ ] capabilities consistent
+[ ] cancellation respected
+[ ] timeout respected
+[ ] malformed response handled
+[ ] authorization preserved
+[ ] network policy respected
+[ ] deterministic semantics
+```
+
+Specialized tests then cover domain behavior.
+
+## 563. New release gate
+
+```text
+GATE-SUBTITLE-01
+────────────────────────────────
+
+[ ] subtitle domain model
+[ ] language normalization
+[ ] original language preserved
+[ ] episode matching
+[ ] provider capability declaration
+[ ] authorization evidence
+[ ] URL policy
+[ ] deduplication
+[ ] deterministic ranking
+[ ] forced subtitle semantics
+[ ] hearing-impaired semantics
+[ ] timeout
+[ ] cancellation
+[ ] rate limiting
+[ ] circuit breaker
+[ ] empty result semantics
+[ ] failure semantics
+[ ] Stremio mapper
+[ ] HTTP integration
+```
+
+Status:
+
+```text
+GATE-SUBTITLE-01 = OPEN
+```
+
+## 564. The architecture has now reached a useful abstraction point
+
+We have:
+
+```text
+                 PROVIDER
+                     │
+           ┌─────────┴─────────┐
+           ▼                   ▼
+        DECLARATION        IMPLEMENTATION
+           │                   │
+           ▼                   ▼
+       ADMISSION          EXECUTION
+           │                   │
+           └─────────┬─────────┘
+                     ▼
+                  OBSERVATION
+                     │
+                     ▼
+                 VALIDATION
+                     │
+                     ▼
+                AUTHORIZATION
+                     │
+                     ▼
+                RECONCILIATION
+                     │
+                     ▼
+                  DEDUPE
+                     │
+                     ▼
+                   RANK
+                     │
+                     ▼
+               PROTOCOL VIEW
+```
+
+This pattern now applies to:
+
+- identity providers,
+- metadata providers,
+- stream sources,
+- subtitle providers.
+
+The next major subsystem is therefore **Catalog + Search/Discovery**.
+
+That is where we must prevent a particularly dangerous architectural
+mistake: using every source adapter as a catalog crawler. Instead,
+catalog discovery needs its own indexed, bounded, evidence-bearing
+model so `/catalog` and search remain deterministic and do not turn a
+playback resolver into an uncontrolled Internet crawler.
