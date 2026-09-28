@@ -17967,3 +17967,1065 @@ HTTP client**, including retries, redirect validation, rate limiting,
 cancellation, response-size limits, content validation, and how a
 real owned/licensed media backend becomes a `SourceCandidate` without
 contaminating the domain layer.
+
+## 448. Source Runtime: from admitted adapter to controlled execution
+
+We have established that:
+
+```text
+admitted ≠ executable
+```
+
+and:
+
+```text
+healthy ≠ authorized
+```
+
+The next boundary is the **source runtime**.
+
+Its job is not to decide whether a source is lawful or authoritative.
+That was handled by admission.
+
+Its job is to ensure:
+
+**An already-admitted source executes inside explicit operational
+limits.**
+
+```text
+AdmissionDecision
+       │
+       ▼
+ExecutableAdapter
+       │
+       ▼
+SourceRuntime
+       │
+       ├── timeout
+       ├── cancellation
+       ├── concurrency
+       ├── rate limit
+       ├── circuit breaker
+       ├── network policy
+       ├── response limits
+       └── validation
+              │
+              ▼
+        Adapter Execution
+```
+
+## 449. Never give adapters the raw HTTP client
+
+A tempting design is:
+
+```ts
+class MyAdapter {
+  async resolve(media) {
+    return fetch("https://...");
+  }
+}
+```
+
+That creates several problems:
+
+- SSRF protection becomes adapter-specific.
+- timeouts become inconsistent.
+- redirects may bypass policy.
+- response limits may differ.
+- retries may amplify traffic.
+- instrumentation becomes fragmented.
+- cancellation becomes unreliable.
+- one adapter can accidentally ignore global limits.
+
+Instead:
+
+```ts
+interface SourceHttpClient {
+  request(
+    request: SourceHttpRequest,
+    context: SourceHttpContext
+  ): Promise<SourceHttpResponse>;
+}
+```
+
+The adapter receives a **constrained client**, not unrestricted
+network access.
+
+## 450. Source HTTP contract
+
+```ts
+interface SourceHttpRequest {
+  readonly method: "GET" | "HEAD";
+  readonly url: string;
+
+  readonly headers?: Readonly<Record<string, string>>;
+}
+```
+
+Context:
+
+```ts
+interface SourceHttpContext {
+  readonly signal: AbortSignal;
+  readonly sourceId: string;
+}
+```
+
+Response:
+
+```ts
+interface SourceHttpResponse {
+  readonly status: number;
+  readonly headers: Readonly<Record<string, string>>;
+
+  readonly body: Uint8Array;
+
+  readonly finalUrl: string;
+}
+```
+
+The important design decision is that the adapter does not receive a
+Node-specific `Response`.
+
+The runtime owns the transport representation.
+
+## 451. Response limits
+
+A source must not be allowed to return an arbitrarily large response.
+
+Define:
+
+```ts
+interface HttpLimits {
+  readonly maxResponseBytes: number;
+  readonly maxHeaderBytes: number;
+  readonly maxRedirects: number;
+}
+```
+
+For metadata APIs, perhaps:
+
+```text
+maxResponseBytes = 2 MiB
+```
+
+For a source manifest:
+
+```text
+maxResponseBytes = 512 KiB
+```
+
+These values are configuration decisions, not universal truths.
+
+The invariant is:
+
+```text
+response_size > limit
+        ↓
+reject
+```
+
+before unbounded buffering occurs.
+
+## 452. Do not confuse metadata retrieval with media transfer
+
+The addon should normally return a playback URL:
+
+```text
+source
+  ↓
+metadata / manifest / lookup
+  ↓
+playback URL
+  ↓
+Stremio
+  ↓
+media server
+```
+
+It should **not** become:
+
+```text
+source
+  ↓
+addon
+  ↓
+download entire movie
+  ↓
+addon
+  ↓
+Stremio
+```
+
+The latter transforms the addon into a media relay.
+
+That introduces:
+
+- bandwidth multiplication,
+- memory/disk pressure,
+- connection management,
+- abuse exposure,
+- legal and authorization complexity,
+- much more difficult cancellation semantics.
+
+Therefore v0.1 should keep:
+
+```text
+addon = resolver
+```
+
+rather than:
+
+```text
+addon = media proxy
+```
+
+## 453. HTTP error taxonomy
+
+Do not map every non-200 response into:
+
+```text
+source_network_error
+```
+
+Use a richer taxonomy.
+
+```ts
+type SourceHttpFailure =
+  | "timeout"
+  | "aborted"
+  | "dns_failure"
+  | "connection_failure"
+  | "tls_failure"
+  | "response_too_large"
+  | "too_many_redirects"
+  | "blocked_host"
+  | "unsupported_scheme"
+  | "rate_limited"
+  | "server_error"
+  | "client_error"
+  | "invalid_response";
+```
+
+Then the resolver can make meaningful decisions.
+
+For example:
+
+```text
+429 → rate_limited
+503 → server_error
+404 → source_empty / identity_not_found
+timeout → source_timeout
+```
+
+But these mappings should be **adapter-aware**.
+
+A `404` from an identity endpoint might mean:
+
+```text
+NOT_FOUND
+```
+
+while a `404` from a media asset endpoint might mean:
+
+```text
+candidate_missing
+```
+
+HTTP status is evidence.
+
+It is not itself the domain meaning.
+
+## 454. Semantic translation belongs in the adapter
+
+This is another important boundary:
+
+```text
+HTTP semantics
+      ↓
+adapter interpretation
+      ↓
+domain semantics
+```
+
+Not:
+
+```text
+HTTP 404
+  = NOT_FOUND
+```
+
+globally.
+
+For example:
+
+```ts
+if (response.status === 404) {
+  return {
+    status: "not_found",
+    identities: [],
+    source: this.id,
+    observedAt: now()
+  };
+}
+```
+
+That interpretation belongs to the specific identity adapter.
+
+The generic HTTP runtime knows only:
+
+```text
+status = 404
+```
+
+## 455. Retry policy
+
+Retries are dangerous if treated as universally beneficial.
+
+A naive implementation:
+
+```ts
+for (let i = 0; i < 5; i++) {
+  await fetch(...);
+}
+```
+
+can turn one failing request into five.
+
+Instead define:
+
+```ts
+interface RetryPolicy {
+  readonly maxAttempts: number;
+
+  readonly retryable: readonly SourceHttpFailure[];
+
+  readonly baseDelayMs: number;
+
+  readonly maxDelayMs: number;
+}
+```
+
+Example:
+
+```text
+attempt 1
+   ↓
+temporary failure
+   ↓
+backoff
+   ↓
+attempt 2
+   ↓
+temporary failure
+   ↓
+backoff
+   ↓
+attempt 3
+   ↓
+final outcome
+```
+
+## 456. Retry must respect cancellation
+
+This is critical.
+
+If:
+
+```text
+caller cancels
+```
+
+during backoff:
+
+```text
+sleep(1000)
+```
+
+must not continue blindly.
+
+Instead:
+
+```ts
+await abortableDelay(delayMs, signal);
+```
+
+Therefore:
+
+```text
+caller cancellation
+       │
+       ├── HTTP request
+       ├── retry delay
+       └── adapter execution
+```
+
+all terminate through the same cancellation tree.
+
+## 457. Retry classification
+
+A useful initial rule:
+
+```text
+Retry:
+  timeout
+  connection failure
+  selected 5xx
+  selected 429
+
+Don't retry:
+  malformed request
+  blocked host
+  unsupported scheme
+  authorization rejection
+  invalid source configuration
+  deterministic 4xx
+```
+
+But even `429` needs care.
+
+The server may provide:
+
+```text
+Retry-After
+```
+
+which should be respected where applicable.
+
+## 458. Rate limiter
+
+Each source receives an independent limiter.
+
+```text
+              Global
+                 │
+        ┌────────┼────────┐
+        ▼        ▼        ▼
+    Source A  Source B  Source C
+     limiter   limiter   limiter
+```
+
+This prevents one provider from consuming the entire runtime budget.
+
+Conceptual contract:
+
+```ts
+interface RateLimiter {
+  acquire(sourceId: string, signal: AbortSignal): Promise<void>;
+}
+```
+
+Then:
+
+```text
+adapter request
+      │
+      ▼
+rate limiter
+      │
+      ▼
+semaphore
+      │
+      ▼
+circuit breaker
+      │
+      ▼
+HTTP policy
+      │
+      ▼
+network
+```
+
+The ordering should be deliberate.
+
+## 459. Ordering of runtime gates
+
+Recommended execution pipeline:
+
+```text
+1. admission
+2. identity eligibility
+3. circuit check
+4. rate-limit acquisition
+5. concurrency acquisition
+6. timeout scope
+7. network-policy validation
+8. adapter execution
+9. response validation
+10. candidate validation
+11. authorization
+```
+
+Why circuit before waiting?
+
+If the circuit is already open:
+
+```text
+OPEN
+```
+
+we should fail immediately rather than occupying limiter/semaphore
+capacity.
+
+Why network validation before network I/O?
+
+Because:
+
+**A rejected URL should never reach the socket layer.**
+
+## 460. Source execution context
+
+Rather than passing many independent arguments:
+
+```ts
+adapter.resolve(media, signal, timeout, languages, logger, metrics, ...);
+```
+
+create a constrained context:
+
+```ts
+interface SourceExecutionContext {
+  readonly signal: AbortSignal;
+
+  readonly sourceId: string;
+
+  readonly preferredLanguages: readonly string[];
+
+  readonly http: SourceHttpClient;
+
+  readonly now: () => string;
+}
+```
+
+The adapter can therefore perform source-specific operations without
+acquiring unrestricted infrastructure.
+
+## 461. Capability-based runtime access
+
+This creates a useful security boundary:
+
+```text
+Adapter
+  │
+  ├── receives canonical media
+  ├── receives constrained HTTP client
+  ├── receives AbortSignal
+  └── receives source identity
+```
+
+It does **not** receive:
+
+```text
+filesystem
+database
+process.env
+raw fetch
+shell
+arbitrary sockets
+```
+
+unless those capabilities are explicitly part of the adapter contract.
+
+This dramatically reduces accidental coupling.
+
+## 462. Environment secrets
+
+Never place source credentials in:
+
+```text
+SourceCandidate
+```
+
+or logs.
+
+Instead:
+
+```ts
+interface SourceCredentialProvider {
+  get(sourceId: string, signal: AbortSignal): Promise<SourceCredential>;
+}
+```
+
+The runtime can construct a scoped adapter context:
+
+```text
+sourceId
+   │
+   ▼
+credential provider
+   │
+   ▼
+short-lived credential
+   │
+   ▼
+HTTP request
+```
+
+Credentials should never enter:
+
+- candidate objects,
+- resolution receipts,
+- normal logs,
+- Stremio responses.
+
+## 463. Header policy
+
+Do not blindly forward every configured header.
+
+A source may have:
+
+```text
+Authorization
+Cookie
+X-API-Key
+```
+
+Those are sensitive.
+
+Therefore distinguish:
+
+```ts
+interface SensitiveHeader {
+  readonly name: string;
+  readonly value: string;
+  readonly redactInLogs: true;
+}
+```
+
+Logging must produce:
+
+```text
+Authorization: [REDACTED]
+```
+
+not the token.
+
+## 464. URL policy and credentials
+
+A dangerous pattern is:
+
+```text
+https://user:password@example.org/media.mp4
+```
+
+Candidate URLs should normally reject embedded credentials:
+
+```ts
+if (url.username || url.password) {
+  throw new PolicyViolation("embedded_credentials");
+}
+```
+
+Credentials belong in controlled transport configuration.
+
+Not in URLs returned to Stremio.
+
+## 465. Redirect security
+
+Suppose:
+
+```text
+https://authorized.example/media
+```
+
+returns:
+
+```text
+302 Location: http://127.0.0.1:8080/admin
+```
+
+A generic HTTP client following redirects would create an SSRF
+vulnerability.
+
+Therefore each redirect is a new policy decision:
+
+```text
+URL₀
+ │
+ ▼
+validate
+ │
+ ▼
+request
+ │
+ ▼
+Location₁
+ │
+ ▼
+validate again
+ │
+ ▼
+request
+ │
+ ▼
+Location₂
+```
+
+Never:
+
+```text
+validate first URL once
+       ↓
+follow all redirects
+```
+
+## 466. DNS rebinding
+
+Hostname validation alone is insufficient in a hostile network
+environment.
+
+Conceptually:
+
+```text
+allowed.example.org
+       │
+       ▼
+DNS
+       │
+       ▼
+203.0.113.x
+```
+
+Later:
+
+```text
+allowed.example.org
+       │
+       ▼
+DNS
+       │
+       ▼
+127.0.0.1
+```
+
+A robust network layer should therefore define how DNS resolution and
+connection targets are validated.
+
+This is especially important if arbitrary provider-controlled URLs are
+ever accepted.
+
+For an initial **operator-owned fixed-host source**, the attack
+surface can be substantially reduced by restricting outbound hosts to
+configured endpoints.
+
+## 467. Candidate URL policy
+
+Candidate validation should therefore become:
+
+```text
+Candidate URL
+    │
+    ▼
+syntax
+    │
+    ▼
+scheme
+    │
+    ▼
+credentials
+    │
+    ▼
+hostname
+    │
+    ▼
+IP / DNS policy
+    │
+    ▼
+source allowlist
+    │
+    ▼
+redirect policy
+    │
+    ▼
+AUTHORIZED PLAYBACK URL
+```
+
+The resolver should never confuse:
+
+```text
+valid URL
+```
+
+with:
+
+```text
+safe URL
+```
+
+or:
+
+```text
+authorized URL
+```
+
+## 468. Source-owned playback URLs
+
+For the first real adapter, a clean architecture is:
+
+```text
+Owned Library
+      │
+      ├── identity index
+      ├── asset index
+      └── playback endpoint
+              │
+              ▼
+       OwnedLibraryAdapter
+              │
+              ▼
+       SourceCandidate
+```
+
+Example:
+
+```ts
+interface OwnedLibraryRecord {
+  readonly canonicalId: string;
+  readonly assetId: string;
+
+  readonly playbackUrl: string;
+
+  readonly mediaInfo?: {
+    readonly container?: string;
+    readonly resolution?: number;
+    readonly bitrate?: number;
+  };
+}
+```
+
+The adapter converts this into:
+
+```ts
+{
+  sourceId: "owned-media-library",
+  media,
+  url: record.playbackUrl,
+  mediaInfo: record.mediaInfo,
+  language: "und",
+  provenance: {
+    adapterId: "owned-media-library"
+  },
+  capabilities: {
+    directPlayback: true
+  },
+  authorization: {
+    status: "authorized",
+    evidenceIds: ["asset:..."]
+  }
+}
+```
+
+No scraping is required.
+
+No third-party site discovery is required.
+
+## 469. Source-specific identity requirement
+
+The owned library should ideally not perform title matching at
+playback time.
+
+Instead:
+
+```text
+CanonicalMedia
+       │
+       ▼
+canonicalId
+       │
+       ▼
+library index
+       │
+       ├── asset found
+       └── asset absent
+```
+
+If absent:
+
+```text
+source_empty
+```
+
+not:
+
+```text
+source_failed
+```
+
+provided the index was successfully queried and established absence.
+
+## 470. The resulting state machine
+
+We can now describe the complete resolution lifecycle:
+
+```text
+                   REQUEST
+                       │
+                       ▼
+                    PARSE
+                       │
+                       ▼
+                  IDENTITY
+                       │
+         ┌─────────────┼──────────────┐
+         ▼             ▼              ▼
+     NOT_FOUND    NOT_RESOLVED    AMBIGUOUS
+         │             │              │
+         └─────────────┴──────────────┘
+                       │
+                   RESOLVED
+                       │
+                       ▼
+               CAPABILITY FILTER
+                       │
+                       ▼
+               IDENTITY FILTER
+                       │
+                       ▼
+                ADMISSION
+                       │
+                  ┌────┴────┐
+                  ▼         ▼
+               REJECT      ADMIT
+                            │
+                            ▼
+                       CIRCUIT
+                            │
+                            ▼
+                      RATE LIMIT
+                            │
+                            ▼
+                      CONCURRENCY
+                            │
+                            ▼
+                        TIMEOUT
+                            │
+                            ▼
+                      NETWORK POLICY
+                            │
+                            ▼
+                        EXECUTE
+                            │
+                            ▼
+                        VALIDATE
+                            │
+                            ▼
+                       AUTHORIZE
+                            │
+                            ▼
+                         DEDUPE
+                            │
+                            ▼
+                          RANK
+                            │
+                            ▼
+                        PRESENT
+```
+
+This is now approaching a real execution architecture rather than
+merely a Stremio wrapper.
+
+## 471. New runtime gate
+
+Introduce:
+
+```text
+GATE-SOURCE-RUNTIME-01
+```
+
+```text
+[ ] raw fetch unavailable to adapters
+[ ] SourceHttpClient boundary exists
+[ ] timeout enforced
+[ ] AbortSignal propagated
+[ ] retry policy explicit
+[ ] retry cancellation tested
+[ ] rate limit per source
+[ ] concurrency per source
+[ ] circuit checked before execution
+[ ] response-size limit
+[ ] redirect limit
+[ ] redirect policy revalidated
+[ ] HTTPS policy enforced
+[ ] embedded credentials rejected
+[ ] sensitive headers redacted
+[ ] secrets absent from candidates
+[ ] provider HTTP semantics remain adapter-specific
+[ ] network failures classified
+[ ] media body not proxied by default
+[ ] DNS/IP policy defined
+[ ] deterministic failure mapping tested
+```
+
+Status:
+
+```text
+GATE-SOURCE-RUNTIME-01 = OPEN
+```
+
+No execution evidence exists yet.
+
+## 472. Architecture checkpoint
+
+The addon now has five distinct authorities:
+
+| Authority | Question |
+| --- | --- |
+| **Protocol** | What did Stremio request? |
+| **Identity** | What media does that request identify? |
+| **Admission** | Which sources are permitted? |
+| **Runtime** | Can an admitted source execute safely now? |
+| **Resolver** | Which resulting candidates should be presented? |
+
+And one important non-authority:
+
+| Component | What it is *not* |
+| --- | --- |
+| Health | not authorization |
+| Cache | not truth |
+| Metadata | not identity authority |
+| Ranking | not authorization |
+| Logging | not canonical evidence |
+| HTTP status | not automatically domain semantics |
+
+That separation is what prevents the system from gradually turning:
+
+```text
+"we observed X"
+```
+
+into:
+
+```text
+"therefore X is true"
+```
+
+and then:
+
+```text
+"therefore we are authorized to act on X."
+```
+
+## 473. Next build target
+
+The natural next step is now **the concrete owned-media source
+implementation**:
+
+```text
+OwnedMediaSource
+├── manifest/declaration
+├── configuration schema
+├── identity index
+├── asset index
+├── credential boundary
+├── HTTP implementation
+├── candidate conversion
+├── authorization evidence
+├── source-specific error mapping
+├── adapter conformance tests
+└── end-to-end Stremio test
+```
+
+That is where the abstract contracts become an actual runnable
+source, while keeping the source implementation replaceable by a
+licensed API, public-domain repository, or another explicitly
+authorized backend later.
