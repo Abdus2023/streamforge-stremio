@@ -22534,3 +22534,1462 @@ mistake: using every source adapter as a catalog crawler. Instead,
 catalog discovery needs its own indexed, bounded, evidence-bearing
 model so `/catalog` and search remain deterministic and do not turn a
 playback resolver into an uncontrolled Internet crawler.
+
+## 565. Catalog + Discovery: separate browsing from playback
+
+The next boundary is important enough to make explicit:
+
+```text
+CATALOG/DISCOVERY
+    answers:
+    "What media can I browse?"
+
+STREAM RESOLUTION
+    answers:
+    "What authorized playback candidates exist for this media?"
+
+METADATA
+    answers:
+    "What descriptive information is currently observed?"
+
+IDENTITY
+    answers:
+    "Which canonical media entity does this identifier refer to?"
+```
+
+These are related questions, but they are **not the same operation**.
+
+A source that can play a movie does not automatically become a
+catalog provider.
+
+## 566. The anti-pattern
+
+Avoid:
+
+```text
+/catalog
+   ↓
+for every source
+   ↓
+source.resolve(...)
+   ↓
+discover everything
+```
+
+That creates several problems:
+
+```text
+catalog request
+    ↓
+N sources
+    ↓
+N network requests
+    ↓
+N different provider semantics
+    ↓
+unbounded discovery
+```
+
+It also encourages providers to expose arbitrary content simply
+because they happen to return it.
+
+The correct architecture is:
+
+```text
+Catalog
+   │
+   ▼
+CatalogIndex
+   │
+   ▼
+CatalogEntries
+   │
+   ▼
+Stremio Catalog DTO
+```
+
+## 567. Catalog as an explicit capability
+
+Introduce:
+
+```ts
+interface CatalogProvider {
+  readonly id: string;
+
+  readonly capabilities: CatalogCapabilities;
+
+  list(
+    request: CatalogRequest,
+    context: CatalogContext
+  ): Promise<CatalogObservation>;
+}
+```
+
+Capabilities:
+
+```ts
+interface CatalogCapabilities {
+  readonly mediaTypes: readonly MediaType[];
+
+  readonly catalogs: readonly string[];
+
+  readonly supportsPagination: boolean;
+
+  readonly supportsSearch: boolean;
+}
+```
+
+This is intentionally different from:
+
+```text
+SourceCapabilities
+```
+
+because:
+
+```text
+canPlay(media)
+```
+
+does not imply:
+
+```text
+canEnumerate(catalog)
+```
+
+## 568. Catalog request
+
+```ts
+interface CatalogRequest {
+  readonly catalogId: string;
+
+  readonly type: MediaType;
+
+  readonly skip: number;
+
+  readonly limit: number;
+
+  readonly extra?: Readonly<Record<string, string>>;
+}
+```
+
+For search:
+
+```ts
+interface SearchRequest {
+  readonly type?: MediaType;
+
+  readonly query: string;
+
+  readonly skip: number;
+
+  readonly limit: number;
+}
+```
+
+The application layer owns these concepts.
+
+The Stremio protocol layer merely translates them.
+
+## 569. Catalog observation
+
+As with the other subsystems, preserve state:
+
+```ts
+interface CatalogObservation {
+  readonly providerId: string;
+
+  readonly observedAt: string;
+
+  readonly status: "success" | "not_found" | "not_resolved" | "ambiguous";
+
+  readonly entries: readonly CatalogObservationEntry[];
+}
+```
+
+Entry:
+
+```ts
+interface CatalogObservationEntry {
+  readonly media: MediaRef;
+
+  readonly canonicalId?: string;
+
+  readonly title?: string;
+
+  readonly year?: number;
+
+  readonly poster?: string;
+
+  readonly background?: string;
+
+  readonly evidenceIds: readonly string[];
+}
+```
+
+The important detail is:
+
+```text
+canonicalId?
+```
+
+not:
+
+```text
+canonicalId: string
+```
+
+A catalog provider may know that a title exists without having
+established canonical identity.
+
+## 570. Catalog identity is not automatically canonical
+
+Suppose a provider returns:
+
+```text
+title = "Example"
+year = 2024
+providerId = "catalog-A"
+providerItemId = "12345"
+```
+
+That is an observation.
+
+It does **not** automatically establish:
+
+```text
+canonicalId = media:example-2024
+```
+
+Instead:
+
+```text
+Catalog observation
+       │
+       ▼
+Identity resolution
+       │
+       ├── RESOLVED
+       ├── AMBIGUOUS
+       ├── NOT_FOUND
+       └── NOT_RESOLVED
+```
+
+This preserves the same identity boundary already established.
+
+## 571. Catalog index
+
+For production-scale browsing, use an explicit index:
+
+```ts
+interface CatalogIndex {
+  list(request: CatalogRequest): Promise<readonly CatalogEntry[]>;
+
+  search(request: SearchRequest): Promise<readonly CatalogEntry[]>;
+}
+```
+
+The index is a **derived view**.
+
+Canonical facts remain elsewhere.
+
+```text
+observations
+    ↓
+reconciliation
+    ↓
+catalog index
+```
+
+Therefore:
+
+```text
+CatalogIndex ≠ source of truth
+```
+
+## 572. Catalog entry
+
+```ts
+interface CatalogEntry {
+  readonly canonicalId: string;
+
+  readonly media: MediaRef;
+
+  readonly title: string;
+
+  readonly year?: number;
+
+  readonly poster?: string;
+
+  readonly background?: string;
+
+  readonly genres: readonly string[];
+
+  readonly sourceEvidenceIds: readonly string[];
+
+  readonly generatedAt: string;
+}
+```
+
+This is a projection optimized for browsing.
+
+It should not contain the complete evidence graph.
+
+## 573. "Persist facts; derive views"
+
+The architecture now has a recurring pattern:
+
+```text
+                FACTS
+                  │
+       ┌──────────┼──────────┐
+       ▼          ▼          ▼
+    Identity   Metadata   Catalog
+    Evidence   Evidence    Evidence
+       │          │          │
+       └──────────┼──────────┘
+                  ▼
+             DERIVATION
+                  │
+       ┌──────────┼──────────┐
+       ▼          ▼          ▼
+  Canonical     Metadata    Catalog
+   Media         View        Index
+```
+
+Never make the catalog projection the authority merely because it is
+convenient to query.
+
+## 574. Pagination contract
+
+Stremio catalog pagination commonly uses a `skip` mechanism.
+
+Internally, make pagination explicit:
+
+```ts
+interface Page<T> {
+  readonly items: readonly T[];
+
+  readonly skip: number;
+
+  readonly limit: number;
+
+  readonly hasMore: boolean;
+}
+```
+
+Invariant:
+
+```text
+items.length <= limit
+```
+
+And:
+
+```text
+skip >= 0
+limit > 0
+```
+
+with a configured maximum:
+
+```text
+limit <= MAX_CATALOG_PAGE_SIZE
+```
+
+Never let a client request an arbitrarily large page.
+
+## 575. Stable pagination
+
+A subtle problem appears when the underlying catalog changes while
+the client paginates.
+
+Suppose:
+
+```text
+request 1: skip=0
+
+catalog changes
+
+request 2: skip=100
+```
+
+Items can move between pages.
+
+For an initial implementation, use deterministic ordering:
+
+```text
+ORDER BY canonicalId
+```
+
+or another stable declared key.
+
+Avoid:
+
+```text
+ORDER BY random()
+```
+
+and unstable provider response ordering.
+
+## 576. Search is not arbitrary web search
+
+Search should be explicitly scoped.
+
+```text
+Search
+   ↓
+registered CatalogProvider(s)
+   ↓
+bounded query
+   ↓
+observations
+   ↓
+identity reconciliation
+   ↓
+dedupe
+   ↓
+rank
+   ↓
+results
+```
+
+Do not interpret:
+
+```text
+search("matrix")
+```
+
+as:
+
+```text
+crawl the Internet for anything containing "matrix"
+```
+
+That would destroy the provider boundary.
+
+## 577. Search query normalization
+
+Normalize:
+
+```ts
+interface NormalizedSearchQuery {
+  readonly original: string;
+
+  readonly normalized: string;
+}
+```
+
+Potential normalization:
+
+```text
+trim
+Unicode normalization
+collapse whitespace
+case normalization
+```
+
+But don't aggressively remove punctuation or transliterate languages
+unless that behavior is explicitly part of the search contract.
+
+For example:
+
+```text
+"Spider-Man"
+```
+
+should not silently become a different semantic query.
+
+## 578. Search ranking
+
+Search ranking is different from stream ranking.
+
+Stream ranking asks:
+
+Which playable candidate should appear first?
+
+Search ranking asks:
+
+Which catalog entity best matches the query?
+
+Therefore keep:
+
+```text
+StreamRanker
+```
+
+and:
+
+```text
+CatalogRanker
+```
+
+separate.
+
+## 579. Catalog ranking model
+
+A deterministic first implementation could consider:
+
+```text
+exact title match
+prefix match
+token match
+year match
+provider confidence
+canonical identity availability
+stable canonical ID
+```
+
+But every score must be explainable.
+
+For example:
+
+```ts
+interface CatalogRankingExplanation {
+  readonly exactTitle: boolean;
+  readonly prefixMatch: boolean;
+  readonly tokenMatchCount: number;
+  readonly yearMatch: boolean;
+  readonly identityResolved: boolean;
+}
+```
+
+Then:
+
+```text
+score = derived view
+```
+
+rather than an unexplained magic number.
+
+## 580. Dedupe catalog results
+
+Two providers may return:
+
+```text
+Provider A: tt1234567
+
+Provider B: tmdb:550
+```
+
+Identity reconciliation can establish that they represent the same
+media.
+
+Then:
+
+```text
+Provider A ─┐
+            ├──> CanonicalMedia
+Provider B ─┘
+```
+
+and the catalog projection becomes one entry.
+
+This is one of the strongest reasons identity must remain
+independent.
+
+## 581. Unresolved catalog entries
+
+Suppose:
+
+```text
+Provider A: title = "Example" year = 2024
+
+Identity: AMBIGUOUS
+```
+
+The system has two choices:
+
+### Strict canonical catalog
+
+Only include resolved identities.
+
+### Evidence-preserving staging catalog
+
+Retain unresolved observations separately until identity is resolved.
+
+For the main Stremio catalog, the strict approach is safer:
+
+```text
+AMBIGUOUS
+   ↓
+not promoted to canonical catalog entry
+```
+
+The observation is not destroyed.
+
+## 582. Catalog ingestion
+
+Instead of querying providers during every user request:
+
+```text
+Provider
+   ↓
+ingestion job
+   ↓
+observation
+   ↓
+reconciliation
+   ↓
+catalog index
+```
+
+This changes the runtime behavior dramatically.
+
+A user request becomes:
+
+```text
+/catalog
+   ↓
+CatalogIndex
+   ↓
+fast deterministic response
+```
+
+rather than:
+
+```text
+/catalog
+   ↓
+multiple external providers
+   ↓
+latency + failures
+```
+
+## 583. Ingestion is asynchronous
+
+Introduce:
+
+```ts
+interface CatalogIngestionJob {
+  readonly jobId: string;
+
+  readonly providerId: string;
+
+  readonly catalogId: string;
+
+  readonly startedAt: string;
+
+  readonly completedAt?: string;
+
+  readonly status: "running" | "completed" | "partial" | "failed";
+}
+```
+
+This allows:
+
+```text
+runtime request path
+```
+
+to remain separate from:
+
+```text
+background synchronization path
+```
+
+## 584. Freshness
+
+Catalog data becomes time-dependent.
+
+Add:
+
+```ts
+interface CatalogFreshness {
+  readonly observedAt: string;
+
+  readonly generatedAt: string;
+
+  readonly expiresAt?: string;
+}
+```
+
+But:
+
+```text
+expired
+```
+
+does not mean:
+
+```text
+false
+```
+
+This follows the same rule as identity and metadata.
+
+```text
+expired catalog
+    ≠ media does not exist
+```
+
+## 585. Stale-while-revalidate
+
+A useful policy:
+
+```text
+fresh
+   ↓
+serve
+
+stale but usable
+   ↓
+serve
+   + schedule refresh
+
+missing
+   ↓
+empty/error according to protocol
+```
+
+The policy should be explicit.
+
+Do not let stale behavior emerge accidentally from cache
+implementation details.
+
+## 586. Catalog index storage
+
+For v0.1, a deterministic JSON/SQLite-backed index is sufficient.
+
+Possible evolution:
+
+```text
+v0.1 JSON index
+v0.2 SQLite
+v0.3 SQLite + FTS
+v1.x optional external search index
+```
+
+Do not introduce Elasticsearch/OpenSearch merely because "search"
+exists.
+
+The storage engine should follow actual requirements.
+
+## 587. SQLite boundary
+
+If SQLite becomes necessary, isolate it:
+
+```text
+CatalogRepository
+      │
+      ▼
+SQLite
+```
+
+The application layer sees:
+
+```ts
+interface CatalogRepository {
+  getPage(...): Promise<Page<CatalogEntry>>;
+  search(...): Promise<readonly CatalogEntry[]>;
+}
+```
+
+It should not see SQL statements.
+
+## 588. Full-text search
+
+If search grows beyond simple matching:
+
+```text
+CatalogEntry
+    ↓
+tokenizer
+    ↓
+FTS index
+```
+
+But the FTS index remains a derived structure.
+
+Therefore:
+
+```text
+FTS index corruption
+    ≠ loss of canonical evidence
+```
+
+It can be rebuilt.
+
+That is an important durability property.
+
+## 589. Rebuildability invariant
+
+A strong architectural invariant:
+
+```text
+Canonical facts + deterministic derivation rules = rebuildable views
+```
+
+Therefore:
+
+```text
+catalog index
+metadata cache
+search index
+ranking cache
+```
+
+should ideally be reconstructible.
+
+If deleting a derived index destroys authoritative facts, the
+boundary has failed.
+
+## 590. Catalog authorization
+
+Catalog visibility itself can require policy.
+
+For example:
+
+```ts
+interface CatalogVisibilityPolicy {
+  canExpose(entry: CatalogEntry, context: VisibilityContext): boolean;
+}
+```
+
+But don't confuse:
+
+```text
+catalog visibility
+```
+
+with:
+
+```text
+playback authorization
+```
+
+A title can legitimately appear in a catalog while no authorized
+playback candidate currently exists.
+
+## 591. Three independent states
+
+This produces an important distinction:
+
+```text
+CATALOG
+  "media exists in browse index"
+
+METADATA
+  "descriptive information exists"
+
+PLAYBACK
+  "authorized playback candidate exists now"
+```
+
+All combinations are possible.
+
+| Catalog | Metadata | Playback | Meaning |
+| --- | --- | --- | --- |
+| ✓ | ✓ | ✓ | browse + information + playback |
+| ✓ | ✓ | ✗ | known media, no playable candidate |
+| ✓ | ✗ | ✓ | playable but metadata unavailable |
+| ✗ | ✓ | ✓ | possible direct resolution without catalog listing |
+| ✗ | ✗ | ✓ | direct playback path only |
+| ✓ | ✗ | ✗ | browse-only entry |
+
+This is preferable to one global:
+
+```text
+available = true/false
+```
+
+## 592. Catalog does not imply stream availability
+
+This is worth making an invariant:
+
+```text
+CatalogEntry
+    ─X→ PlayableCandidate
+```
+
+There is no automatic implication.
+
+Instead:
+
+```text
+CatalogEntry
+    │
+    ▼
+CanonicalMedia
+    │
+    ▼
+StreamResolver
+    │
+    ▼
+PlayableCandidate[]
+```
+
+The stream resolver performs a fresh eligibility check.
+
+## 593. Search result identity
+
+A search result should carry:
+
+```ts
+interface SearchResult {
+  readonly canonicalId: string;
+
+  readonly media: MediaRef;
+
+  readonly title: string;
+
+  readonly year?: number;
+
+  readonly poster?: string;
+
+  readonly score: number;
+
+  readonly explanation: CatalogRankingExplanation;
+}
+```
+
+The score is a **derived ranking value**, not evidence.
+
+## 594. Stremio catalog mapping
+
+The mapper remains protocol-specific:
+
+```ts
+function toStremioCatalogItem(entry: CatalogEntry): StremioCatalogItem {
+  return {
+    id: entry.media.id,
+    type: entry.media.type,
+    name: entry.title,
+    year: entry.year,
+    poster: entry.poster,
+    background: entry.background
+  };
+}
+```
+
+For series/episode representations, the exact protocol DTO should be
+verified against the SDK/protocol version actually installed before
+claiming compatibility.
+
+That verification belongs to the release gate.
+
+## 595. Manifest evolution
+
+Only after catalog implementation exists should the manifest evolve
+from:
+
+```text
+resources:
+  stream
+```
+
+to something like:
+
+```text
+resources:
+  stream
+  catalog
+```
+
+And only after metadata:
+
+```text
+resources:
+  stream
+  catalog
+  meta
+```
+
+And subtitles:
+
+```text
+resources:
+  stream
+  catalog
+  meta
+  subtitle
+```
+
+The manifest therefore becomes a **release artifact**, not a wish
+list.
+
+## 596. Capability staging
+
+This suggests explicit capability profiles:
+
+```ts
+type AddonProfile =
+  | "stream-only"
+  | "stream-catalog"
+  | "stream-catalog-meta"
+  | "full";
+```
+
+But avoid using this as runtime magic.
+
+A profile should generate/validate configuration.
+
+## 597. The unified application layer
+
+We now have enough subsystems to introduce a common application
+façade:
+
+```ts
+interface MediaApplication {
+  resolveStreams(
+    request: StreamRequest,
+    context: ResolutionRequestContext
+  ): Promise<ResolutionResult>;
+
+  getMetadata(
+    request: MetadataRequest,
+    context: ResolutionRequestContext
+  ): Promise<MetadataResult>;
+
+  getSubtitles(
+    request: SubtitleRequest,
+    context: ResolutionRequestContext
+  ): Promise<SubtitleResult>;
+
+  getCatalog(
+    request: CatalogRequest,
+    context: ResolutionRequestContext
+  ): Promise<Page<CatalogEntry>>;
+
+  search(
+    request: SearchRequest,
+    context: ResolutionRequestContext
+  ): Promise<readonly SearchResult[]>;
+}
+```
+
+This is not necessarily the final public API.
+
+It is an architectural boundary.
+
+## 598. Resource resolver
+
+An even stronger abstraction is a typed resource model:
+
+```text
+                MediaApplication
+                        │
+         ┌──────────────┼──────────────┐
+         ▼              ▼              ▼
+      Streams        Metadata       Subtitles
+                        │
+                  ┌─────┴─────┐
+                  ▼           ▼
+               Catalog       Search
+```
+
+Each operation remains independent.
+
+There is no giant:
+
+```text
+resolveEverything()
+```
+
+method.
+
+That would recreate the coupling we spent the previous sections
+removing.
+
+## 599. Why not `resolveEverything()`?
+
+Because a Stremio client may request:
+
+```text
+/meta
+```
+
+without:
+
+```text
+/stream
+```
+
+or:
+
+```text
+/catalog
+```
+
+without either.
+
+If one mega-resolver executes all subsystems:
+
+```text
+/catalog
+  ↓
+identity
+  ↓
+metadata
+  ↓
+streams
+  ↓
+subtitles
+```
+
+then an outage in a subtitle provider could accidentally affect
+catalog browsing.
+
+Independent resource resolution gives:
+
+```text
+failure isolation
+```
+
+as an architectural property.
+
+## 600. Failure-domain isolation
+
+The resulting system can be represented as:
+
+```text
+                 STREMIO
+                     │
+         ┌───────────┼───────────┐
+         ▼           ▼           ▼
+      Catalog     Metadata     Stream
+         │           │           │
+         ▼           ▼           ▼
+       pool-A      pool-B      pool-C
+         │           │           │
+         ▼           ▼           ▼
+     providers    providers   providers
+                     │
+                  pool-D
+                     │
+                 subtitles
+```
+
+More accurately, subtitles would have their own pool as well.
+
+The principle is:
+
+one subsystem's external latency must not consume the entire
+process's execution budget.
+
+## 601. Resource-specific budgets
+
+Define:
+
+```ts
+interface ResourceBudget {
+  readonly timeoutMs: number;
+
+  readonly maxConcurrency: number;
+
+  readonly maxCandidates: number;
+}
+```
+
+Then:
+
+```text
+stream:
+    5000ms / 20
+
+metadata:
+    3000ms / 10
+
+subtitle:
+    3000ms / 10
+
+catalog:
+    mostly local / 4
+```
+
+Those numbers are examples, not validated production defaults.
+
+The important part is that budgets are **declared per resource**.
+
+## 602. Cancellation hierarchy
+
+A Stremio request creates:
+
+```text
+Request AbortSignal
+        │
+        ├── identity
+        ├── metadata
+        ├── stream
+        └── subtitle
+```
+
+But shared operations require care.
+
+If two requests share:
+
+```text
+identity lookup
+```
+
+then:
+
+```text
+Request A cancelled
+```
+
+must not necessarily cancel the shared identity lookup for:
+
+```text
+Request B
+```
+
+Hence the earlier subscriber-counted in-flight abstraction.
+
+## 603. Request deadline
+
+Rather than giving every subsystem an independent full timeout:
+
+```text
+request deadline
+      │
+      ├── identity
+      ├── metadata
+      └── stream
+```
+
+A stronger model is:
+
+```ts
+interface Deadline {
+  readonly expiresAtMs: number;
+}
+```
+
+Each subsystem receives:
+
+```text
+remainingMs(deadline)
+```
+
+This prevents:
+
+```text
+5 sec identity + 5 sec metadata + 5 sec stream = 15 sec request
+```
+
+when the client expected a bounded request.
+
+## 604. Deadline propagation
+
+The request path becomes:
+
+```text
+request
+  │
+  ▼
+deadline = now + budget
+  │
+  ├── identity: remaining
+  ├── metadata: remaining
+  ├── stream: remaining
+  └── subtitles: remaining
+```
+
+Each provider must obey the remaining deadline.
+
+This is more precise than independently setting arbitrary child
+timeouts.
+
+## 605. Parallel vs sequential orchestration
+
+For `/stream`, identity resolution usually precedes source
+resolution:
+
+```text
+identity
+   ↓
+CanonicalMedia
+   ↓
+sources
+```
+
+But metadata and subtitles may sometimes execute independently once
+canonical identity exists.
+
+For example:
+
+```text
+CanonicalMedia
+     │
+┌───┼────┐
+▼   ▼    ▼
+meta stream subtitles
+```
+
+These can run concurrently when requested together by an internal
+workflow.
+
+The default Stremio handlers, however, should only perform the work
+needed for their individual resource.
+
+## 606. Admission graph vs execution graph
+
+We now have two different graphs.
+
+### Admission graph
+
+```text
+Declaration
+   ↓
+Validation
+   ↓
+Authorization evidence
+   ↓
+Admission
+```
+
+### Execution graph
+
+```text
+Request
+   ↓
+Identity
+   ↓
+Provider selection
+   ↓
+Runtime controls
+   ↓
+Observation
+   ↓
+Validation
+   ↓
+Authorization
+   ↓
+Projection
+```
+
+Do not merge them.
+
+An admitted provider can fail during execution.
+
+An unhealthy provider does not become unauthorized.
+
+## 607. Final information architecture
+
+The system now has five major information domains:
+
+```text
+                 MEDIA PLATFORM
+                        │
+      ┌─────────────────┼──────────────────┐
+      ▼                 ▼                  ▼
+   Identity          Discovery          Resources
+      │                 │                  │
+      │                 │          ┌───────┼────────┐
+      │                 │          ▼       ▼        ▼
+      │                 │       Streams Metadata Subtitles
+      │                 │
+      └─────────────────┴──────────────────┘
+                     │
+                  Evidence
+                     │
+                     ▼
+               Derived Views
+```
+
+Where:
+
+```text
+Identity
+    = entity resolution
+
+Discovery
+    = catalog/search
+
+Streams
+    = authorized playback candidates
+
+Metadata
+    = descriptive observations
+
+Subtitles
+    = subtitle candidates
+```
+
+## 608. The central invariant
+
+The whole architecture can now be reduced to one rule:
+
+```text
+OBSERVE
+   ↓
+PRESERVE
+   ↓
+VALIDATE
+   ↓
+AUTHORIZE
+   ↓
+DERIVE
+   ↓
+PRESENT
+```
+
+Not:
+
+```text
+FETCH
+ ↓
+TRUST
+ ↓
+RETURN
+```
+
+That distinction is what makes the addon an aggregation platform
+rather than a collection of network scrapers.
+
+## 609. Updated release gates
+
+The release tree now becomes:
+
+```text
+GATE-V0.1
+│
+├── GATE-CORE
+├── GATE-IDENTITY-01
+├── GATE-SOURCE-ADMISSION-01
+├── GATE-SOURCE-RUNTIME-01
+├── GATE-METADATA-01
+├── GATE-SUBTITLE-01
+└── GATE-CATALOG-01
+```
+
+`GATE-CATALOG-01`:
+
+```text
+[ ] CatalogProvider contract
+[ ] catalog capabilities
+[ ] bounded pagination
+[ ] deterministic ordering
+[ ] CatalogObservation
+[ ] identity separation
+[ ] catalog index
+[ ] search contract
+[ ] search normalization
+[ ] deterministic ranking
+[ ] catalog dedupe
+[ ] freshness model
+[ ] stale policy
+[ ] rebuildable index
+[ ] authorization/visibility policy
+[ ] protocol mapper
+[ ] integration tests
+[ ] manifest capability validated
+```
+
+Status:
+
+```text
+GATE-CATALOG-01 = OPEN
+```
+
+And the global project remains:
+
+```text
+IMPLEMENTATION STATUS = NOT VERIFIED
+RELEASE STATUS        = OPEN
+ARTIFACT STATUS       = NOT BOUND
+```
+
+because none of these gates has yet been demonstrated by an actual CI
+execution in this conversation.
