@@ -8332,3 +8332,1914 @@ CI
 Then we can freeze the first **`v0.1.0-conformance` baseline**, run the
 entire suite, and only after evidence exists begin adding additional
 source adapters.
+
+## 223. Executable reference implementation
+
+We have reached the point where continuing to add abstractions would
+be counterproductive.
+
+The next milestone is:
+
+**Turn the architecture into a small, executable, testable addon
+kernel before adding more providers.**
+
+The first implementation should intentionally have **one safe fixture
+adapter** representing an explicitly authorized/public-domain/user-owned
+source. Everything else can plug into the same contract later.
+
+## 224. Freeze the v0.1 boundary
+
+Before writing implementation code, freeze this dependency direction:
+
+```text
+┌──────────────────────────────────────────────────┐
+│                    addon/                          │
+│              Stremio protocol only                 │
+└───────────────────────┬──────────────────────────┘
+                         │
+                         ▼
+┌──────────────────────────────────────────────────┐
+│                  application                       │
+│       identity / resolver / orchestration          │
+└───────────────┬──────────────────┬───────────────┘
+                 │                  │
+                 ▼                  ▼
+┌──────────────────────┐   ┌──────────────────────┐
+│       domain          │   │       runtime         │
+│ media/candidates/      │   │ timeout/cache/http/   │
+│ policy/results         │   │ limiter/breaker       │
+└──────────────────────┘   └──────────────────────┘
+                 ▲                  ▲
+                 │                  │
+                 └────────┬─────────┘
+                          │
+                          ▼
+                   source adapters
+```
+
+Dependency rule:
+
+```text
+addon → application → domain
+                 ↘ runtime
+
+adapters → domain + runtime interfaces
+```
+
+Never:
+
+```text
+domain → Stremio SDK
+domain → fetch
+domain → Pino
+domain → cache implementation
+```
+
+The domain remains portable.
+
+## 225. Project tree
+
+The concrete tree becomes:
+
+```text
+stremio-source-aggregator/
+│
+├── package.json
+├── package-lock.json
+├── tsconfig.json
+├── vitest.config.ts
+├── Dockerfile
+├── compose.yaml
+├── .dockerignore
+├── .gitignore
+│
+├── src/
+│   ├── index.ts
+│   │
+│   ├── addon/
+│   │   ├── manifest.ts
+│   │   ├── parser.ts
+│   │   └── stream-handler.ts
+│   │
+│   ├── application/
+│   │   └── resolver.ts
+│   │
+│   ├── domain/
+│   │   ├── media.ts
+│   │   ├── candidate.ts
+│   │   ├── failure.ts
+│   │   └── result.ts
+│   │
+│   ├── adapters/
+│   │   ├── interface.ts
+│   │   ├── registry.ts
+│   │   └── fixture/
+│   │       └── adapter.ts
+│   │
+│   ├── resolver/
+│   │   ├── validate.ts
+│   │   ├── policy.ts
+│   │   ├── dedupe.ts
+│   │   └── rank.ts
+│   │
+│   ├── runtime/
+│   │   ├── timeout.ts
+│   │   ├── semaphore.ts
+│   │   ├── limiter.ts
+│   │   ├── breaker.ts
+│   │   ├── cache.ts
+│   │   ├── inflight.ts
+│   │   └── http.ts
+│   │
+│   ├── observability/
+│   │   ├── logger.ts
+│   │   ├── metrics.ts
+│   │   └── health.ts
+│   │
+│   └── config/
+│       └── config.ts
+│
+└── test/
+    ├── domain/
+    ├── runtime/
+    ├── resolver/
+    ├── addon/
+    └── integration/
+```
+
+## 226. `package.json`
+
+For the first implementation, keep dependencies deliberately small.
+
+```json
+{
+  "name": "stremio-source-aggregator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test && npm run build"
+  },
+  "dependencies": {
+    "pino": "^9.0.0",
+    "stremio-addon-sdk": "^1.6.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0",
+    "vitest": "^3.0.0"
+  }
+}
+```
+
+These versions are **implementation placeholders**, not a claim that
+they are the latest releases. Before freezing `package-lock.json`,
+resolve the actual versions and record them as build evidence.
+
+## 227. TypeScript configuration
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+
+    "forceConsistentCasingInFileNames": true,
+
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+
+    "outDir": "dist",
+    "rootDir": "src"
+  },
+  "include": ["src/**/*.ts"]
+}
+```
+
+The important settings are:
+
+```text
+strict
+noUncheckedIndexedAccess
+exactOptionalPropertyTypes
+noImplicitOverride
+```
+
+They make the domain contracts considerably harder to accidentally
+weaken.
+
+## 228. Domain: `media.ts`
+
+```ts
+export type MediaType = "movie" | "series";
+
+export interface MediaRef {
+  readonly type: MediaType;
+  readonly id: string;
+  readonly season?: number;
+  readonly episode?: number;
+}
+```
+
+No Stremio dependency.
+
+No provider dependency.
+
+No HTTP dependency.
+
+## 229. Domain: candidate
+
+```ts
+import type { MediaRef } from "./media.js";
+
+export interface SourceCandidate {
+  readonly sourceId: string;
+
+  readonly media: MediaRef;
+
+  readonly location: {
+    readonly url: string;
+  };
+
+  readonly mediaInfo: {
+    readonly container?: string;
+    readonly videoCodec?: string;
+    readonly audioCodec?: string;
+    readonly width?: number;
+    readonly height?: number;
+    readonly bitrate?: number;
+    readonly sizeBytes?: number;
+    readonly durationSeconds?: number;
+  };
+
+  readonly language: {
+    readonly audio?: readonly string[];
+    readonly subtitle?: readonly string[];
+  };
+
+  readonly provenance: {
+    readonly adapter: string;
+    readonly sourceRecordId?: string;
+    readonly observedAt: string;
+  };
+
+  readonly capabilities: {
+    readonly directPlayback: boolean;
+    readonly seekable?: boolean;
+    readonly live?: boolean;
+  };
+
+  readonly authorization: {
+    readonly status: "authorized" | "unknown" | "denied";
+
+    readonly basis?: string;
+  };
+}
+```
+
+This is the central internal object.
+
+## 230. Domain: failures
+
+```ts
+export type FailureCode =
+  | "invalid_request"
+  | "identity_not_found"
+  | "identity_ambiguous"
+  | "source_empty"
+  | "source_timeout"
+  | "source_aborted"
+  | "source_rate_limited"
+  | "source_circuit_open"
+  | "source_invalid_response"
+  | "source_network_error"
+  | "candidate_invalid"
+  | "candidate_not_authorized"
+  | "internal_error";
+
+export interface Failure {
+  readonly code: FailureCode;
+  readonly sourceId?: string;
+  readonly message?: string;
+}
+```
+
+Keep the machine-readable code stable.
+
+Human-readable `message` remains diagnostic.
+
+## 231. Domain: result
+
+```ts
+import type { SourceCandidate } from "./candidate.js";
+import type { Failure } from "./failure.js";
+import type { MediaRef } from "./media.js";
+
+export type ResolutionStatus = "success" | "empty" | "partial" | "failed";
+
+export interface ResolutionResult {
+  readonly media: MediaRef;
+
+  readonly status: ResolutionStatus;
+
+  readonly candidates: readonly SourceCandidate[];
+
+  readonly failures: readonly Failure[];
+
+  readonly sourceCount: number;
+
+  readonly durationMs: number;
+}
+```
+
+Now the resolver has a meaningful semantic result rather than just:
+
+```text
+SourceCandidate[]
+```
+
+## 232. Adapter contract
+
+```ts
+import type { MediaRef } from "../domain/media.js";
+import type { SourceCandidate } from "../domain/candidate.js";
+
+export interface ResolveContext {
+  readonly signal: AbortSignal;
+
+  readonly timeoutMs: number;
+
+  readonly preferredLanguages: readonly string[];
+}
+
+export interface SourceAdapter {
+  readonly id: string;
+
+  readonly name: string;
+
+  supports(media: MediaRef): boolean;
+
+  resolve(
+    media: MediaRef,
+    ctx: ResolveContext
+  ): Promise<readonly SourceCandidate[]>;
+}
+```
+
+The contract is intentionally small.
+
+## 233. Adapter registry
+
+```ts
+import type { MediaRef } from "../domain/media.js";
+import type { SourceAdapter } from "./interface.js";
+
+export class SourceRegistry {
+  private readonly adapters = new Map<string, SourceAdapter>();
+
+  register(adapter: SourceAdapter): void {
+    if (this.adapters.has(adapter.id)) {
+      throw new Error(`duplicate_adapter:${adapter.id}`);
+    }
+
+    this.adapters.set(adapter.id, adapter);
+  }
+
+  all(): readonly SourceAdapter[] {
+    return [...this.adapters.values()];
+  }
+
+  applicable(media: MediaRef): readonly SourceAdapter[] {
+    return this.all().filter(adapter => adapter.supports(media));
+  }
+}
+```
+
+## 234. Validation
+
+```ts
+import type { SourceCandidate } from "../domain/candidate.js";
+
+export function validateCandidate(candidate: SourceCandidate): boolean {
+  try {
+    const url = new URL(candidate.location.url);
+
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      return false;
+    }
+
+    if (!candidate.sourceId) {
+      return false;
+    }
+
+    if (!candidate.provenance.adapter) {
+      return false;
+    }
+
+    if (
+      candidate.media.type === "series" &&
+      (!Number.isInteger(candidate.media.season) ||
+        !Number.isInteger(candidate.media.episode))
+    ) {
+      return false;
+    }
+
+    return true;
+  } catch {
+    return false;
+  }
+}
+```
+
+This is structural validation.
+
+It does **not** establish authorization.
+
+## 235. Policy
+
+```ts
+import type { SourceCandidate } from "../domain/candidate.js";
+
+export interface PolicyDecision {
+  readonly allowed: boolean;
+  readonly reasons: readonly string[];
+}
+
+export function evaluatePolicy(candidate: SourceCandidate): PolicyDecision {
+  const reasons: string[] = [];
+
+  if (candidate.authorization.status !== "authorized") {
+    reasons.push("authorization_not_verified");
+  }
+
+  if (!candidate.capabilities.directPlayback) {
+    reasons.push("direct_playback_unavailable");
+  }
+
+  return {
+    allowed: reasons.length === 0,
+
+    reasons
+  };
+}
+```
+
+This is intentionally strict.
+
+`unknown` does not become `authorized`.
+
+## 236. Deduplication
+
+```ts
+import type { SourceCandidate } from "../domain/candidate.js";
+
+function canonicalUrl(raw: string): string {
+  const url = new URL(raw);
+
+  url.hash = "";
+
+  return url.toString();
+}
+
+function key(candidate: SourceCandidate): string {
+  const media = candidate.media;
+
+  return [
+    media.type,
+    media.id,
+    media.season ?? "",
+    media.episode ?? "",
+    canonicalUrl(candidate.location.url)
+  ].join("|");
+}
+
+export function dedupeCandidates(
+  candidates: readonly SourceCandidate[]
+): readonly SourceCandidate[] {
+  const seen = new Set<string>();
+
+  const result: SourceCandidate[] = [];
+
+  for (const candidate of candidates) {
+    const k = key(candidate);
+
+    if (seen.has(k)) {
+      continue;
+    }
+
+    seen.add(k);
+    result.push(candidate);
+  }
+
+  return result;
+}
+```
+
+## 237. Deterministic ranking
+
+```ts
+import type { SourceCandidate } from "../domain/candidate.js";
+
+function pixels(candidate: SourceCandidate): number {
+  return (
+    (candidate.mediaInfo.width ?? 0) * (candidate.mediaInfo.height ?? 0)
+  );
+}
+
+export function rankCandidates(
+  candidates: readonly SourceCandidate[]
+): readonly SourceCandidate[] {
+  return [...candidates].sort((a, b) => {
+    if (a.capabilities.directPlayback !== b.capabilities.directPlayback) {
+      return a.capabilities.directPlayback ? -1 : 1;
+    }
+
+    const resolution = pixels(b) - pixels(a);
+
+    if (resolution !== 0) {
+      return resolution;
+    }
+
+    const bitrate = (b.mediaInfo.bitrate ?? 0) - (a.mediaInfo.bitrate ?? 0);
+
+    if (bitrate !== 0) {
+      return bitrate;
+    }
+
+    return a.sourceId.localeCompare(b.sourceId);
+  });
+}
+```
+
+The final `sourceId` comparison is important.
+
+Without it, equal candidates can depend on upstream ordering.
+
+## 238. Timeout implementation
+
+```ts
+export async function withTimeout<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  timeoutMs: number,
+  parentSignal?: AbortSignal
+): Promise<T> {
+  const controller = new AbortController();
+
+  const abortFromParent = () => {
+    controller.abort(parentSignal?.reason);
+  };
+
+  if (parentSignal) {
+    if (parentSignal.aborted) {
+      abortFromParent();
+    } else {
+      parentSignal.addEventListener("abort", abortFromParent, {
+        once: true
+      });
+    }
+  }
+
+  const timer = setTimeout(() => {
+    controller.abort(new Error("timeout"));
+  }, timeoutMs);
+
+  try {
+    return await operation(controller.signal);
+  } finally {
+    clearTimeout(timer);
+
+    parentSignal?.removeEventListener("abort", abortFromParent);
+  }
+}
+```
+
+## 239. Semaphore
+
+```ts
+export class Semaphore {
+  private active = 0;
+
+  private readonly queue: Array<() => void> = [];
+
+  constructor(private readonly capacity: number) {
+    if (capacity < 1) {
+      throw new Error("invalid_semaphore_capacity");
+    }
+  }
+
+  async acquire(): Promise<() => void> {
+    if (this.active < this.capacity) {
+      this.active++;
+
+      return () => this.release();
+    }
+
+    await new Promise<void>(resolve => this.queue.push(resolve));
+
+    this.active++;
+
+    return () => this.release();
+  }
+
+  private release(): void {
+    this.active--;
+
+    const next = this.queue.shift();
+
+    next?.();
+  }
+}
+```
+
+## 240. Circuit breaker
+
+Use the previously defined state machine, but make `half-open` a
+controlled probe.
+
+```ts
+export type BreakerState = "closed" | "open" | "half-open";
+
+export class CircuitBreaker {
+  private state: BreakerState = "closed";
+
+  private failures = 0;
+
+  private openedAt = 0;
+
+  constructor(
+    private readonly threshold = 5,
+    private readonly cooldownMs = 30_000
+  ) {}
+
+  state(): BreakerState {
+    this.refresh();
+
+    return this.state;
+  }
+
+  allow(): boolean {
+    this.refresh();
+
+    if (this.state === "open") {
+      return false;
+    }
+
+    if (this.state === "half-open") {
+      this.state = "open";
+      return true;
+    }
+
+    return true;
+  }
+
+  success(): void {
+    this.state = "closed";
+    this.failures = 0;
+    this.openedAt = 0;
+  }
+
+  failure(): void {
+    this.failures++;
+
+    if (this.failures >= this.threshold) {
+      this.state = "open";
+      this.openedAt = Date.now();
+    }
+  }
+
+  private refresh(): void {
+    if (
+      this.state === "open" &&
+      Date.now() - this.openedAt >= this.cooldownMs
+    ) {
+      this.state = "half-open";
+    }
+  }
+}
+```
+
+## 241. Source execution status
+
+```ts
+export type AdapterStatus =
+  | "success"
+  | "empty"
+  | "timeout"
+  | "aborted"
+  | "rate_limited"
+  | "circuit_open"
+  | "invalid_response"
+  | "network_error"
+  | "error";
+
+export interface AdapterExecution {
+  readonly adapterId: string;
+  readonly status: AdapterStatus;
+  readonly durationMs: number;
+  readonly candidates: readonly SourceCandidate[];
+  readonly error?: string;
+}
+```
+
+Now the resolver can preserve partial failures.
+
+## 242. Failure classification
+
+```ts
+export function classifyError(error: unknown): AdapterStatus {
+  if (error instanceof Error && error.message === "timeout") {
+    return "timeout";
+  }
+
+  if (error instanceof DOMException && error.name === "AbortError") {
+    return "aborted";
+  }
+
+  if (error instanceof TypeError) {
+    return "network_error";
+  }
+
+  return "error";
+}
+```
+
+In production, make this more precise around the actual HTTP
+implementation.
+
+## 243. Resolver implementation
+
+Now the pieces become one executable kernel.
+
+```ts
+import type { MediaRef } from "../domain/media.js";
+
+import type { SourceCandidate } from "../domain/candidate.js";
+
+import type { Failure } from "../domain/failure.js";
+
+import type { ResolutionResult } from "../domain/result.js";
+
+import type { SourceAdapter } from "../adapters/interface.js";
+
+import { validateCandidate } from "./validate.js";
+
+import { evaluatePolicy } from "./policy.js";
+
+import { dedupeCandidates } from "./dedupe.js";
+
+import { rankCandidates } from "./rank.js";
+
+import { withTimeout } from "../runtime/timeout.js";
+
+import { Semaphore } from "../runtime/semaphore.js";
+
+export interface ResolverConfig {
+  readonly totalTimeoutMs: number;
+  readonly sourceTimeoutMs: number;
+  readonly concurrency: number;
+  readonly preferredLanguages: readonly string[];
+}
+
+export class Resolver {
+  private readonly semaphore;
+
+  constructor(
+    private readonly adapters: readonly SourceAdapter[],
+    private readonly config: ResolverConfig
+  ) {
+    this.semaphore = new Semaphore(config.concurrency);
+  }
+
+  async resolve(media: MediaRef): Promise<ResolutionResult> {
+    const started = performance.now();
+
+    const controller = new AbortController();
+
+    const totalTimer = setTimeout(
+      () => controller.abort(new Error("resolution_timeout")),
+      this.config.totalTimeoutMs
+    );
+
+    try {
+      const applicable = this.adapters.filter(adapter =>
+        adapter.supports(media)
+      );
+
+      const executions = await Promise.all(
+        applicable.map(adapter =>
+          this.execute(adapter, media, controller.signal)
+        )
+      );
+
+      const failures: Failure[] = [];
+
+      const candidates: SourceCandidate[] = [];
+
+      for (const execution of executions) {
+        if (execution.status !== "success") {
+          failures.push({
+            code: this.failureCode(execution.status),
+            sourceId: execution.adapterId,
+            message: execution.error
+          });
+
+          continue;
+        }
+
+        for (const candidate of execution.candidates) {
+          if (!validateCandidate(candidate)) {
+            failures.push({
+              code: "candidate_invalid",
+              sourceId: execution.adapterId
+            });
+
+            continue;
+          }
+
+          const decision = evaluatePolicy(candidate);
+
+          if (!decision.allowed) {
+            failures.push({
+              code: "candidate_not_authorized",
+              sourceId: candidate.sourceId,
+              message: decision.reasons.join(",")
+            });
+
+            continue;
+          }
+
+          candidates.push(candidate);
+        }
+      }
+
+      const unique = dedupeCandidates(candidates);
+
+      const ranked = rankCandidates(unique);
+
+      return {
+        media,
+        status: this.status(applicable.length, executions.length, ranked.length),
+        candidates: ranked,
+        failures,
+        sourceCount: applicable.length,
+        durationMs: performance.now() - started
+      };
+    } finally {
+      clearTimeout(totalTimer);
+    }
+  }
+
+  private async execute(
+    adapter: SourceAdapter,
+    media: MediaRef,
+    parentSignal: AbortSignal
+  ): Promise<AdapterExecution> {
+    const started = performance.now();
+
+    const release = await this.semaphore.acquire();
+
+    try {
+      const candidates = await withTimeout(
+        signal =>
+          adapter.resolve(media, {
+            signal,
+            timeoutMs: this.config.sourceTimeoutMs,
+            preferredLanguages: this.config.preferredLanguages
+          }),
+        this.config.sourceTimeoutMs,
+        parentSignal
+      );
+
+      return {
+        adapterId: adapter.id,
+
+        status: candidates.length > 0 ? "success" : "empty",
+
+        durationMs: performance.now() - started,
+
+        candidates
+      };
+    } catch (error) {
+      return {
+        adapterId: adapter.id,
+        status: this.classify(error),
+        durationMs: performance.now() - started,
+        candidates: [],
+        error: error instanceof Error ? error.message : String(error)
+      };
+    } finally {
+      release();
+    }
+  }
+
+  private classify(error: unknown): AdapterStatus {
+    if (error instanceof Error && error.message === "timeout") {
+      return "timeout";
+    }
+
+    if (error instanceof DOMException && error.name === "AbortError") {
+      return "aborted";
+    }
+
+    return "error";
+  }
+
+  private failureCode(status: AdapterStatus): Failure["code"] {
+    switch (status) {
+      case "timeout":
+        return "source_timeout";
+      case "aborted":
+        return "source_aborted";
+      case "rate_limited":
+        return "source_rate_limited";
+      case "circuit_open":
+        return "source_circuit_open";
+      case "invalid_response":
+        return "source_invalid_response";
+      case "network_error":
+        return "source_network_error";
+      default:
+        return "internal_error";
+    }
+  }
+
+  private status(
+    sourceCount: number,
+    executionCount: number,
+    candidateCount: number
+  ): ResolutionResult["status"] {
+    if (candidateCount > 0) {
+      return executionCount < sourceCount ? "partial" : "success";
+    }
+
+    return executionCount === sourceCount ? "empty" : "failed";
+  }
+}
+```
+
+There is one deliberate next refinement here: integrate the breaker and
+limiter directly into `execute()` rather than leaving them as
+conceptual infrastructure.
+
+## 244. Fixture adapter
+
+We need one adapter that doesn't depend on an external service.
+
+```ts
+import type { SourceAdapter, ResolveContext } from "../interface.js";
+
+import type { MediaRef } from "../../domain/media.js";
+
+import type { SourceCandidate } from "../../domain/candidate.js";
+
+export class FixtureAdapter implements SourceAdapter {
+  readonly id = "fixture-authorized";
+
+  readonly name = "Authorized Fixture Source";
+
+  constructor(private readonly candidates: readonly SourceCandidate[]) {}
+
+  supports(media: MediaRef): boolean {
+    return this.candidates.some(
+      candidate =>
+        candidate.media.type === media.type &&
+        candidate.media.id === media.id &&
+        candidate.media.season === media.season &&
+        candidate.media.episode === media.episode
+    );
+  }
+
+  async resolve(
+    media: MediaRef,
+    _ctx: ResolveContext
+  ): Promise<readonly SourceCandidate[]> {
+    return this.candidates.filter(
+      candidate =>
+        candidate.media.type === media.type &&
+        candidate.media.id === media.id &&
+        candidate.media.season === media.season &&
+        candidate.media.episode === media.episode
+    );
+  }
+}
+```
+
+This adapter is deliberately boring.
+
+That's a feature.
+
+## 245. Fixture candidate
+
+```ts
+export const fixtureCandidate = {
+  sourceId: "fixture-authorized",
+
+  media: {
+    type: "movie",
+    id: "tt1234567"
+  },
+
+  location: {
+    url: "https://media.example.test/movie.mp4"
+  },
+
+  mediaInfo: {
+    container: "mp4",
+    videoCodec: "h264",
+    audioCodec: "aac",
+    width: 1920,
+    height: 1080
+  },
+
+  language: {
+    audio: ["en"]
+  },
+
+  provenance: {
+    adapter: "fixture-authorized",
+    sourceRecordId: "fixture-001",
+    observedAt: "2026-01-01T00:00:00.000Z"
+  },
+
+  capabilities: {
+    directPlayback: true,
+    seekable: true
+  },
+
+  authorization: {
+    status: "authorized",
+    basis: "test_fixture"
+  }
+} satisfies SourceCandidate;
+```
+
+The URL is illustrative and is **not expected to be playable**. It
+exists to test protocol semantics.
+
+## 246. Stremio mapping
+
+```ts
+export interface StremioStream {
+  readonly name?: string;
+  readonly title?: string;
+  readonly url: string;
+}
+
+export function toStremioStream(candidate: SourceCandidate): StremioStream {
+  const quality =
+    candidate.mediaInfo.width && candidate.mediaInfo.height
+      ? `${candidate.mediaInfo.width}x${candidate.mediaInfo.height}`
+      : undefined;
+
+  return {
+    name: candidate.sourceId,
+
+    title: [quality, candidate.mediaInfo.videoCodec, candidate.mediaInfo.audioCodec]
+      .filter(value => value !== undefined)
+      .join(" • "),
+
+    url: candidate.location.url
+  };
+}
+```
+
+The mapper remains pure.
+
+## 247. Protocol parser
+
+```ts
+import type { MediaType, MediaRef } from "../domain/media.js";
+
+export function parseMediaRef(type: string, id: string): MediaRef {
+  if (type !== "movie" && type !== "series") {
+    throw new Error("unsupported_media_type");
+  }
+
+  if (!id) {
+    throw new Error("missing_media_id");
+  }
+
+  if (type === "movie") {
+    return {
+      type: "movie",
+      id
+    };
+  }
+
+  const parts = id.split(":");
+
+  if (parts.length !== 3) {
+    throw new Error("invalid_series_id");
+  }
+
+  const [seriesId, seasonRaw, episodeRaw] = parts;
+
+  const season = Number(seasonRaw);
+
+  const episode = Number(episodeRaw);
+
+  if (
+    !Number.isInteger(season) ||
+    season < 1 ||
+    !Number.isInteger(episode) ||
+    episode < 1
+  ) {
+    throw new Error("invalid_episode_coordinates");
+  }
+
+  return {
+    type: "series",
+    id: seriesId,
+    season,
+    episode
+  };
+}
+```
+
+## 248. Manifest
+
+Keep it isolated:
+
+```ts
+export const manifest = {
+  id: "com.example.authorized-aggregator",
+
+  version: "0.1.0",
+
+  name: "Authorized Source Aggregator",
+
+  description: "Aggregates eligible playback sources.",
+
+  resources: ["stream"],
+
+  types: ["movie", "series"],
+
+  idPrefixes: ["tt"]
+} as const;
+```
+
+The actual SDK's accepted manifest shape must be checked by the
+compiler against the installed package before release.
+
+## 249. Addon assembly
+
+The application composition root should be explicit.
+
+Conceptually:
+
+```ts
+const registry = new SourceRegistry();
+
+registry.register(new FixtureAdapter([fixtureCandidate]));
+
+const resolver = new Resolver(registry.all(), {
+  totalTimeoutMs: 4000,
+  sourceTimeoutMs: 2500,
+  concurrency: 6,
+  preferredLanguages: ["en"]
+});
+```
+
+Then the Stremio layer gets only:
+
+```text
+manifest + resolver
+```
+
+## 250. This gives us the first real vertical slice
+
+```text
+                ┌─────────────┐
+                 │   Stremio   │
+                 └──────┬──────┘
+                        │
+                        ▼
+                  HTTP handler
+                        │
+                        ▼
+                   parseMediaRef
+                        │
+                        ▼
+                     Resolver
+                        │
+                        ▼
+                 Fixture Adapter
+                        │
+                        ▼
+                  SourceCandidate
+                        │
+                        ▼
+                     Policy
+                        │
+                        ▼
+                     Dedup
+                        │
+                        ▼
+                     Ranking
+                        │
+                        ▼
+                 StremioStream
+```
+
+That is the first **vertical slice**.
+
+## 251. Test the vertical slice before adding anything else
+
+### Parser tests
+
+```ts
+it("parses a movie", () => {
+  expect(parseMediaRef("movie", "tt1234567")).toEqual({
+    type: "movie",
+    id: "tt1234567"
+  });
+});
+```
+
+Series:
+
+```ts
+it("parses an episode", () => {
+  expect(parseMediaRef("series", "tt1234567:2:7")).toEqual({
+    type: "series",
+    id: "tt1234567",
+    season: 2,
+    episode: 7
+  });
+});
+```
+
+Invalid:
+
+```ts
+it("rejects malformed episode IDs", () => {
+  expect(() => parseMediaRef("series", "tt1234567:abc:7")).toThrow(
+    "invalid_episode_coordinates"
+  );
+});
+```
+
+## 252. Policy invariant
+
+```ts
+it("rejects unknown authorization", async () => {
+  const candidate = structuredClone(fixtureCandidate);
+
+  candidate.authorization = {
+    status: "unknown"
+  };
+
+  const adapter = new FixtureAdapter([candidate]);
+
+  const resolver = new Resolver([adapter], config);
+
+  const result = await resolver.resolve(candidate.media);
+
+  expect(result.candidates).toHaveLength(0);
+
+  expect(
+    result.failures.some(failure => failure.code === "candidate_not_authorized")
+  ).toBe(true);
+});
+```
+
+This is one of the most important tests in the entire repository.
+
+## 253. Ranking invariant
+
+```ts
+it("ranks higher resolution first", () => {
+  const ranked = rankCandidates([
+    makeCandidate({
+      sourceId: "low",
+      width: 1280,
+      height: 720
+    }),
+
+    makeCandidate({
+      sourceId: "high",
+      width: 1920,
+      height: 1080
+    })
+  ]);
+
+  expect(ranked.map(x => x.sourceId)).toEqual(["high", "low"]);
+});
+```
+
+## 254. Determinism test
+
+Run the same input many times:
+
+```ts
+it("produces deterministic ranking", () => {
+  const candidates = [
+    makeCandidate({ sourceId: "z" }),
+
+    makeCandidate({ sourceId: "a" }),
+
+    makeCandidate({ sourceId: "m" })
+  ];
+
+  const first = rankCandidates(candidates);
+
+  for (let i = 0; i < 100; i++) {
+    expect(rankCandidates(candidates)).toEqual(first);
+  }
+});
+```
+
+The stronger future version should randomize input order as well.
+
+## 255. Timeout test
+
+```ts
+it("aborts a slow adapter", async () => {
+  const adapter: SourceAdapter = {
+    id: "slow",
+    name: "Slow",
+    supports: () => true,
+    resolve: async (_media, ctx) => {
+      await new Promise<void>((_, reject) => {
+        const timer = setTimeout(() => {}, 10_000);
+
+        ctx.signal.addEventListener(
+          "abort",
+          () => {
+            clearTimeout(timer);
+
+            reject(new Error("aborted"));
+          },
+          { once: true }
+        );
+      });
+
+      return [];
+    }
+  };
+
+  // Resolver test...
+});
+```
+
+The exact test implementation should avoid hanging the test runner,
+but the invariant is:
+
+```text
+timeout
+   →
+AbortSignal
+   →
+underlying operation stops
+```
+
+## 256. Concurrency test
+
+Create 20 fake adapters.
+
+Each increments:
+
+```ts
+active++;
+maxActive = Math.max(maxActive, active);
+```
+
+and sleeps briefly.
+
+Configure:
+
+```text
+capacity = 4
+```
+
+Then assert:
+
+```ts
+expect(maxActive).toBeLessThanOrEqual(4);
+```
+
+This converts a runtime design assumption into executable evidence.
+
+## 257. Integration test
+
+The final test should be:
+
+```text
+npm run check
+       │
+       ├── typecheck
+       ├── unit tests
+       └── build
+```
+
+Then:
+
+```text
+start built server
+       │
+       ├── GET /manifest.json
+       │
+       └── GET /stream/movie/...
+```
+
+This is the first point where:
+
+```text
+"the code compiles"
+```
+
+and:
+
+```text
+"the addon actually speaks its protocol"
+```
+
+are independently demonstrated.
+
+## 258. CI becomes execution authority
+
+Given the evidence rule:
+
+**NO EVIDENCE → NO VERIFIED CLAIM**
+
+the repository should eventually have:
+
+```text
+CI
+│
+├── npm ci
+├── npm run typecheck
+├── npm test
+├── npm run build
+├── container build
+└── integration smoke test
+```
+
+Only CI results should create:
+
+```text
+VERIFIED
+```
+
+status.
+
+A local assistant-generated source tree is merely:
+
+```text
+PROVISIONAL
+```
+
+until execution evidence exists.
+
+## 259. First CI workflow
+
+```yaml
+name: conformance
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+```
+
+The exact action versions should also be frozen through the repository
+lock/configuration process.
+
+## 260. Container
+
+Keep it minimal.
+
+```dockerfile
+FROM node:22-alpine AS build
+
+WORKDIR /app
+
+COPY package*.json ./
+
+RUN npm ci
+
+COPY tsconfig.json ./
+COPY src ./src
+
+RUN npm run build
+
+
+FROM node:22-alpine
+
+WORKDIR /app
+
+ENV NODE_ENV=production
+
+COPY package*.json ./
+
+RUN npm ci --omit=dev
+
+COPY --from=build /app/dist ./dist
+
+EXPOSE 7000
+
+USER node
+
+CMD ["node", "dist/index.js"]
+```
+
+The `USER node` requirement is important.
+
+There is no reason for the addon process to run as root.
+
+## 261. Container health
+
+Add:
+
+```dockerfile
+HEALTHCHECK \
+  --interval=30s \
+  --timeout=3s \
+  --retries=3 \
+  CMD wget \
+    -q \
+    -O /dev/null \
+    http://127.0.0.1:7001/health/live \
+    || exit 1
+```
+
+This assumes the health server uses a separate port.
+
+That separation is useful:
+
+```text
+7000 → addon protocol
+7001 → operational health
+```
+
+## 262. Compose
+
+```yaml
+services:
+  addon:
+    build: .
+    ports:
+      - "7000:7000"
+      - "7001:7001"
+    environment:
+      PORT: "7000"
+      HEALTH_PORT: "7001"
+```
+
+Do not expose internal provider credentials through Compose files
+committed to the repository.
+
+Use environment injection/secrets at deployment time.
+
+## 263. Runtime health
+
+Minimal native Node server:
+
+```ts
+import { createServer } from "node:http";
+
+export function startHealthServer(port: number) {
+  const server = createServer((req, res) => {
+    if (req.url === "/health/live") {
+      res.writeHead(200, {
+        "content-type": "application/json"
+      });
+
+      res.end(JSON.stringify({ status: "ok" }));
+
+      return;
+    }
+
+    if (req.url === "/health/ready") {
+      res.writeHead(200, {
+        "content-type": "application/json"
+      });
+
+      res.end(JSON.stringify({ status: "ready" }));
+
+      return;
+    }
+
+    res.writeHead(404);
+    res.end();
+  });
+
+  server.listen(port);
+
+  return server;
+}
+```
+
+## 264. Don't make readiness depend on all providers
+
+This would be a mistake:
+
+```text
+provider B down
+     ↓
+addon NOT READY
+```
+
+if provider B is optional.
+
+Instead:
+
+```text
+required runtime dependency down
+       ↓
+NOT READY
+
+optional source unavailable
+       ↓
+DEGRADED
+```
+
+That distinction matters enormously once you have multiple sources.
+
+## 265. First operational dashboard
+
+Even without Prometheus, expose internal counters:
+
+```text
+requests
+successful resolutions
+empty resolutions
+partial resolutions
+failed resolutions
+
+adapter calls
+timeouts
+network errors
+circuit opens
+
+cache hits
+cache misses
+stale hits
+
+candidates observed
+candidates rejected
+candidates emitted
+```
+
+Later this can become Prometheus/OpenTelemetry.
+
+Don't introduce that complexity before the semantics are stable.
+
+## 266. The first genuine release gate
+
+The project should now have:
+
+```text
+G0  Domain contracts                 ✓
+G1  Adapter contracts                ✓
+G2  Resolver                         ✓
+G3  Candidate validation             ✓
+G4  Authorization policy             ✓
+G5  Deduplication                    ✓
+G6  Deterministic ranking            ✓
+
+G7  Abort propagation                ✓
+G8  Timeout                          ✓
+G9  Concurrency limit                ✓
+G10 Rate limiting                    PARTIAL
+G11 Circuit breaker                  PARTIAL
+G12 Cache abstraction                ✓
+G13 In-flight dedup                  ✓
+G14 Safe HTTP boundary               PARTIAL
+G15 Health endpoints                 ✓
+
+G16 Stremio manifest                 ✓
+G17 Movie request parsing            ✓
+G18 Series request parsing           ✓
+G19 Stream mapping                   ✓
+G20 Protocol integration test        TODO
+
+G21 Metadata                         TODO
+G22 Catalog                          TODO
+G23 Subtitles                        TODO
+
+G24 Docker build                     TODO
+G25 CI execution                     TODO
+G26 Release evidence                 TODO
+```
+
+Notice the deliberate wording:
+
+**implemented in blueprint/code ≠ verified by execution.**
+
+## 267. The first frozen baseline
+
+The first tag should eventually be something like:
+
+```text
+v0.1.0-conformance
+```
+
+But **do not create that tag merely because the code has been
+written**.
+
+The admission condition should be:
+
+```text
+npm ci
+   ↓
+typecheck PASS
+   ↓
+unit tests PASS
+   ↓
+integration tests PASS
+   ↓
+build PASS
+   ↓
+container build PASS
+   ↓
+container smoke test PASS
+   ↓
+CI PASS
+   ↓
+artifact digest recorded
+   ↓
+tag
+```
+
+That is much closer to the:
+
+```text
+freeze → formalize → implement → test → release gate → tag
+```
+
+workflow.
+
+## 268. The architecture has reached an important point
+
+We can now distinguish four separate truths:
+
+```text
+1. CODE TRUTH
+   What the source tree says.
+
+2. EXECUTION TRUTH
+   What the test/build actually demonstrated.
+
+3. SOURCE TRUTH
+   What an external provider actually returned.
+
+4. AUTHORIZATION TRUTH
+   What the deployment is actually permitted to use.
+```
+
+None should be silently substituted for another.
+
+For example:
+
+```text
+"adapter returns URL"
+```
+
+doesn't prove:
+
+```text
+"URL is authorized."
+```
+
+and:
+
+```text
+"tests pass"
+```
+
+doesn't prove:
+
+```text
+"the external source is currently available."
+```
+
+And:
+
+```text
+"HTTP 200"
+```
+
+doesn't prove:
+
+```text
+"the media plays."
+```
+
+## 269. Next architectural layer
+
+After this executable baseline, the next expansion should be **not
+another generic abstraction**.
+
+It should be:
+
+```text
+                v0.1 kernel
+                     │
+           ┌─────────┼─────────┐
+           ▼         ▼         ▼
+       Metadata    Subtitle   Source
+        adapter    adapter    adapters
+           │         │         │
+           └─────────┴─────────┘
+                     │
+                     ▼
+              unified identity
+```
+
+with one particularly important feature:
+
+### source capability negotiation
+
+Instead of asking every adapter:
+
+```text
+"Can you resolve this?"
+```
+
+we eventually ask:
+
+```ts
+interface SourceCapabilities {
+  readonly mediaTypes: readonly MediaType[];
+
+  readonly supportsMovies: boolean;
+  readonly supportsSeries: boolean;
+  readonly supportsEpisodes: boolean;
+
+  readonly providesMetadata: boolean;
+  readonly providesStreams: boolean;
+  readonly providesSubtitles: boolean;
+
+  readonly requiresIdentity: readonly IdentityKind[];
+
+  readonly authorizationMode:
+    | "configured_owned"
+    | "public_domain"
+    | "licensed"
+    | "unknown";
+}
+```
+
+That gives the registry enough information to perform **admission and
+routing before execution**, rather than discovering incompatibilities
+only after a source has been called.
+
+That becomes the foundation for the next stage:
+
+```text
+Capability
+     ↓
+Admission
+     ↓
+Identity matching
+     ↓
+Source selection
+     ↓
+Execution
+     ↓
+Evidence
+     ↓
+Policy
+     ↓
+Rank
+     ↓
+Stremio
+```
+
+**Current status: PROVISIONAL until actually built and executed.**
