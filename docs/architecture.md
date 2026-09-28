@@ -15170,3 +15170,1439 @@ IMDb/TMDB/TVDB mappings, `NOT_FOUND` vs `NOT_RESOLVED` vs `AMBIGUOUS`,
 identity-provider adapters, cache semantics, and the routing algorithm
 that prevents an adapter from being queried when the identity evidence
 is insufficient.
+
+## 384. Identity Layer — From String IDs to Canonical Media
+
+The next boundary is identity.
+
+The fundamental rule is:
+
+**A provider identifier is evidence about an entity, not the entity
+itself.**
+
+So:
+
+```text
+"tt1234567"
+```
+
+must not become the internal canonical identity merely because
+Stremio supplied it.
+
+Instead:
+
+```text
+Stremio ID
+    ↓
+identity observation
+    ↓
+identity resolution
+    ↓
+CanonicalMedia
+    ↓
+source routing
+```
+
+This prevents provider-specific IDs from leaking through the whole
+system.
+
+## 385. Identity State Machine
+
+Identity resolution needs more states than success/failure.
+
+```text
+                  ┌───────────────┐
+                   │ NOT_REQUESTED │
+                   └───────┬───────┘
+                           │
+                           ▼
+                   ┌───────────────┐
+                   │    RESOLVING  │
+                   └───────┬───────┘
+                           │
+              ┌────────────┼─────────────┐
+              ▼            ▼             ▼
+          NOT_FOUND    RESOLVED      AMBIGUOUS
+              │            │             │
+              │            ▼             │
+              │       CANONICAL         │
+              │        MEDIA             │
+              │            │             │
+              └────────────┴─────────────┘
+```
+
+The distinction is essential:
+
+| State | Meaning |
+| --- | --- |
+| `NOT_FOUND` | Provider explicitly reports no matching identity |
+| `NOT_RESOLVED` | We cannot currently establish identity |
+| `AMBIGUOUS` | Multiple plausible identities remain |
+| `RESOLVED` | Sufficient evidence establishes one canonical entity |
+
+These must not collapse into:
+
+```text
+null
+```
+
+because `null` destroys semantics.
+
+## 386. Identity Domain Model
+
+Create:
+
+```text
+src/identity/
+├── types.ts
+├── resolver.ts
+├── registry.ts
+├── normalize.ts
+├── graph.ts
+├── confidence.ts
+└── cache.ts
+```
+
+The fundamental types:
+
+```ts
+export type IdentityKind = "imdb" | "tmdb" | "tvdb" | "internal";
+
+export interface ExternalIdentity {
+  readonly kind: IdentityKind;
+  readonly value: string;
+  readonly source: string;
+  readonly observedAt: string;
+}
+```
+
+Then:
+
+```ts
+export interface CanonicalMedia {
+  readonly canonicalId: string;
+
+  readonly media: MediaRef;
+
+  readonly identities: readonly ExternalIdentity[];
+
+  readonly resolvedAt: string;
+}
+```
+
+Example:
+
+```json
+{
+  "canonicalId": "media:01J...",
+  "media": {
+    "type": "movie",
+    "id": "tt1234567"
+  },
+  "identities": [
+    {
+      "kind": "imdb",
+      "value": "tt1234567",
+      "source": "cinemeta",
+      "observedAt": "2026-09-28T20:00:00Z"
+    },
+    {
+      "kind": "tmdb",
+      "value": "550",
+      "source": "tmdb",
+      "observedAt": "2026-09-28T20:00:01Z"
+    }
+  ],
+  "resolvedAt": "2026-09-28T20:00:01Z"
+}
+```
+
+The canonical ID is ours.
+
+The external identifiers remain provenance-bearing observations.
+
+## 387. Identity Is a Graph
+
+A better mental model is:
+
+```text
+                    ┌─────────────┐
+                     │ Canonical   │
+                     │   Media     │
+                     └──────┬──────┘
+                            │
+              ┌─────────────┼──────────────┐
+              │             │              │
+              ▼             ▼              ▼
+         IMDb ID        TMDB ID        TVDB ID
+        tt1234567         550           550
+              │             │              │
+              ▼             ▼              ▼
+           Source A      Source B       Source C
+```
+
+The edges have provenance.
+
+We should not merely store:
+
+```text
+IMDb = tt1234567
+TMDB = 550
+```
+
+but:
+
+```text
+IMDb → tt1234567
+    observed by → provider X
+    observed at → timestamp
+    evidence → receipt
+```
+
+This becomes valuable when providers disagree.
+
+## 388. Provider Disagreement
+
+Suppose:
+
+```text
+Provider A: tt1234567 → tmdb 550
+
+Provider B: tt1234567 → tmdb 999999
+```
+
+The system must not silently choose one.
+
+Instead:
+
+```text
+identity conflict
+      │
+      ▼
+CONFLICT / AMBIGUOUS
+```
+
+Then:
+
+```text
+source requiring TMDB
+        ↓
+cannot safely route
+```
+
+unless an explicit resolution rule establishes which relationship is
+authoritative.
+
+This follows the general principle:
+
+**Conflicting evidence must remain conflicting until resolved.**
+
+## 389. Identity Provider Contract
+
+```ts
+export interface IdentityAdapter {
+  readonly id: string;
+
+  readonly capabilities: {
+    readonly inputKinds: readonly IdentityKind[];
+    readonly outputKinds: readonly IdentityKind[];
+    readonly mediaTypes: readonly MediaType[];
+  };
+
+  resolve(
+    identity: ExternalIdentityRequest,
+    context: IdentityResolveContext
+  ): Promise<IdentityObservation>;
+}
+```
+
+Request:
+
+```ts
+export interface ExternalIdentityRequest {
+  readonly kind: IdentityKind;
+  readonly value: string;
+  readonly mediaType: MediaType;
+}
+```
+
+Context:
+
+```ts
+export interface IdentityResolveContext {
+  readonly signal: AbortSignal;
+  readonly timeoutMs: number;
+}
+```
+
+Observation:
+
+```ts
+export interface IdentityObservation {
+  readonly status: "resolved" | "not_found" | "ambiguous" | "not_resolved";
+
+  readonly identities: readonly ExternalIdentity[];
+
+  readonly source: string;
+
+  readonly observedAt: string;
+}
+```
+
+Again:
+
+```text
+identity adapter ≠ source adapter
+```
+
+An identity provider tells us **what something is**.
+
+A stream source tells us **whether it can provide an eligible
+playback candidate**.
+
+## 390. Identity vs Source
+
+This distinction should be explicit:
+
+```text
+                    REQUEST
+                        │
+                        ▼
+                   IDENTITY
+                        │
+              "What media is this?"
+                        │
+                        ▼
+                 CANONICAL MEDIA
+                        │
+                        ▼
+                    ROUTING
+                        │
+              "Who can handle it?"
+                        │
+                        ▼
+                   SOURCES
+                        │
+              "What can play it?"
+                        │
+                        ▼
+                 CANDIDATES
+```
+
+Without this separation, adapters eventually start doing their own
+incompatible identity matching.
+
+That produces:
+
+```text
+Source A → title matching
+Source B → IMDb matching
+Source C → filename matching
+Source D → fuzzy matching
+```
+
+and the resolver no longer knows why two sources supposedly refer to
+the same thing.
+
+## 391. Identity Normalization
+
+External IDs need strict normalization.
+
+IMDb:
+
+```ts
+export function normalizeImdbId(value: string): string {
+  const normalized = value.trim().toLowerCase();
+
+  if (!/^tt\d+$/.test(normalized)) {
+    throw new Error("Invalid IMDb identifier");
+  }
+
+  return normalized;
+}
+```
+
+TMDB:
+
+```ts
+export function normalizeTmdbId(value: string): string {
+  const normalized = value.trim();
+
+  if (!/^\d+$/.test(normalized)) {
+    throw new Error("Invalid TMDB identifier");
+  }
+
+  return normalized;
+}
+```
+
+The normalized value becomes:
+
+```text
+identity key = kind + ":" + normalizedValue
+```
+
+Examples:
+
+```text
+imdb:tt1234567
+tmdb:550
+tvdb:12345
+```
+
+## 392. Identity Key
+
+```ts
+export function identityKey(identity: ExternalIdentity): string {
+  return `${identity.kind}:${identity.value}`;
+}
+```
+
+Never use:
+
+```text
+identity.value
+```
+
+alone.
+
+Otherwise:
+
+```text
+tmdb:550
+```
+
+and:
+
+```text
+tvdb:550
+```
+
+would collide.
+
+## 393. Canonical ID
+
+A canonical ID should not be derived from the first provider ID
+encountered.
+
+Bad:
+
+```text
+canonicalId = "imdb:tt1234567"
+```
+
+because the system then implicitly declares IMDb authoritative.
+
+Better:
+
+```text
+canonicalId = "media:<stable-id>"
+```
+
+For a first implementation, UUID/ULID-style identifiers are
+sufficient.
+
+For deterministic reconstruction from evidence, another possibility
+is:
+
+```text
+canonicalId = hash(
+  normalized identity evidence
+)
+```
+
+But this requires much stronger identity semantics.
+
+Therefore for v0.1:
+
+```text
+canonicalId = opaque internal identity
+```
+
+and canonicality is established by the resolver/evidence layer.
+
+## 394. Canonicality Is Not Truth
+
+This distinction is subtle.
+
+Suppose:
+
+```text
+canonicalId = media:abc123
+```
+
+That means:
+
+Our system currently treats these identity observations as belonging
+to one canonical entity.
+
+It does **not** mean:
+
+The system has discovered metaphysical truth about the media.
+
+So:
+
+```text
+canonicality ≠ truth
+```
+
+This is exactly the kind of semantic collapse the architecture is
+designed to prevent.
+
+## 395. Identity Resolution Algorithm
+
+Initial algorithm:
+
+```text
+INPUT
+  ExternalIdentity
+         │
+         ▼
+   normalize
+         │
+         ▼
+lookup local identity cache
+         │
+    ┌────┴────┐
+    │         │
+  FOUND     MISS
+    │         │
+    │         ▼
+    │    select capable
+    │    identity adapters
+    │         │
+    │         ▼
+    │      execute
+    │         │
+    │         ▼
+    │    collect observations
+    │         │
+    └────┬────┘
+         ▼
+     reconcile
+         │
+    ┌────┼─────────────┐
+    ▼    ▼             ▼
+FOUND AMBIGUOUS   NOT_RESOLVED
+    │
+    ▼
+CanonicalMedia
+```
+
+## 396. Reconciliation
+
+Suppose three observations arrive:
+
+```text
+A → TMDB 550
+B → TMDB 550
+C → TVDB 12345
+```
+
+Then:
+
+```text
+A ──┐
+    ├── tmdb:550
+B ──┘
+
+C → tvdb:12345
+```
+
+If evidence establishes that:
+
+```text
+tmdb:550 ↔ tvdb:12345
+```
+
+then:
+
+```text
+CanonicalMedia
+├── imdb:tt...
+├── tmdb:550
+└── tvdb:12345
+```
+
+But if:
+
+```text
+tmdb:550 ↔ tvdb:12345
+```
+
+cannot be established:
+
+```text
+AMBIGUOUS
+```
+
+rather than guessing.
+
+## 397. Identity Confidence
+
+Avoid a single arbitrary number such as:
+
+```text
+confidence = 0.87
+```
+
+unless the calibration methodology exists.
+
+Instead use evidence classes:
+
+```ts
+export type IdentityEvidence =
+  | {
+      type: "exact_provider_mapping";
+      source: string;
+    }
+  | {
+      type: "explicit_cross_reference";
+      source: string;
+    }
+  | {
+      type: "exact_external_id";
+      source: string;
+    }
+  | {
+      type: "title_year_match";
+      source: string;
+    }
+  | {
+      type: "fuzzy_match";
+      source: string;
+    };
+```
+
+Then policy can say:
+
+```text
+exact cross-reference
+    → routable
+
+title/year match
+    → not sufficient for high-risk source
+
+fuzzy match
+    → never silently canonical
+```
+
+This is more auditable than an unexplained confidence score.
+
+## 398. Identity Routing Policy
+
+Suppose an adapter declares:
+
+```text
+identityKinds: ["tmdb"]
+```
+
+and the request contains:
+
+```text
+IMDb: tt1234567
+```
+
+The router should ask:
+
+```text
+Do we possess a sufficiently authoritative IMDb → TMDB mapping?
+```
+
+If:
+
+```text
+YES
+```
+
+then:
+
+```text
+tt1234567
+   ↓
+tmdb:550
+   ↓
+adapter
+```
+
+If:
+
+```text
+NO
+```
+
+then:
+
+```text
+adapter not eligible
+```
+
+Not:
+
+```text
+adapter → guess title → search
+```
+
+This prevents identity guessing from silently becoming source
+authorization.
+
+## 399. Routing Matrix
+
+| Request identity | Adapter requires | Mapping | Route |
+| --- | --- | --- | --- |
+| IMDb | IMDb | exact | YES |
+| IMDb | TMDB | verified mapping | YES |
+| IMDb | TVDB | verified mapping | YES |
+| IMDb | TMDB | fuzzy title match | NO |
+| IMDb | TMDB | ambiguous mapping | NO |
+| IMDb | unknown | none | NO |
+| TMDB | TMDB | exact | YES |
+| TMDB | IMDb | verified mapping | YES |
+
+The critical property:
+
+```text
+insufficient identity evidence
+        ↓
+NO ROUTE
+```
+
+rather than:
+
+```text
+insufficient evidence
+        ↓
+best guess
+```
+
+## 400. Source Adapter Capability Expansion
+
+The previous adapter contract should therefore evolve from:
+
+```text
+supports(media)
+```
+
+toward:
+
+```ts
+supports(media: CanonicalMedia): boolean;
+```
+
+But we should not remove the lower-level media check.
+
+A useful contract is:
+
+```ts
+export interface SourceAdapter {
+  readonly id: string;
+  readonly name: string;
+  readonly capabilities: SourceCapabilities;
+
+  supportsMedia(media: MediaRef): boolean;
+
+  supportsIdentity(identities: readonly ExternalIdentity[]): boolean;
+
+  resolve(
+    media: CanonicalMedia,
+    context: ResolveContext
+  ): Promise<readonly SourceCandidate[]>;
+}
+```
+
+Now source execution is based on resolved identity.
+
+## 401. Capability Routing
+
+Routing becomes:
+
+```text
+                 CanonicalMedia
+                        │
+                        ▼
+               ┌─────────────────┐
+               │ Capability check│
+               └────────┬────────┘
+                        │
+           ┌────────────┼────────────┐
+           ▼            ▼            ▼
+        media type   identity      episode
+           │            │            │
+           └────────────┼────────────┘
+                        ▼
+                 eligible adapters
+```
+
+Then health/circuit state is evaluated:
+
+```text
+eligible
+   ↓
+healthy?
+   ↓
+circuit closed?
+   ↓
+execute
+```
+
+Authorization remains separate.
+
+## 402. Identity Cache
+
+Identity results can be cached, but the cache must preserve semantic
+state.
+
+Bad:
+
+```text
+Map<string, CanonicalMedia | null>
+```
+
+Better:
+
+```ts
+type IdentityCacheValue =
+  | {
+      status: "resolved";
+      media: CanonicalMedia;
+    }
+  | {
+      status: "not_found";
+    }
+  | {
+      status: "ambiguous";
+      observations: readonly IdentityObservation[];
+    }
+  | {
+      status: "not_resolved";
+    };
+```
+
+Then:
+
+```text
+cache miss ≠ not found
+```
+
+This is critical.
+
+## 403. Negative Cache
+
+Negative results may be cached, but with different TTLs.
+
+For example:
+
+```text
+RESOLVED
+  → longer TTL
+
+NOT_FOUND
+  → moderate TTL
+
+AMBIGUOUS
+  → shorter TTL
+
+NOT_RESOLVED
+  → very short TTL
+```
+
+Why?
+
+Because:
+
+```text
+NOT_FOUND
+```
+
+is an explicit provider observation.
+
+Whereas:
+
+```text
+NOT_RESOLVED
+```
+
+may simply mean:
+
+```text
+provider unavailable
+timeout
+rate limit
+temporary failure
+```
+
+Caching them identically could suppress future successful resolution.
+
+## 404. Identity Cache Semantics
+
+Therefore:
+
+```text
+id="cache-key"
+identity cache key
+    ↓
+result
+    + observedAt
+    + expiresAt
+    + source evidence
+```
+
+Example:
+
+```json
+{
+  "status": "not_resolved",
+  "observedAt": "2026-09-28T20:30:00Z",
+  "expiresAt": "2026-09-28T20:31:00Z",
+  "source": "tmdb"
+}
+```
+
+This says:
+
+We did not resolve this at that observation point.
+
+It does **not** say:
+
+This media does not exist.
+
+## 405. Identity Evidence Receipt
+
+Every identity resolution can produce:
+
+```ts
+export interface IdentityReceipt {
+  readonly receiptId: string;
+
+  readonly requestIdentity: ExternalIdentity;
+
+  readonly observations: readonly IdentityObservation[];
+
+  readonly outcome: "resolved" | "not_found" | "ambiguous" | "not_resolved";
+
+  readonly canonicalId?: string;
+
+  readonly observedAt: string;
+}
+```
+
+This is particularly valuable when debugging:
+
+```text
+"Why didn't source X run?"
+```
+
+We can answer:
+
+```text
+Source X requires TMDB identity.
+
+TMDB identity was not established.
+
+Therefore source X was not routed.
+```
+
+Rather than:
+
+```text
+"the source didn't work."
+```
+
+## 406. Routing Explanation
+
+The router should eventually produce an explainable decision:
+
+```ts
+export interface RoutingDecision {
+  readonly adapterId: string;
+
+  readonly decision:
+    | "eligible"
+    | "identity_missing"
+    | "identity_ambiguous"
+    | "media_unsupported"
+    | "circuit_open"
+    | "not_admitted";
+
+  readonly requiredIdentities: readonly IdentityKind[];
+
+  readonly availableIdentities: readonly IdentityKind[];
+
+  readonly evidenceIds: readonly string[];
+}
+```
+
+Example:
+
+```json
+{
+  "adapterId": "tmdb-authorized-source",
+  "decision": "identity_missing",
+  "requiredIdentities": ["tmdb"],
+  "availableIdentities": ["imdb"],
+  "evidenceIds": []
+}
+```
+
+This is vastly more useful than:
+
+```text
+adapter skipped
+```
+
+## 407. Identity Graph Storage
+
+For v0.1:
+
+```text
+in-memory
+```
+
+is sufficient.
+
+For later persistence:
+
+```text
+identity_edges
+────────────────────────────────────
+from_kind
+from_value
+to_kind
+to_value
+source
+observed_at
+evidence_id
+status
+```
+
+Example:
+
+```text
+imdb:tt1234567
+       │
+       │ observed by provider-x
+       ▼
+tmdb:550
+```
+
+A graph database is **not** required.
+
+A relational/document representation is sufficient initially.
+
+## 408. Avoid Premature Graph Infrastructure
+
+Do not introduce:
+
+```text
+Neo4j
+graph database
+distributed identity service
+```
+
+for v0.1.
+
+The semantic model is a graph.
+
+The implementation does not have to be.
+
+This is another important distinction:
+
+```text
+conceptual model ≠ required storage technology
+```
+
+A simple:
+
+```text
+Map<IdentityKey, IdentityRecord>
+```
+
+can implement the initial model.
+
+## 409. Identity Resolver
+
+The core resolver can look like:
+
+```ts
+export class IdentityResolver {
+  constructor(
+    private readonly registry: IdentityRegistry,
+    private readonly cache: IdentityCache
+  ) {}
+
+  async resolve(
+    input: ExternalIdentity,
+    context: IdentityResolveContext
+  ): Promise<IdentityResolution> {
+    const normalized = normalizeIdentity(input);
+
+    const cached = await this.cache.get(normalized);
+
+    if (cached) {
+      return cached;
+    }
+
+    const adapters = this.registry
+      .all()
+      .filter(adapter =>
+        adapter.capabilities.inputKinds.includes(normalized.kind)
+      );
+
+    const observations = await Promise.allSettled(
+      adapters.map(adapter =>
+        adapter.resolve(
+          {
+            kind: normalized.kind,
+            value: normalized.value,
+            mediaType: input.mediaType
+          },
+          context
+        )
+      )
+    );
+
+    const result = reconcileIdentityObservations(normalized, observations);
+
+    await this.cache.set(normalized, result);
+
+    return result;
+  }
+}
+```
+
+The important thing is what happens inside:
+
+```text
+reconcileIdentityObservations()
+```
+
+That function becomes a major correctness boundary.
+
+## 410. Reconciliation Must Be Pure
+
+Make reconciliation a pure function:
+
+```ts
+function reconcileIdentityObservations(
+  input: ExternalIdentity,
+  observations: readonly IdentityObservation[]
+): IdentityResolution {
+  // no HTTP
+  // no cache
+  // no logging
+  // no mutable global state
+}
+```
+
+This makes it:
+
+```text
+deterministic
+testable
+replayable
+auditable
+```
+
+Given identical evidence:
+
+```text
+same observations
+       ↓
+same resolution
+```
+
+That is exactly what we want from an evidence-driven system.
+
+## 411. Reconciliation Tests
+
+Test:
+
+```text
+one exact mapping
+    → resolved
+
+two agreeing mappings
+    → resolved
+
+conflicting mappings
+    → ambiguous
+
+all NOT_FOUND
+    → not_found
+
+all temporary failures
+    → not_resolved
+
+one NOT_FOUND + one temporary failure
+    → not_resolved
+```
+
+The last case is especially important.
+
+If one provider says:
+
+```text
+NOT_FOUND
+```
+
+while another provider simply timed out, we cannot safely conclude:
+
+```text
+NOT_FOUND
+```
+
+because the failed provider may have contained the answer.
+
+Therefore:
+
+```text
+explicit negative evidence + incomplete observation = not fully resolved
+```
+
+## 412. Identity Failure Matrix
+
+| Observation set | Resolution |
+| --- | --- |
+| exact mapping | `resolved` |
+| agreeing mappings | `resolved` |
+| conflicting mappings | `ambiguous` |
+| all explicit not-found | `not_found` |
+| timeout only | `not_resolved` |
+| rate limit only | `not_resolved` |
+| not-found + timeout | `not_resolved` |
+| ambiguous + timeout | `ambiguous` |
+
+This preserves information rather than flattening it.
+
+## 413. Identity Layer in the Complete Pipeline
+
+We can now refine the architecture:
+
+```text
+                         STREMIO
+                             │
+                             ▼
+                          PARSE
+                             │
+                             ▼
+                     ExternalIdentity
+                             │
+                             ▼
+                     IDENTITY RESOLVER
+                             │
+               ┌─────────────┼──────────────┐
+               ▼             ▼              ▼
+           cache          adapters       evidence
+               │             │
+               └──────┬──────┘
+                      ▼
+                  RECONCILE
+                      │
+           ┌──────────┼───────────┐
+           ▼          ▼           ▼
+       resolved    ambiguous   not-resolved
+           │
+           ▼
+     CanonicalMedia
+           │
+           ▼
+       SOURCE ROUTING
+           │
+           ▼
+        EXECUTION
+           │
+           ▼
+      CANDIDATES
+           │
+           ▼
+  VALIDATE → AUTHORIZE → DEDUPE → RANK
+           │
+           ▼
+         STREMIO
+```
+
+## 414. A Critical New Invariant
+
+We can now formally state:
+
+**A source adapter must never manufacture an identity solely to make
+itself executable.**
+
+Therefore prohibited behavior:
+
+```text
+request:
+  tt1234567
+
+adapter:
+  "I don't know the IMDb mapping,
+   but I'll search by title anyway."
+```
+
+unless that behavior is explicitly declared as an identity-resolution
+capability and governed by its own evidence policy.
+
+Otherwise source adapters become hidden identity resolvers.
+
+That would violate the architecture.
+
+## 415. Identity Authority
+
+There should also be an explicit distinction between:
+
+```text
+identity source
+```
+
+and:
+
+```text
+identity authority
+```
+
+An API returning:
+
+```text
+IMDb tt1234567 → TMDB 550
+```
+
+provides an observation.
+
+The application may decide:
+
+```text
+this observation is sufficient for routing
+```
+
+But that decision is application policy.
+
+Therefore:
+
+```text
+provider observation ≠ application authority
+```
+
+This mirrors the earlier rule:
+
+```text
+source health ≠ source authorization
+```
+
+and:
+
+```text
+canonicality ≠ truth
+```
+
+## 416. Identity Layer Release Gate
+
+Before identity becomes part of a release:
+
+```text
+GATE-ID-01
+```
+
+must require:
+
+```text
+[ ] identity normalization tested
+[ ] identity keys collision-safe
+[ ] provider contract defined
+[ ] NOT_FOUND preserved
+[ ] NOT_RESOLVED preserved
+[ ] AMBIGUOUS preserved
+[ ] reconciliation pure
+[ ] conflicting mappings tested
+[ ] negative-cache semantics tested
+[ ] identity evidence recorded
+[ ] routing refuses insufficient identity
+[ ] identity cache does not become authorization
+[ ] deterministic reconciliation verified
+```
+
+Only after this passes should a real TMDB/TVDB/etc. adapter be
+admitted.
+
+## 417. Resulting Source-Selection Algorithm
+
+The complete source selection algorithm is now:
+
+```text
+REQUEST
+  │
+  ▼
+Parse
+  │
+  ▼
+Normalize identity
+  │
+  ▼
+Resolve identity
+  │
+  ├── NOT_FOUND ──────────────► no identity route
+  │
+  ├── NOT_RESOLVED ───────────► retry/fallback policy
+  │
+  ├── AMBIGUOUS ──────────────► block dependent routes
+  │
+  └── RESOLVED
+          │
+          ▼
+    CanonicalMedia
+          │
+          ▼
+    capability filter
+          │
+          ▼
+    identity filter
+          │
+          ▼
+    admission filter
+          │
+          ▼
+    health filter
+          │
+          ▼
+    circuit filter
+          │
+          ▼
+    bounded execution
+```
+
+This is substantially stronger than:
+
+```text
+for each source:
+    search(title)
+```
+
+because every decision is explainable.
+
+## 418. Current Status
+
+| Component | Status |
+| --- | --- |
+| Stremio protocol boundary | **DEFINED** |
+| SDK integration model | **VERIFIED** |
+| Resolver | **DEFINED** |
+| Candidate model | **DEFINED** |
+| Authorization | **DEFINED** |
+| Runtime controls | **DEFINED** |
+| Conformance harness | **DEFINED** |
+| Identity model | **DEFINED** |
+| Identity state machine | **DEFINED** |
+| Identity reconciliation | **DEFINED** |
+| Identity cache semantics | **DEFINED** |
+| Routing explanation | **DEFINED** |
+| Actual test execution | **OPEN** |
+| Real identity provider | **OPEN** |
+| Real authorized source | **OPEN** |
+| Metadata | **NEXT** |
+| Subtitles | **NEXT** |
+| Catalog | **NEXT** |
+| Release artifact | **NOT ADMITTED** |
+
+The next major boundary is **source admission + a real authorized
+adapter**: how an adapter proves its capabilities, authorization
+basis, identity requirements, network permissions, rate-limit
+behavior, and provenance before it can enter the runtime registry.
