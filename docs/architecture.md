@@ -20233,3 +20233,1172 @@ the current system can resolve a canonical media identity but still
 lacks a principled way to obtain title, year, artwork, genres,
 episode names, runtime, and other metadata without turning metadata
 providers into accidental identity authorities.
+
+## 501. Metadata must become its own subsystem
+
+We now have:
+
+```text
+Stremio ID
+    ↓
+Identity
+    ↓
+CanonicalMedia
+    ↓
+Authorized sources
+    ↓
+Playable candidates
+```
+
+But Stremio eventually needs more than playback.
+
+It needs to know things such as:
+
+- title
+- year
+- poster
+- background
+- description
+- genres
+- runtime
+- cast
+- directors
+- season information
+- episode title
+- episode description
+
+The dangerous shortcut is:
+
+```text
+metadata provider
+      ↓
+"therefore this is the identity"
+```
+
+That would allow metadata to silently become identity authority.
+
+Instead:
+
+```text
+IDENTITY
+    │
+    ├───────────────┐
+    ▼               ▼
+CanonicalMedia    Metadata
+                    │
+                    ├── title
+                    ├── year
+                    ├── artwork
+                    ├── genres
+                    └── description
+```
+
+Metadata enriches an entity.
+
+It does not define the entity by itself.
+
+## 502. Metadata contract
+
+Introduce:
+
+```ts
+interface MetadataProvider {
+  readonly id: string;
+
+  readonly capabilities: MetadataCapabilities;
+
+  getMetadata(
+    media: CanonicalMedia,
+    context: MetadataContext
+  ): Promise<MetadataObservation>;
+}
+```
+
+Capabilities:
+
+```ts
+interface MetadataCapabilities {
+  readonly mediaTypes: readonly MediaType[];
+
+  readonly fields: readonly MetadataField[];
+
+  readonly identityKinds: readonly IdentityKind[];
+}
+```
+
+Fields:
+
+```ts
+type MetadataField =
+  | "title"
+  | "original_title"
+  | "year"
+  | "runtime"
+  | "genres"
+  | "overview"
+  | "poster"
+  | "background"
+  | "cast"
+  | "directors"
+  | "season"
+  | "episode"
+  | "episode_title"
+  | "episode_overview";
+```
+
+This allows providers to declare exactly what they can supply.
+
+## 503. Observation, not truth
+
+The provider result should be called an **observation**.
+
+```ts
+interface MetadataObservation {
+  readonly providerId: string;
+
+  readonly observedAt: string;
+
+  readonly status: "success" | "not_found" | "not_resolved" | "ambiguous";
+
+  readonly fields: readonly MetadataFieldObservation[];
+}
+```
+
+Each field retains provenance:
+
+```ts
+interface MetadataFieldObservation<T = unknown> {
+  readonly field: MetadataField;
+
+  readonly value: T;
+
+  readonly source: string;
+
+  readonly observedAt: string;
+
+  readonly evidenceId?: string;
+}
+```
+
+Therefore:
+
+```text
+title = "Example Movie"
+source = provider-A
+observedAt = ...
+```
+
+is an observation.
+
+It is not transformed into:
+
+```text
+TITLE_TRUTH = "Example Movie"
+```
+
+## 504. Why field-level provenance matters
+
+Suppose two providers report:
+
+```text
+Provider A: title = "The Example"
+
+Provider B: title = "Example: The Movie"
+```
+
+But both agree:
+
+```text
+year = 2024
+```
+
+We should not throw away the disagreement.
+
+Represent:
+
+```text
+title
+├── A → "The Example"
+└── B → "Example: The Movie"
+
+year
+├── A → 2024
+└── B → 2024
+```
+
+Now a later reconciliation policy can derive a display value.
+
+The observations remain intact.
+
+## 505. `MetadataRecord`
+
+The derived application view can be:
+
+```ts
+interface MetadataRecord {
+  readonly canonicalId: string;
+
+  readonly fields: Readonly<Partial<Record<MetadataField, MetadataValue>>>;
+
+  readonly generatedAt: string;
+}
+```
+
+And:
+
+```ts
+interface MetadataValue<T = unknown> {
+  readonly value: T;
+
+  readonly sources: readonly string[];
+
+  readonly evidenceIds: readonly string[];
+
+  readonly confidence: "high" | "medium" | "low";
+}
+```
+
+Important:
+
+`MetadataRecord` is a **derived view**.
+
+The observations remain the underlying facts.
+
+```text
+OBSERVATIONS
+     │
+     ▼
+RECONCILIATION
+     │
+     ▼
+MetadataRecord
+     │
+     ▼
+Stremio Meta DTO
+```
+
+## 506. Metadata reconciliation
+
+We need a pure function:
+
+```ts
+reconcileMetadata(observations: readonly MetadataObservation[]): MetadataRecord;
+```
+
+No:
+
+- HTTP
+- database
+- cache
+- logging
+- global state
+
+inside it.
+
+Given the same observations:
+
+```text
+reconcile(O) = reconcile(O)
+```
+
+This makes the result testable.
+
+## 507. Different fields need different reconciliation rules
+
+Do not use one universal rule.
+
+For example:
+
+### Year
+
+```text
+2024
+2024
+2024
+```
+
+strong agreement.
+
+### Title
+
+```text
+"The Example"
+"Example"
+"Example: The Movie"
+```
+
+requires a display policy.
+
+### Genres
+
+Should normally be treated as a set:
+
+```text
+Provider A: ["Drama", "Mystery"]
+
+Provider B: ["Mystery", "Thriller"]
+```
+
+Possible derived set:
+
+```text
+["Drama", "Mystery", "Thriller"]
+```
+
+But that is a **policy choice**, not a fact.
+
+### Runtime
+
+```text
+Provider A → 118 min
+Provider B → 120 min
+```
+
+Do not silently average:
+
+```text
+119 min
+```
+
+That would manufacture information.
+
+## 508. Preserve disagreements
+
+A useful structure is:
+
+```ts
+interface MetadataConflict {
+  readonly field: MetadataField;
+
+  readonly observations: readonly MetadataFieldObservation[];
+
+  readonly resolution: "selected" | "merged" | "unresolved";
+}
+```
+
+Then:
+
+```ts
+interface MetadataReconciliationResult {
+  readonly record: MetadataRecord;
+
+  readonly conflicts: readonly MetadataConflict[];
+}
+```
+
+This prevents:
+
+```text
+conflict
+   ↓
+silently overwrite
+```
+
+## 509. Metadata state machine
+
+Metadata should preserve the same epistemic distinction already used
+for identity.
+
+```text
+REQUEST
+   │
+   ▼
+PROVIDER QUERY
+   │
+   ├── SUCCESS
+   │
+   ├── NOT_FOUND
+   │
+   ├── NOT_RESOLVED
+   │
+   └── AMBIGUOUS
+```
+
+Then:
+
+```text
+multiple observations
+        │
+        ▼
+reconciliation
+        │
+        ├── agreed
+        ├── merged
+        └── conflict
+```
+
+No provider failure becomes:
+
+```text
+"there is no metadata"
+```
+
+For example:
+
+```text
+timeout ≠ not_found
+```
+
+## 510. Metadata provider ≠ identity provider
+
+This distinction deserves an explicit interface separation.
+
+```ts
+interface IdentityAdapter {
+  resolve(...): Promise<IdentityObservation>;
+}
+
+interface MetadataProvider {
+  getMetadata(...): Promise<MetadataObservation>;
+}
+```
+
+A provider may implement both internally, but the interfaces remain
+distinct.
+
+Why?
+
+Because:
+
+```text
+"Provider says title X"
+```
+
+doesn't automatically mean:
+
+```text
+"Provider proved this is entity X"
+```
+
+## 511. Identity-linked metadata
+
+Metadata requests should normally use already-resolved identity
+evidence.
+
+For example:
+
+```ts
+interface MetadataRequest {
+  readonly media: CanonicalMedia;
+
+  readonly preferredLanguages: readonly string[];
+}
+```
+
+A metadata provider may support:
+
+```text
+internal ID
+IMDb ID
+TMDB ID
+```
+
+Routing chooses the appropriate identity representation from the
+already established `CanonicalMedia`.
+
+It should not perform silent fuzzy matching as a side effect.
+
+## 512. Provider capability routing
+
+Suppose:
+
+```text
+Provider A requires TMDB
+Provider B requires IMDb
+Provider C requires internal ID
+```
+
+and the canonical entity contains:
+
+```text
+IMDb
+TMDB
+internal
+```
+
+Then all three may be eligible.
+
+But if it contains only:
+
+```text
+IMDb
+```
+
+then:
+
+```text
+A → identity_missing
+B → eligible
+C → identity_missing
+```
+
+This should produce a routing explanation exactly like source
+routing.
+
+## 513. Metadata routing decision
+
+```ts
+interface MetadataRoutingDecision {
+  readonly providerId: string;
+
+  readonly decision:
+    | "eligible"
+    | "identity_missing"
+    | "media_unsupported"
+    | "disabled"
+    | "rate_limited"
+    | "circuit_open";
+
+  readonly requiredIdentities: readonly IdentityKind[];
+
+  readonly availableIdentities: readonly IdentityKind[];
+}
+```
+
+Again:
+
+```text
+routing decision ≠ metadata result
+```
+
+A provider being eligible doesn't mean it successfully returned
+metadata.
+
+## 514. Metadata cache
+
+Metadata is a strong candidate for caching.
+
+But cache semantics must preserve state.
+
+```ts
+type MetadataCacheValue =
+  | {
+      readonly status: "resolved";
+      readonly record: MetadataRecord;
+    }
+  | {
+      readonly status: "not_found";
+    }
+  | {
+      readonly status: "not_resolved";
+    }
+  | {
+      readonly status: "ambiguous";
+      readonly conflicts: readonly MetadataConflict[];
+    };
+```
+
+Therefore:
+
+```text
+cache miss
+    ≠ not_found
+```
+
+and:
+
+```text
+expired
+    ≠ not_found
+```
+
+## 515. Cache TTL policy
+
+Different states should receive different TTLs.
+
+Example policy:
+
+```text
+resolved:
+    long
+
+not_found:
+    medium
+
+ambiguous:
+    short
+
+not_resolved:
+    very short
+```
+
+The exact durations belong in configuration.
+
+The semantic distinction is architectural.
+
+## 516. Artwork is special
+
+Artwork URLs require their own validation.
+
+A metadata provider may return:
+
+```text
+poster = "https://..."
+```
+
+That does not automatically make the URL safe to proxy.
+
+The addon should preferably return the URL directly when the client
+can retrieve it, subject to the source's authorization and network
+model.
+
+If the addon ever proxies artwork, it needs the same:
+
+```text
+SSRF
+redirect
+size
+content-type
+timeout
+```
+
+controls as any other remote resource.
+
+## 517. Do not download artwork unnecessarily
+
+For v0.1:
+
+```text
+provider
+   ↓
+poster URL
+   ↓
+Stremio meta response
+```
+
+is sufficient.
+
+Do not build:
+
+```text
+provider
+   ↓
+addon
+   ↓
+download image
+   ↓
+store image
+   ↓
+serve image
+```
+
+unless there is a specific reason.
+
+That would create another unnecessary proxy subsystem.
+
+## 518. Metadata API surface
+
+Once implemented, the Stremio surface can expand:
+
+```text
+GET /meta/movie/:id.json
+GET /meta/series/:id.json
+```
+
+But this should not happen merely because the handler exists.
+
+Manifest capability must be updated only after:
+
+```text
+metadata implementation
++ tests
++ HTTP integration
++ release gate
+```
+
+pass.
+
+This follows:
+
+**Capability declaration follows verified implementation.**
+
+## 519. Stremio metadata mapping
+
+Internally:
+
+```ts
+interface MetadataRecord {
+  readonly canonicalId: string;
+  readonly fields: ...;
+}
+```
+
+Externally:
+
+```ts
+interface StremioMeta {
+  readonly id: string;
+  readonly type: "movie" | "series";
+
+  readonly name?: string;
+  readonly poster?: string;
+  readonly background?: string;
+  readonly description?: string;
+  readonly releaseInfo?: string;
+  readonly genres?: readonly string[];
+  readonly runtime?: string;
+
+  readonly videos?: readonly StremioVideo[];
+}
+```
+
+The mapper is responsible for representation only:
+
+```text
+MetadataRecord
+      ↓
+StremioMeta
+```
+
+It must not perform identity resolution.
+
+## 520. Series metadata
+
+Series introduce another hierarchy:
+
+```text
+Series
+├── metadata
+│
+├── Season 1
+│    ├── Episode 1
+│    ├── Episode 2
+│    └── ...
+│
+└── Season 2
+     ├── Episode 1
+     └── ...
+```
+
+The domain should distinguish:
+
+```ts
+interface SeriesMetadata {
+  readonly media: CanonicalMedia;
+
+  readonly title?: MetadataValue<string>;
+
+  readonly seasons: readonly SeasonMetadata[];
+}
+```
+
+and:
+
+```ts
+interface EpisodeMetadata {
+  readonly season: number;
+  readonly episode: number;
+
+  readonly title?: MetadataValue<string>;
+  readonly overview?: MetadataValue<string>;
+  readonly runtime?: MetadataValue<number>;
+}
+```
+
+This avoids stuffing episode data into arbitrary key-value objects.
+
+## 521. Metadata and playback remain independent
+
+This is a major design invariant.
+
+A movie can have:
+
+```text
+metadata = available
+streams = empty
+```
+
+or:
+
+```text
+metadata = unavailable
+streams = available
+```
+
+or:
+
+```text
+metadata = partial
+streams = partial
+```
+
+Therefore:
+
+```text
+metadata failure
+    ≠ stream failure
+```
+
+The resolver should not block playback merely because optional
+metadata is unavailable.
+
+## 522. Parallelism
+
+Once identity is resolved:
+
+```text
+                 CanonicalMedia
+                       │
+           ┌───────────┼───────────┐
+           ▼           ▼           ▼
+       metadata     source A    source B
+       provider
+           │           │           │
+           └───────────┼───────────┘
+                       ▼
+                  aggregation
+```
+
+Metadata and stream resolution can run independently.
+
+But only if their resource budgets are separate.
+
+Do not allow a slow metadata provider to consume the entire
+source-resolution concurrency budget.
+
+## 523. Independent runtime pools
+
+Use:
+
+```text
+Runtime
+│
+├── identity pool
+├── metadata pool
+├── source pool
+└── auxiliary pool
+```
+
+Each may have:
+
+- concurrency limit
+- timeout
+- rate limiter
+- circuit breaker
+
+This prevents:
+
+```text
+metadata provider hangs
+       ↓
+all source requests blocked
+       ↓
+no playback
+```
+
+## 524. Unified request context
+
+At the top level:
+
+```ts
+interface ResolutionRequestContext {
+  readonly requestId: string;
+
+  readonly signal: AbortSignal;
+
+  readonly preferredLanguages: readonly string[];
+}
+```
+
+Then derive child contexts:
+
+```text
+RequestContext
+      │
+      ├── IdentityContext
+      ├── MetadataContext
+      └── SourceContext
+```
+
+Each subsystem receives only the capabilities it needs.
+
+## 525. Metadata observability
+
+Events:
+
+```ts
+interface MetadataEvent {
+  readonly requestId: string;
+  readonly providerId?: string;
+
+  readonly stage: "selected" | "started" | "completed" | "failed" | "rejected";
+
+  readonly outcome: "success" | "empty" | "partial" | "failure" | "ambiguous";
+
+  readonly durationMs?: number;
+
+  readonly fieldCount?: number;
+}
+```
+
+Metrics:
+
+```text
+metadata_requests_total
+metadata_success_total
+metadata_empty_total
+metadata_partial_total
+metadata_failed_total
+metadata_provider_failures_total
+metadata_provider_duration_ms
+metadata_conflicts_total
+```
+
+Again, these are derived observations.
+
+They are not the metadata authority.
+
+## 526. Metadata receipts
+
+A metadata resolution can produce:
+
+```ts
+interface MetadataReceipt {
+  readonly receiptId: string;
+  readonly requestId: string;
+
+  readonly canonicalId: string;
+
+  readonly providerObservations: readonly string[];
+
+  readonly outcome: "resolved" | "partial" | "empty" | "ambiguous" | "not_resolved";
+
+  readonly observedAt: string;
+}
+```
+
+This makes later debugging possible:
+
+```text
+Why did the UI show this title?
+
+→ Provider A observed it.
+→ Provider B disagreed.
+→ reconciliation selected A.
+```
+
+That is substantially better than:
+
+```text
+"the metadata service returned it."
+```
+
+## 527. Metadata release gate
+
+Introduce:
+
+```text
+GATE-METADATA-01
+```
+
+```text
+[ ] MetadataProvider contract defined
+[ ] MetadataObservation defined
+[ ] field-level provenance preserved
+[ ] provider capability declarations
+[ ] identity requirements explicit
+[ ] metadata does not become identity authority
+[ ] NOT_FOUND preserved
+[ ] NOT_RESOLVED preserved
+[ ] AMBIGUOUS preserved
+[ ] reconciliation is pure
+[ ] conflicts preserved
+[ ] cache states preserved
+[ ] cache miss != not_found
+[ ] artwork URL policy defined
+[ ] series/episode model defined
+[ ] metadata independent from playback
+[ ] provider runtime limits
+[ ] provider circuit breakers
+[ ] provider rate limits
+[ ] Stremio mapping isolated
+[ ] integration tests
+```
+
+Status:
+
+```text
+GATE-METADATA-01 = OPEN
+```
+
+## 528. The system now has three information graphs
+
+We can now distinguish three different graphs.
+
+### Identity graph
+
+```text
+IMDb
+│
+├── TMDB
+├── TVDB
+└── Internal canonical ID
+```
+
+Question:
+
+What entity do these identifiers refer to?
+
+### Metadata graph
+
+```text
+CanonicalMedia
+│
+├── title observations
+├── year observations
+├── artwork observations
+├── genre observations
+└── people observations
+```
+
+Question:
+
+What information has providers observed about this entity?
+
+### Source graph
+
+```text
+CanonicalMedia
+│
+├── authorized asset A
+├── authorized asset B
+└── authorized asset C
+```
+
+Question:
+
+Which authorized playback assets are available for this entity?
+
+They should not collapse into one giant object.
+
+## 529. The larger architecture
+
+```text
+                         STREMIO
+                             │
+               ┌─────────────┴─────────────┐
+               ▼                           ▼
+           /meta                        /stream
+               │                           │
+               ▼                           ▼
+         Metadata Service             Stream Resolver
+               │                           │
+               └────────────┬──────────────┘
+                            ▼
+                     CanonicalMedia
+                            │
+             ┌──────────────┼──────────────┐
+             ▼              ▼              ▼
+         Identity        Metadata        Sources
+         Evidence       Evidence        Evidence
+             │              │              │
+             ▼              ▼              ▼
+        Reconcile       Reconcile       Resolve
+             │              │              │
+             ▼              ▼              ▼
+        Identity View   Metadata View   Candidates
+```
+
+This gives us a clean semantic separation:
+
+```text
+IDENTITY
+    ↓
+entity reference
+
+METADATA
+    ↓
+observations about entity
+
+SOURCE
+    ↓
+authorized executable representations
+```
+
+## 530. Next boundary: subtitles
+
+The next major subsystem should be built on exactly the same
+architecture rather than becoming a special case:
+
+```text
+Subtitle Provider
+       │
+       ▼
+SubtitleObservation
+       │
+       ▼
+validate
+       │
+       ▼
+authorize
+       │
+       ▼
+dedupe
+       │
+       ▼
+rank
+       │
+       ▼
+Stremio Subtitle DTO
+```
+
+But subtitles introduce additional semantics:
+
+- language tags and normalization,
+- hearing-impaired variants,
+- forced subtitles,
+- subtitle format,
+- episode-specific matching,
+- external-file authorization,
+- encoding detection,
+- timing quality,
+- provider conflicts.
+
+That makes subtitles the next useful test of whether the architecture
+really generalizes beyond video streams.
+
+### Updated evidence state
+
+| Subsystem | Status |
+| --- | --- |
+| Stremio protocol | **DEFINED** |
+| SDK integration | **VERIFIED from documentation** |
+| Identity | **DEFINED** |
+| Source admission | **DEFINED** |
+| Source runtime | **DEFINED** |
+| Owned media source | **DEFINED** |
+| Metadata | **DEFINED** |
+| Metadata reconciliation | **DEFINED** |
+| Metadata caching | **DEFINED** |
+| Actual implementation | **OPEN** |
+| Tests executed | **OPEN** |
+| CI evidence | **OPEN** |
+| Production artifact | **NOT ADMITTED** |
+
+The architectural sequence is now:
+
+```text
+IDENTITY
+   ↓
+SOURCE ADMISSION
+   ↓
+SOURCE RUNTIME
+   ↓
+PLAYBACK
+   ↓
+METADATA
+   ↓
+SUBTITLES
+   ↓
+CATALOG
+   ↓
+SEARCH/DISCOVERY
+   ↓
+RELEASE ARTIFACT
+```
+
+The crucial principle remains unchanged throughout:
+
+**Persist observations and execution facts; derive representations
+from them; never let a convenient representation silently become
+authority.**
