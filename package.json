@@ -1,0 +1,23 @@
+{
+  "name": "streamforge-stremio",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A deterministic, policy-aware multi-source media aggregation engine for Stremio, with explicit authorization, source isolation, validation, deduplication, ranking, resilience, and evidence-preserving execution.",
+  "productName": "StreamForge — Authorized Stream Aggregation Engine for Stremio",
+  "keywords": [
+    "stremio",
+    "stremio-addon",
+    "media-aggregation",
+    "aggregation-engine",
+    "authorization",
+    "deterministic-ranking"
+  ],
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Abdus2023/streamforge-stremio.git"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
