@@ -1449,3 +1449,1132 @@ scraper": **a general media-source aggregation kernel with a Stremio
 protocol adapter on top**. Stremio's current protocol explicitly
 supports this model of aggregating streams from different sources, and
 its SDK provides the corresponding stream-handler abstraction.
+
+## 30. Turn the design into a real implementation
+
+The next step is to stop treating this as an addon collection and
+define a **conformance-oriented aggregation kernel**.
+
+The core invariant should be:
+
+```text
+                    External Sources
+                            │
+                            ▼
+                   ┌─────────────────┐
+                   │ Source Adapters │
+                   └────────┬────────┘
+                            │
+                            │ untrusted
+                            ▼
+                   ┌─────────────────┐
+                   │ Normalization   │
+                   └────────┬────────┘
+                            │
+                            ▼
+                   ┌─────────────────┐
+                   │ Validation      │
+                   └────────┬────────┘
+                            │
+                            ▼
+                   ┌─────────────────┐
+                   │ Policy          │
+                   └────────┬────────┘
+                            │
+                            ▼
+                   ┌─────────────────┐
+                   │ Deduplication   │
+                   └────────┬────────┘
+                            │
+                            ▼
+                   ┌─────────────────┐
+                   │ Ranking         │
+                   └────────┬────────┘
+                            │
+                            ▼
+                   ┌─────────────────┐
+                   │ Stremio Mapper  │
+                   └────────┬────────┘
+                            │
+                            ▼
+                        Stremio
+```
+
+The important property is that **Stremio must never receive raw
+adapter output**.
+
+## 31. Freeze the domain contract first
+
+Create:
+
+```text
+src/domain/
+├── media.ts
+├── source.ts
+├── candidate.ts
+├── policy.ts
+├── failure.ts
+└── result.ts
+```
+
+### `media.ts`
+
+```ts
+export type MediaType = "movie" | "series";
+
+export interface MediaRef {
+  type: MediaType;
+
+  /**
+   * Canonical external identifier.
+   * Normally IMDb in the first implementation.
+   */
+  id: string;
+
+  imdbId?: string;
+  tmdbId?: string;
+
+  season?: number;
+  episode?: number;
+}
+```
+
+Add an invariant:
+
+```ts
+export function isEpisode(media: MediaRef): boolean {
+  return (
+    media.type === "series" &&
+    Number.isInteger(media.season) &&
+    Number.isInteger(media.episode) &&
+    media.season! >= 1 &&
+    media.episode! >= 1
+  );
+}
+```
+
+Do not silently convert:
+
+```text
+tt1234567
+```
+
+into an episode.
+
+## 32. Candidate is not yet a stream
+
+This distinction is fundamental.
+
+```ts
+export interface SourceCandidate {
+  sourceId: string;
+
+  media: MediaRef;
+
+  location: {
+    url: string;
+  };
+
+  mediaInfo: {
+    container?: string;
+    videoCodec?: string;
+    audioCodec?: string;
+
+    width?: number;
+    height?: number;
+
+    bitrate?: number;
+    sizeBytes?: number;
+
+    durationSeconds?: number;
+  };
+
+  language: {
+    audio?: string[];
+    subtitle?: string[];
+  };
+
+  provenance: {
+    adapter: string;
+    sourceRecordId?: string;
+    observedAt: string;
+  };
+
+  capabilities: {
+    directPlayback: boolean;
+    seekable?: boolean;
+    live?: boolean;
+  };
+
+  authorization: {
+    status: "authorized" | "unknown" | "denied";
+    basis?: string;
+  };
+}
+```
+
+This allows you to preserve uncertainty.
+
+For example:
+
+```text
+authorization.status = unknown
+```
+
+must **not** become:
+
+```text
+authorized = true
+```
+
+## 33. Eligibility is a separate theorem
+
+Define:
+
+```ts
+export interface EligibilityResult {
+  eligible: boolean;
+
+  reasons: string[];
+}
+```
+
+Then:
+
+```ts
+export function evaluateEligibility(
+  candidate: SourceCandidate
+): EligibilityResult {
+  const reasons: string[] = [];
+
+  if (candidate.authorization.status !== "authorized") {
+    reasons.push("source_not_authorized");
+  }
+
+  if (!candidate.capabilities.directPlayback) {
+    reasons.push("direct_playback_unavailable");
+  }
+
+  if (!isHttpUrl(candidate.location.url)) {
+    reasons.push("unsupported_url");
+  }
+
+  return {
+    eligible: reasons.length === 0,
+    reasons
+  };
+}
+```
+
+This gives you:
+
+```text
+OBSERVED
+    ↓
+NORMALIZED
+    ↓
+VALID
+    ↓
+ELIGIBLE
+    ↓
+RANKABLE
+    ↓
+EMITTABLE
+```
+
+rather than one boolean called `ready`.
+
+## 34. URL validation
+
+Do not accept arbitrary protocols.
+
+```ts
+const ALLOWED_PROTOCOLS = new Set(["http:", "https:"]);
+
+export function isHttpUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+
+    return ALLOWED_PROTOCOLS.has(url.protocol);
+  } catch {
+    return false;
+  }
+}
+```
+
+For a user-owned local media adapter, you can explicitly support
+additional protocols later.
+
+Don't make the first implementation permissive and attempt to "secure
+it later."
+
+## 35. Adapter registry
+
+```ts
+export class SourceRegistry {
+  private readonly adapters = new Map<string, SourceAdapter>();
+
+  register(adapter: SourceAdapter): void {
+    if (this.adapters.has(adapter.id)) {
+      throw new Error(`duplicate_adapter:${adapter.id}`);
+    }
+
+    this.adapters.set(adapter.id, adapter);
+  }
+
+  all(): SourceAdapter[] {
+    return [...this.adapters.values()];
+  }
+
+  applicable(media: MediaRef): SourceAdapter[] {
+    return this.all().filter(adapter => adapter.supports(media));
+  }
+}
+```
+
+This gives you deterministic registration.
+
+Example:
+
+```ts
+const registry = new SourceRegistry();
+
+registry.register(new PublicDomainAdapter());
+
+registry.register(new UserLibraryAdapter());
+
+registry.register(new LicensedApiAdapter());
+```
+
+## 36. Adapter execution should produce evidence
+
+Instead of:
+
+```ts
+Promise<SourceCandidate[]>
+```
+
+I recommend:
+
+```ts
+export interface AdapterExecution {
+  adapterId: string;
+
+  startedAt: string;
+  completedAt: string;
+
+  durationMs: number;
+
+  candidates: SourceCandidate[];
+
+  status:
+    | "success"
+    | "empty"
+    | "timeout"
+    | "rate_limited"
+    | "invalid"
+    | "error";
+
+  failure?: SourceFailure;
+}
+```
+
+Why?
+
+Because:
+
+```text
+[]
+```
+
+can mean several radically different things:
+
+```text
+NO_RESULTS
+SOURCE_UNREACHABLE
+SOURCE_TIMED_OUT
+SOURCE_RETURNED_INVALID_DATA
+SOURCE_NOT_CONFIGURED
+SOURCE_HAS_NO_MATCH
+```
+
+Those are not equivalent.
+
+## 37. Resolver v2
+
+```ts
+export async function resolveMedia(
+  media: MediaRef,
+  registry: SourceRegistry,
+  ctx: ResolveContext
+): Promise<ResolutionResult> {
+  const adapters = registry.applicable(media);
+
+  const executions = await Promise.all(
+    adapters.map(adapter => executeAdapter(adapter, media, ctx))
+  );
+
+  const allCandidates = executions.flatMap(execution => execution.candidates);
+
+  const normalized = allCandidates.map(normalizeCandidate).filter(Boolean);
+
+  const validated = normalized.filter(candidate =>
+    validateCandidate(candidate!)
+  );
+
+  const eligible = validated.filter(
+    candidate => evaluateEligibility(candidate!).eligible
+  );
+
+  const unique = deduplicate(eligible);
+
+  const ranked = rank(unique);
+
+  return {
+    media,
+    executions,
+    candidates: ranked
+  };
+}
+```
+
+Now you can expose operational evidence separately from the Stremio
+response.
+
+## 38. Don't let ranking become business logic
+
+A dangerous design is:
+
+```text
+source score
+    ↓
+if score > X
+    ↓
+allow source
+```
+
+Instead:
+
+```text
+                 Candidate
+                     │
+              ┌──────┴──────┐
+              ▼             ▼
+         Eligibility      Metadata
+              │             │
+              ▼             ▼
+            FILTER       RANKING
+              │             │
+              └──────┬──────┘
+                     ▼
+                   OUTPUT
+```
+
+Eligibility answers:
+
+Can this candidate be emitted?
+
+Ranking answers:
+
+In what order should already-eligible candidates appear?
+
+This prevents ranking from becoming a hidden authorization mechanism.
+
+## 39. Deterministic ranking
+
+Define a tuple rather than a mysterious score.
+
+```ts
+interface RankingTuple {
+  directPlayback: number;
+  languageMatch: number;
+  resolution: number;
+  bitrate: number;
+  reliability: number;
+  sourceId: string;
+}
+```
+
+Then compare lexicographically:
+
+```ts
+function compare(a: RankingTuple, b: RankingTuple): number {
+  return (
+    b.directPlayback - a.directPlayback ||
+    b.languageMatch - a.languageMatch ||
+    b.resolution - a.resolution ||
+    b.bitrate - a.bitrate ||
+    b.reliability - a.reliability ||
+    a.sourceId.localeCompare(b.sourceId)
+  );
+}
+```
+
+The final `sourceId` tie-breaker is important.
+
+Otherwise two equivalent streams can randomly change order between
+executions.
+
+## 40. Resolution normalization
+
+Don't compare:
+
+```text
+"HD"
+"1080p"
+"Full HD"
+"1920x1080"
+```
+
+as strings.
+
+Normalize them:
+
+```ts
+export interface Resolution {
+  width: number;
+  height: number;
+}
+
+export function classifyResolution(resolution?: Resolution): string {
+  if (!resolution) {
+    return "unknown";
+  }
+
+  const pixels = resolution.width * resolution.height;
+
+  if (pixels >= 3840 * 2160) {
+    return "2160p";
+  }
+
+  if (pixels >= 1920 * 1080) {
+    return "1080p";
+  }
+
+  if (pixels >= 1280 * 720) {
+    return "720p";
+  }
+
+  if (pixels >= 854 * 480) {
+    return "480p";
+  }
+
+  return "sd";
+}
+```
+
+But preserve the raw observed dimensions as well.
+
+```text
+normalized meaning
+        +
+original evidence
+```
+
+is better than replacing the original data.
+
+## 41. Source-specific normalization
+
+Suppose Adapter A says:
+
+```json
+{
+  "quality": "1080p"
+}
+```
+
+Adapter B:
+
+```json
+{
+  "width": 1920,
+  "height": 1080
+}
+```
+
+Adapter C:
+
+```json
+{
+  "resolution": "Full HD"
+}
+```
+
+All become:
+
+```json
+{
+  "width": 1920,
+  "height": 1080
+}
+```
+
+But retain:
+
+```json
+{
+  "raw": {
+    "quality": "1080p"
+  }
+}
+```
+
+only inside adapter-local diagnostics if needed.
+
+The domain layer should not become a dumping ground for
+provider-specific fields.
+
+## 42. Source adapters become tiny
+
+This is one of the major architectural wins.
+
+An adapter should mostly do:
+
+```text
+provider request
+       ↓
+provider response
+       ↓
+provider parser
+       ↓
+SourceCandidate
+```
+
+It should **not** do:
+
+```text
+provider request → dedupe → ranking → cache → global policy →
+Stremio formatting → logging → retry policy
+```
+
+Those belong to the kernel.
+
+## 43. Example adapter skeleton
+
+```ts
+export class PublicDomainAdapter implements SourceAdapter {
+  readonly id = "public-domain";
+  readonly name = "Public Domain";
+
+  supports(media: MediaRef): boolean {
+    return media.type === "movie" || media.type === "series";
+  }
+
+  async resolve(
+    media: MediaRef,
+    ctx: ResolveContext
+  ): Promise<SourceCandidate[]> {
+    const response = await fetchSource(media, ctx);
+
+    return response.items.map(item => normalizeProviderItem(item, media));
+  }
+}
+```
+
+The adapter never constructs a Stremio `Stream`.
+
+## 44. Stremio should be an output adapter
+
+This is a useful abstraction:
+
+```text
+                   Aggregation Kernel
+                           │
+                           │
+              ┌────────────┼────────────┐
+              ▼            ▼            ▼
+           Stremio       JSON API       CLI
+           Adapter
+```
+
+The Stremio-specific code becomes tiny:
+
+```ts
+export function toStremio(candidates: SourceCandidate[]) {
+  return candidates.map(candidate => ({
+    name: buildName(candidate),
+
+    description: buildDescription(candidate),
+
+    url: candidate.location.url,
+
+    behaviorHints: buildHints(candidate)
+  }));
+}
+```
+
+This makes the underlying system reusable.
+
+## 45. Stremio response boundary
+
+Only here should the external protocol shape appear.
+
+```ts
+builder.defineStreamHandler(async args => {
+  const media = parseStremioMedia(args);
+
+  const result = await resolveMedia(media, registry, createContext());
+
+  return {
+    streams: result.candidates.map(toStremioStream)
+  };
+});
+```
+
+Everything below this layer remains Stremio-independent.
+
+## 46. Add a policy engine
+
+This is where deployment-specific behavior belongs.
+
+```ts
+export interface SourcePolicy {
+  allow(candidate: SourceCandidate): PolicyDecision;
+}
+```
+
+```ts
+export interface PolicyDecision {
+  allowed: boolean;
+  reasons: string[];
+}
+```
+
+Example:
+
+```ts
+class DefaultPolicy implements SourcePolicy {
+  allow(candidate: SourceCandidate): PolicyDecision {
+    const reasons: string[] = [];
+
+    if (candidate.authorization.status !== "authorized") {
+      reasons.push("authorization_not_verified");
+    }
+
+    if (!candidate.capabilities.directPlayback) {
+      reasons.push("not_direct_playback");
+    }
+
+    return {
+      allowed: reasons.length === 0,
+
+      reasons
+    };
+  }
+}
+```
+
+Now a self-hosted installation can have:
+
+```text
+StrictPolicy
+UserLibraryPolicy
+PublicDomainPolicy
+EnterprisePolicy
+```
+
+without changing the resolver.
+
+## 47. Configuration must not alter the domain contract
+
+For example:
+
+```text
+MAX_RESOLUTION=1080p
+```
+
+should mean:
+
+```text
+eligible candidates
+        ↓
+configuration filter
+        ↓
+ranking
+```
+
+not:
+
+```text
+adapter itself behaves differently
+```
+
+This makes configuration behavior testable.
+
+## 48. Multi-source aggregation becomes compositional
+
+Once the kernel works:
+
+```text
+                     ┌──────────────┐
+                      │ Resolver     │
+                      └──────┬───────┘
+                             │
+           ┌─────────────────┼─────────────────┐
+           │                 │                 │
+           ▼                 ▼                 ▼
+      Public Domain     User Library     Licensed API
+           │                 │                 │
+           └─────────────────┼─────────────────┘
+                             │
+                        Candidates
+                             │
+                     Normalize/Validate
+                             │
+                        Policy Filter
+                             │
+                          Dedup
+                             │
+                          Rank
+                             │
+                         Stremio
+```
+
+Adding a fourth source should require:
+
+```text
+new adapter + adapter tests + registration
+```
+
+and **zero modifications to the core resolver**.
+
+That is the extensibility test.
+
+## 49. Conformance tests
+
+Now we can make the architecture enforceable.
+
+### Adapter contract
+
+Every adapter must satisfy:
+
+```ts
+describe("SourceAdapter contract", () => {
+  it("has a stable identifier");
+
+  it("returns candidates matching requested media");
+
+  it("does not emit malformed URLs");
+
+  it("does not throw on empty results");
+
+  it("respects AbortSignal");
+
+  it("does not mutate the MediaRef");
+});
+```
+
+### Resolver contract
+
+```ts
+describe("resolver", () => {
+  it("isolates source failures");
+
+  it("deduplicates candidates");
+
+  it("never emits unauthorized candidates");
+
+  it("produces deterministic ordering");
+
+  it("preserves partial success");
+});
+```
+
+## 50. Golden test
+
+Create:
+
+```text
+test/fixtures/
+└── resolution-case-001.json
+```
+
+```json
+{
+  "media": {
+    "type": "movie",
+    "id": "tt0000000"
+  },
+
+  "sources": [
+    {
+      "source": "a",
+      "resolution": [1920, 1080],
+      "authorized": true
+    },
+    {
+      "source": "b",
+      "resolution": [1280, 720],
+      "authorized": true
+    },
+    {
+      "source": "c",
+      "resolution": [3840, 2160],
+      "authorized": false
+    }
+  ],
+
+  "expected": ["a", "b"]
+}
+```
+
+This gives you a regression oracle.
+
+The 4K source should not suddenly appear because somebody changed the
+ranking implementation.
+
+## 51. Failure matrix
+
+| Failure | Other sources | Result |
+| --- | --- | --- |
+| One timeout | Continue | Partial |
+| One HTTP 500 | Continue | Partial |
+| One malformed response | Continue | Partial |
+| One unauthorized candidate | Continue | Filter |
+| All sources empty | N/A | Empty |
+| All sources timeout | N/A | Failure |
+| Identity invalid | N/A | Reject |
+| Duplicate streams | Continue | Deduplicate |
+| Invalid URL | Continue | Reject |
+| Unsupported protocol | Continue | Reject |
+
+This matrix should become automated tests.
+
+## 52. Security test matrix
+
+```text
+SSRF
+  ├── localhost
+  ├── 127.0.0.1
+  ├── private IPv4
+  ├── IPv6 loopback
+  ├── IPv6 private ranges
+  ├── DNS rebinding
+  └── redirect-to-private-address
+
+URL parser
+  ├── malformed URL
+  ├── unsupported scheme
+  ├── credentials embedded in URL
+  └── oversized URL
+
+HTTP
+  ├── timeout
+  ├── redirect chain
+  ├── huge response
+  └── invalid content-type
+```
+
+Especially important if you eventually allow users to configure
+arbitrary source endpoints.
+
+## 53. Rate limiting
+
+A public addon should have two independent limits:
+
+```text
+                    Request
+                        │
+              ┌─────────┴─────────┐
+              ▼                   ▼
+       per-IP limiter       source limiter
+              │                   │
+              ▼                   ▼
+         addon abuse          provider abuse
+```
+
+Do not solve provider rate limits by simply making your entire addon
+slower.
+
+Use:
+
+```text
+concurrency limit + per-source rate limit + cache + circuit breaker
+```
+
+## 54. Concurrency control
+
+If you eventually have 30 adapters, this:
+
+```ts
+await Promise.all(adapters.map(...));
+```
+
+can become excessive.
+
+Use a bounded scheduler:
+
+```text
+30 adapters
+    │
+    ▼
+┌──────────────┐
+│ concurrency  │
+│     = 6      │
+└──────┬───────┘
+       │
+       ├── A
+       ├── B
+       ├── C
+       ├── D
+       ├── E
+       └── F
+```
+
+Then:
+
+```text
+A completes → G starts
+C completes → H starts
+```
+
+This matters particularly for low-resource deployments.
+
+## 55. Latency budget
+
+Define the budget before optimizing.
+
+For example:
+
+```text
+total = 4 seconds
+
+identity       500 ms
+source queries 3000 ms
+normalization   100 ms
+ranking          50 ms
+serialization    50 ms
+buffer          300 ms
+```
+
+The exact numbers should be measured rather than assumed.
+
+The important thing is that the budget exists.
+
+## 56. Fast path
+
+A mature implementation should eventually have:
+
+```text
+Request
+   │
+   ▼
+cache lookup
+   │
+   ├── fresh → return
+   │
+   └── miss
+        │
+        ▼
+     resolver
+```
+
+And potentially:
+
+```text
+stale cache
+    │
+    ├── return stale immediately
+    │
+    └── background refresh
+```
+
+But stale serving should be an explicit policy.
+
+## 57. Don't hide stale data
+
+Internally distinguish:
+
+```text
+FRESH
+STALE_REVALIDATING
+STALE
+UNKNOWN
+```
+
+A stale result is not equivalent to a freshly observed result.
+
+That matters for diagnostics.
+
+## 58. Architecture after hardening
+
+At this point the project becomes:
+
+```text
+┌───────────────────────────────────────────────────────┐
+│                    Presentation                        │
+│                                                         │
+│                Stremio Protocol Adapter                │
+└───────────────────────────┬───────────────────────────┘
+                             │
+┌───────────────────────────▼───────────────────────────┐
+│                  Aggregation Kernel                     │
+│                                                         │
+│ Identity → Resolve → Normalize → Validate → Policy     │
+│                         → Dedup → Rank → Cache          │
+└───────────────────────────┬───────────────────────────┘
+                             │
+┌───────────────────────────▼───────────────────────────┐
+│                    Adapter Layer                        │
+│                                                         │
+│ Public Domain │ User Library │ Licensed APIs │ ...      │
+└───────────────────────────┬───────────────────────────┘
+                             │
+┌───────────────────────────▼───────────────────────────┐
+│                     Evidence                            │
+│                                                         │
+│ request │ source result │ timing │ failure │ health    │
+└─────────────────────────────────────────────────────────┘
+```
+
+This is the point where it stops being "a Stremio addon" in the narrow
+sense.
+
+It becomes a **media-source aggregation engine with a Stremio frontend
+protocol**.
+
+## 59. The next implementation gate
+
+I would now freeze the following contract before writing the remaining
+adapters:
+
+```text
+MEDIA IDENTITY
+    ↓
+SOURCE ADAPTER
+    ↓
+SOURCE CANDIDATE
+    ↓
+ADAPTER EXECUTION
+    ↓
+NORMALIZATION
+    ↓
+VALIDATION
+    ↓
+ELIGIBILITY
+    ↓
+POLICY
+    ↓
+DEDUPLICATION
+    ↓
+RANKING
+    ↓
+STREMIO STREAM
+```
+
+And explicitly prohibit these shortcuts:
+
+```text
+Candidate → Stream                 NO
+Adapter → Stream                   NO
+Ranking → Authorization            NO
+Empty[] → "source unavailable"     NO
+Unknown → Authorized               NO
+Title string → Media identity      NO
+Provider-specific fields → Core    NO
+```
+
+That gives us a stable foundation for the next layer: **a complete
+runnable TypeScript repository, including `package.json`, `tsconfig`,
+source registry, resolver, Stremio HTTP server, test suite, Docker
+setup, health/metrics, and a first legitimate source adapter**.
