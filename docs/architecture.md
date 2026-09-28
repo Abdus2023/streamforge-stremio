@@ -2578,3 +2578,1036 @@ That gives us a stable foundation for the next layer: **a complete
 runnable TypeScript repository, including `package.json`, `tsconfig`,
 source registry, resolver, Stremio HTTP server, test suite, Docker
 setup, health/metrics, and a first legitimate source adapter**.
+
+## 60. Build the runnable repository
+
+Now we can turn the frozen architecture into an actual implementation.
+
+I would target:
+
+```text
+Node.js 22+
+TypeScript
+stremio-addon-sdk
+Vitest
+Fastify        ← operational endpoints only
+Zod            ← external-input validation
+Pino           ← structured logging
+```
+
+The important constraint remains:
+
+```text
+Stremio SDK
+    ↓
+thin protocol adapter
+
+Aggregation kernel
+    ↓
+independent of Stremio
+```
+
+## 61. Repository v1
+
+```text
+stremio-source-aggregator/
+│
+├── package.json
+├── package-lock.json
+├── tsconfig.json
+├── vitest.config.ts
+├── Dockerfile
+├── compose.yaml
+├── .dockerignore
+├── .gitignore
+│
+├── src/
+│   ├── index.ts
+│   │
+│   ├── addon/
+│   │   ├── manifest.ts
+│   │   ├── parser.ts
+│   │   ├── stream-handler.ts
+│   │   └── metadata-handler.ts
+│   │
+│   ├── domain/
+│   │   ├── media.ts
+│   │   ├── candidate.ts
+│   │   ├── failure.ts
+│   │   └── result.ts
+│   │
+│   ├── adapters/
+│   │   ├── interface.ts
+│   │   ├── registry.ts
+│   │   └── public-domain.ts
+│   │
+│   ├── resolver/
+│   │   ├── resolver.ts
+│   │   ├── execute.ts
+│   │   ├── normalize.ts
+│   │   ├── validate.ts
+│   │   ├── policy.ts
+│   │   ├── dedupe.ts
+│   │   └── rank.ts
+│   │
+│   ├── runtime/
+│   │   ├── context.ts
+│   │   ├── timeout.ts
+│   │   ├── breaker.ts
+│   │   └── limiter.ts
+│   │
+│   ├── observability/
+│   │   ├── logger.ts
+│   │   ├── metrics.ts
+│   │   └── health.ts
+│   │
+│   └── config/
+│       └── config.ts
+│
+└── test/
+    ├── media.test.ts
+    ├── validation.test.ts
+    ├── dedupe.test.ts
+    ├── ranking.test.ts
+    ├── resolver.test.ts
+    └── addon.test.ts
+```
+
+## 62. `package.json`
+
+```json
+{
+  "name": "stremio-source-aggregator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test && npm run build"
+  },
+  "dependencies": {
+    "stremio-addon-sdk": "^1.6.0",
+    "zod": "^4.0.0",
+    "pino": "^9.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/stremio-addon-sdk": "^1.6.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0",
+    "vitest": "^3.0.0"
+  }
+}
+```
+
+Pin exact versions when you freeze the release rather than relying
+indefinitely on ranges.
+
+## 63. TypeScript configuration
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+
+    "declaration": true,
+    "sourceMap": true,
+
+    "outDir": "dist",
+    "rootDir": "src",
+
+    "skipLibCheck": true
+  },
+  "include": ["src/**/*.ts"]
+}
+```
+
+The useful part is not the particular flags. It is making the compiler
+enforce the domain boundary.
+
+## 64. Media identity
+
+```ts
+// src/domain/media.ts
+
+export type MediaType = "movie" | "series";
+
+export interface MediaRef {
+  readonly type: MediaType;
+  readonly id: string;
+
+  readonly imdbId?: string;
+  readonly tmdbId?: string;
+
+  readonly season?: number;
+  readonly episode?: number;
+}
+
+export function isEpisode(media: MediaRef): boolean {
+  return (
+    media.type === "series" &&
+    Number.isInteger(media.season) &&
+    Number.isInteger(media.episode) &&
+    media.season! > 0 &&
+    media.episode! > 0
+  );
+}
+```
+
+## 65. Candidate model
+
+```ts
+// src/domain/candidate.ts
+
+import type { MediaRef } from "./media.js";
+
+export interface SourceCandidate {
+  readonly sourceId: string;
+
+  readonly media: MediaRef;
+
+  readonly location: {
+    readonly url: string;
+  };
+
+  readonly mediaInfo: {
+    readonly container?: string;
+    readonly videoCodec?: string;
+    readonly audioCodec?: string;
+
+    readonly width?: number;
+    readonly height?: number;
+
+    readonly bitrate?: number;
+    readonly sizeBytes?: number;
+    readonly durationSeconds?: number;
+  };
+
+  readonly language: {
+    readonly audio?: readonly string[];
+    readonly subtitle?: readonly string[];
+  };
+
+  readonly provenance: {
+    readonly adapter: string;
+    readonly sourceRecordId?: string;
+    readonly observedAt: string;
+  };
+
+  readonly capabilities: {
+    readonly directPlayback: boolean;
+    readonly seekable?: boolean;
+    readonly live?: boolean;
+  };
+
+  readonly authorization: {
+    readonly status: "authorized" | "unknown" | "denied";
+
+    readonly basis?: string;
+  };
+}
+```
+
+Notice the deliberate use of `readonly`.
+
+The resolver should consume candidates, not mutate them.
+
+## 66. Adapter contract
+
+```ts
+// src/adapters/interface.ts
+
+import type { MediaRef } from "../domain/media.js";
+
+import type { SourceCandidate } from "../domain/candidate.js";
+
+export interface ResolveContext {
+  readonly signal: AbortSignal;
+
+  readonly timeoutMs: number;
+
+  readonly preferredLanguages: readonly string[];
+}
+
+export interface SourceAdapter {
+  readonly id: string;
+  readonly name: string;
+
+  supports(media: MediaRef): boolean;
+
+  resolve(media: MediaRef, ctx: ResolveContext): Promise<SourceCandidate[]>;
+}
+```
+
+This interface is the principal extension point.
+
+## 67. Registry
+
+```ts
+// src/adapters/registry.ts
+
+import type { SourceAdapter } from "./interface.js";
+
+import type { MediaRef } from "../domain/media.js";
+
+export class SourceRegistry {
+  private readonly map = new Map<string, SourceAdapter>();
+
+  register(adapter: SourceAdapter): void {
+    if (this.map.has(adapter.id)) {
+      throw new Error(`duplicate_adapter:${adapter.id}`);
+    }
+
+    this.map.set(adapter.id, adapter);
+  }
+
+  all(): readonly SourceAdapter[] {
+    return [...this.map.values()];
+  }
+
+  applicable(media: MediaRef): readonly SourceAdapter[] {
+    return this.all().filter(adapter => adapter.supports(media));
+  }
+}
+```
+
+## 68. Adapter execution
+
+Now preserve failures rather than throwing them away.
+
+```ts
+// src/resolver/execute.ts
+
+import type { SourceAdapter, ResolveContext } from "../adapters/interface.js";
+
+import type { MediaRef } from "../domain/media.js";
+
+import type { SourceCandidate } from "../domain/candidate.js";
+
+export type AdapterStatus = "success" | "empty" | "timeout" | "error";
+
+export interface AdapterExecution {
+  readonly adapterId: string;
+
+  readonly status: AdapterStatus;
+
+  readonly durationMs: number;
+
+  readonly candidates: readonly SourceCandidate[];
+
+  readonly error?: string;
+}
+
+export async function executeAdapter(
+  adapter: SourceAdapter,
+  media: MediaRef,
+  ctx: ResolveContext
+): Promise<AdapterExecution> {
+  const started = performance.now();
+
+  try {
+    const candidates = await adapter.resolve(media, ctx);
+
+    const durationMs = performance.now() - started;
+
+    return {
+      adapterId: adapter.id,
+
+      status: candidates.length === 0 ? "empty" : "success",
+
+      durationMs,
+      candidates
+    };
+  } catch (error) {
+    return {
+      adapterId: adapter.id,
+
+      status: "error",
+
+      durationMs: performance.now() - started,
+
+      candidates: [],
+
+      error: error instanceof Error ? error.message : String(error)
+    };
+  }
+}
+```
+
+## 69. Validation
+
+```ts
+// src/resolver/validate.ts
+
+import type { SourceCandidate } from "../domain/candidate.js";
+
+const protocols = new Set(["http:", "https:"]);
+
+export function validateCandidate(candidate: SourceCandidate): boolean {
+  try {
+    const url = new URL(candidate.location.url);
+
+    if (!protocols.has(url.protocol)) {
+      return false;
+    }
+  } catch {
+    return false;
+  }
+
+  if (!candidate.sourceId || !candidate.provenance.adapter) {
+    return false;
+  }
+
+  if (
+    candidate.media.type === "series" &&
+    (!Number.isInteger(candidate.media.season) ||
+      !Number.isInteger(candidate.media.episode))
+  ) {
+    return false;
+  }
+
+  return true;
+}
+```
+
+## 70. Policy
+
+```ts
+// src/resolver/policy.ts
+
+import type { SourceCandidate } from "../domain/candidate.js";
+
+export interface PolicyDecision {
+  readonly allowed: boolean;
+  readonly reasons: readonly string[];
+}
+
+export function evaluatePolicy(candidate: SourceCandidate): PolicyDecision {
+  const reasons: string[] = [];
+
+  if (candidate.authorization.status !== "authorized") {
+    reasons.push("authorization_not_verified");
+  }
+
+  if (!candidate.capabilities.directPlayback) {
+    reasons.push("direct_playback_unavailable");
+  }
+
+  return {
+    allowed: reasons.length === 0,
+
+    reasons
+  };
+}
+```
+
+This is intentionally conservative.
+
+## 71. Deduplication
+
+```ts
+// src/resolver/dedupe.ts
+
+import type { SourceCandidate } from "../domain/candidate.js";
+
+function canonicalUrl(value: string): string {
+  const url = new URL(value);
+
+  url.hash = "";
+
+  return url.toString();
+}
+
+function key(candidate: SourceCandidate): string {
+  return [
+    candidate.media.type,
+    candidate.media.id,
+    candidate.media.season ?? "",
+    candidate.media.episode ?? "",
+    canonicalUrl(candidate.location.url)
+  ].join("|");
+}
+
+export function deduplicate(
+  candidates: readonly SourceCandidate[]
+): SourceCandidate[] {
+  const result = new Map<string, SourceCandidate>();
+
+  for (const candidate of candidates) {
+    const k = key(candidate);
+
+    if (!result.has(k)) {
+      result.set(k, candidate);
+    }
+  }
+
+  return [...result.values()];
+}
+```
+
+## 72. Ranking
+
+Start simple.
+
+```ts
+// src/resolver/rank.ts
+
+import type { SourceCandidate } from "../domain/candidate.js";
+
+function resolution(candidate: SourceCandidate): number {
+  return (
+    (candidate.mediaInfo.width ?? 0) * (candidate.mediaInfo.height ?? 0)
+  );
+}
+
+export function rank(
+  candidates: readonly SourceCandidate[]
+): SourceCandidate[] {
+  return [...candidates].sort((a, b) => {
+    const direct =
+      Number(b.capabilities.directPlayback) -
+      Number(a.capabilities.directPlayback);
+
+    if (direct !== 0) {
+      return direct;
+    }
+
+    const res = resolution(b) - resolution(a);
+
+    if (res !== 0) {
+      return res;
+    }
+
+    const bitrate = (b.mediaInfo.bitrate ?? 0) - (a.mediaInfo.bitrate ?? 0);
+
+    if (bitrate !== 0) {
+      return bitrate;
+    }
+
+    return a.sourceId.localeCompare(b.sourceId);
+  });
+}
+```
+
+Don't introduce a complicated ML ranking system yet.
+
+First establish deterministic semantics.
+
+## 73. Resolver
+
+```ts
+// src/resolver/resolver.ts
+
+import type { MediaRef } from "../domain/media.js";
+
+import type { SourceCandidate } from "../domain/candidate.js";
+
+import type { ResolveContext } from "../adapters/interface.js";
+
+import { SourceRegistry } from "../adapters/registry.js";
+
+import { executeAdapter } from "./execute.js";
+
+import { validateCandidate } from "./validate.js";
+
+import { evaluatePolicy } from "./policy.js";
+
+import { deduplicate } from "./dedupe.js";
+
+import { rank } from "./rank.js";
+
+export interface ResolutionResult {
+  readonly media: MediaRef;
+
+  readonly executions: readonly Awaited<ReturnType<typeof executeAdapter>>[];
+
+  readonly candidates: readonly SourceCandidate[];
+}
+
+export async function resolveMedia(
+  media: MediaRef,
+  registry: SourceRegistry,
+  ctx: ResolveContext
+): Promise<ResolutionResult> {
+  const adapters = registry.applicable(media);
+
+  const executions = await Promise.all(
+    adapters.map(adapter => executeAdapter(adapter, media, ctx))
+  );
+
+  const candidates = executions.flatMap(execution => execution.candidates);
+
+  const valid = candidates.filter(validateCandidate);
+
+  const permitted = valid.filter(
+    candidate => evaluatePolicy(candidate).allowed
+  );
+
+  const unique = deduplicate(permitted);
+
+  const ranked = rank(unique);
+
+  return {
+    media,
+    executions,
+    candidates: ranked
+  };
+}
+```
+
+This is the kernel.
+
+## 74. First legitimate adapter
+
+For the first adapter, use a **local/user-owned media library** rather
+than trying to start with questionable web scraping.
+
+Its contract can look like:
+
+```text
+User-owned media server
+        │
+        ▼
+  authentication
+        │
+        ▼
+ canonical media lookup
+        │
+        ▼
+ playback URL
+        │
+        ▼
+ SourceCandidate
+```
+
+This also gives us a clean integration test because the source
+semantics are under our control.
+
+## 75. Test adapter
+
+Before connecting any external service, create:
+
+```ts
+// test/fixtures/adapter.ts
+
+import type { SourceAdapter } from "../../src/adapters/interface.js";
+
+export function fakeAdapter(candidates: any[]): SourceAdapter {
+  return {
+    id: "test",
+    name: "Test",
+
+    supports() {
+      return true;
+    },
+
+    async resolve() {
+      return candidates;
+    }
+  };
+}
+```
+
+Now the resolver can be tested independently.
+
+## 76. Resolver test
+
+```ts
+import { describe, expect, it } from "vitest";
+
+import { SourceRegistry } from "../src/adapters/registry.js";
+
+import { resolveMedia } from "../src/resolver/resolver.js";
+
+describe("resolver", () => {
+  it("aggregates successful sources", async () => {
+    const registry = new SourceRegistry();
+
+    registry.register(
+      fakeAdapter([
+        makeCandidate({
+          sourceId: "a",
+          width: 1920,
+          height: 1080
+        })
+      ])
+    );
+
+    const result = await resolveMedia(
+      {
+        type: "movie",
+        id: "tt0000000"
+      },
+      registry,
+      testContext()
+    );
+
+    expect(result.candidates).toHaveLength(1);
+  });
+});
+```
+
+## 77. Add the failure test
+
+```ts
+it("preserves partial success", async () => {
+  const registry = new SourceRegistry();
+
+  registry.register(
+    fakeAdapter([
+      makeCandidate({
+        sourceId: "working",
+        width: 1920,
+        height: 1080
+      })
+    ])
+  );
+
+  registry.register({
+    id: "broken",
+    name: "Broken",
+
+    supports() {
+      return true;
+    },
+
+    async resolve() {
+      throw new Error("provider_failure");
+    }
+  });
+
+  const result = await resolveMedia(movie(), registry, testContext());
+
+  expect(result.candidates).toHaveLength(1);
+
+  expect(
+    result.executions.find(x => x.adapterId === "broken")?.status
+  ).toBe("error");
+});
+```
+
+That test captures one of the central architectural promises.
+
+## 78. Add the authorization test
+
+```ts
+it("does not emit unauthorized candidates", async () => {
+  const registry = new SourceRegistry();
+
+  registry.register(
+    fakeAdapter([
+      makeCandidate({
+        sourceId: "blocked",
+        authorization: {
+          status: "unknown"
+        }
+      }),
+
+      makeCandidate({
+        sourceId: "allowed",
+        authorization: {
+          status: "authorized"
+        }
+      })
+    ])
+  );
+
+  const result = await resolveMedia(movie(), registry, testContext());
+
+  expect(result.candidates.map(x => x.sourceId)).toEqual(["allowed"]);
+});
+```
+
+This is a release-gate test, not merely a unit test.
+
+## 79. Stremio adapter
+
+Now the kernel is ready.
+
+```ts
+// src/addon/stream-handler.ts
+
+import type { SourceCandidate } from "../domain/candidate.js";
+
+function formatQuality(candidate: SourceCandidate): string {
+  const { width, height } = candidate.mediaInfo;
+
+  if (!width || !height) {
+    return "Unknown";
+  }
+
+  return `${width}x${height}`;
+}
+
+export function toStremioStream(candidate: SourceCandidate) {
+  return {
+    name: candidate.sourceId,
+
+    description: formatQuality(candidate),
+
+    url: candidate.location.url
+  };
+}
+```
+
+Notice how stupid this function is.
+
+That's desirable.
+
+## 80. Manifest
+
+Keep it equally boring:
+
+```ts
+export const manifest = {
+  id: "org.example.multisource",
+
+  version: "0.1.0",
+
+  name: "MultiSource",
+
+  description: "Authorized multi-source media aggregation.",
+
+  resources: ["stream"],
+
+  types: ["movie", "series"],
+
+  idPrefixes: ["tt"]
+};
+```
+
+Don't add catalog functionality until metadata semantics are actually
+defined.
+
+## 81. Stremio ID parser
+
+```ts
+export function parseMediaId(type: string, id: string): MediaRef {
+  if (type === "movie") {
+    return {
+      type: "movie",
+      id,
+      imdbId: id
+    };
+  }
+
+  if (type === "series") {
+    const [imdbId, seasonRaw, episodeRaw] = id.split(":");
+
+    const season = Number(seasonRaw);
+
+    const episode = Number(episodeRaw);
+
+    if (!imdbId || !Number.isInteger(season) || !Number.isInteger(episode)) {
+      throw new Error("invalid_series_id");
+    }
+
+    return {
+      type: "series",
+      id: imdbId,
+      imdbId,
+      season,
+      episode
+    };
+  }
+
+  throw new Error(`unsupported_type:${type}`);
+}
+```
+
+## 82. Assemble the addon
+
+```ts
+import { addonBuilder, serveHTTP } from "stremio-addon-sdk";
+
+import { manifest } from "./addon/manifest.js";
+
+import { SourceRegistry } from "./adapters/registry.js";
+
+import { resolveMedia } from "./resolver/resolver.js";
+
+const registry = new SourceRegistry();
+
+// register adapters here
+
+const builder = new addonBuilder(manifest);
+
+builder.defineStreamHandler(async args => {
+  const media = parseMediaId(args.type, args.id);
+
+  const result = await resolveMedia(media, registry, createResolveContext());
+
+  return {
+    streams: result.candidates.map(toStremioStream)
+  };
+});
+
+serveHTTP(builder.getInterface(), {
+  port: Number(process.env.PORT ?? 7000)
+});
+```
+
+## 83. But don't call this release-ready yet
+
+There are still important missing gates:
+
+```text
+G0  Domain contract              ✓
+G1  Adapter contract             ✓
+G2  Resolver                     ✓
+G3  Validation                   ✓
+G4  Policy                       ✓
+G5  Dedup                        ✓
+G6  Deterministic ranking        ✓
+G7  Stremio boundary             ✓
+
+G8  Timeout cancellation         TODO
+G9  Concurrency limiter          TODO
+G10 Circuit breaker              TODO
+G11 Cache                        TODO
+G12 SSRF boundary                TODO
+G13 Rate limiting                TODO
+G14 Observability                TODO
+G15 Health endpoint              TODO
+G16 Metadata                     TODO
+G17 Subtitles                    TODO
+G18 Deployment                   TODO
+G19 Integration tests            TODO
+G20 Release evidence             TODO
+```
+
+The next important piece is **not another source adapter**.
+
+It is runtime reliability.
+
+## 84. Runtime reliability architecture
+
+The execution path should become:
+
+```text
+                 Adapter
+                     │
+                     ▼
+               Circuit breaker
+                     │
+                     ▼
+               Rate limiter
+                     │
+                     ▼
+              Concurrency gate
+                     │
+                     ▼
+                Timeout
+                     │
+                     ▼
+               HTTP request
+                     │
+                     ▼
+                 Parser
+                     │
+                     ▼
+              SourceCandidate
+```
+
+Each layer has one responsibility.
+
+```text
+Circuit breaker → should we call?
+Rate limiter    → may we call now?
+Concurrency     → do we have capacity?
+Timeout         → how long may it run?
+Parser          → what did it return?
+Validator       → is it structurally valid?
+Policy          → may it be emitted?
+```
+
+This is much easier to reason about than a giant `resolve()` function.
+
+## 85. Release evidence
+
+Given the architecture we have now, the release gate should eventually
+produce something like:
+
+```text
+RELEASE CANDIDATE
+─────────────────────────────────────
+Version: 0.1.0
+
+Typecheck                PASS
+Unit tests               PASS
+Integration tests        PASS
+Manifest validation      PASS
+Resolver conformance     PASS
+Policy conformance       PASS
+Dedup conformance        PASS
+Ranking determinism      PASS
+Failure isolation        PASS
+Timeout cancellation     PASS
+SSRF tests               PASS
+Container build          PASS
+Smoke test               PASS
+
+Source adapters:
+  test                     PASS
+  user-library             PASS
+
+Protocol:
+  /manifest.json           PASS
+  /stream                  PASS
+
+STATUS: RELEASE-CANDIDATE
+```
+
+And importantly:
+
+```text
+NO EVIDENCE
+     ↓
+NO VERIFIED CLAIM
+```
+
+So "works" should mean a reproducible test artifact exists, not merely
+that the code looks correct.
+
+## Next layer
+
+The natural continuation is to implement **G8–G15 as the runtime
+substrate**:
+
+```text
+timeout cancellation
+        ↓
+bounded concurrency
+        ↓
+per-source rate limiting
+        ↓
+circuit breakers
+        ↓
+cache with stale/revalidate semantics
+        ↓
+SSRF-safe HTTP client
+        ↓
+structured metrics
+        ↓
+health/readiness endpoints
+```
+
+After that, the Stremio addon becomes a relatively thin shell around a
+hardened aggregation engine rather than the engine itself.
