@@ -16606,3 +16606,1364 @@ The next major boundary is **source admission + a real authorized
 adapter**: how an adapter proves its capabilities, authorization
 basis, identity requirements, network permissions, rate-limit
 behavior, and provenance before it can enter the runtime registry.
+
+## 419. Source Admission: turn an adapter into an executable capability
+
+The identity layer answers:
+
+**"What media is this?"**
+
+The next boundary must answer:
+
+**"Is this source allowed to participate, and under what exact
+conditions?"**
+
+These are different questions.
+
+A source can be:
+
+- correctly identified,
+- reachable,
+- technically capable,
+- and still **not admitted**.
+
+The source-admission layer therefore sits **before execution**, not
+after it.
+
+```text
+CanonicalMedia
+      │
+      ▼
+Capability match
+      │
+      ▼
+Identity requirement
+      │
+      ▼
+Authorization admission
+      │
+      ▼
+Network/policy admission
+      │
+      ▼
+Health / circuit state
+      │
+      ▼
+EXECUTE
+```
+
+The critical invariant is:
+
+**No adapter execution occurs before admission succeeds.**
+
+## 420. Adapter Declaration vs Adapter Implementation
+
+Do not let executable code define its own authority.
+
+An adapter should have two conceptual parts:
+
+```text
+AdapterDeclaration
+        │
+        ├── capabilities
+        ├── identity requirements
+        ├── authorization declaration
+        ├── network requirements
+        └── operational limits
+                 │
+                 ▼
+          Admission Engine
+                 │
+                 ▼
+          AdmittedAdapter
+                 │
+                 ▼
+        AdapterImplementation
+```
+
+The implementation is therefore **subject to a declaration**.
+
+```ts
+interface SourceDeclaration {
+  readonly id: string;
+  readonly name: string;
+
+  readonly capabilities: SourceCapabilities;
+
+  readonly requiredIdentityKinds: readonly IdentityKind[];
+
+  readonly authorization: AuthorizationDeclaration;
+
+  readonly network: NetworkDeclaration;
+
+  readonly limits: SourceLimits;
+}
+```
+
+## 421. Authorization must be evidence-bearing
+
+Avoid:
+
+```text
+authorized: true
+```
+
+as the entire trust model.
+
+That is merely an assertion.
+
+Instead:
+
+```ts
+interface AuthorizationDeclaration {
+  readonly mode: "configured_owned" | "public_domain" | "licensed";
+
+  readonly evidence: readonly AuthorizationEvidence[];
+}
+```
+
+with:
+
+```ts
+interface AuthorizationEvidence {
+  readonly evidenceId: string;
+
+  readonly kind:
+    | "configuration"
+    | "license"
+    | "ownership"
+    | "public_domain_status"
+    | "operator_attestation";
+
+  readonly subject: string;
+
+  readonly observedAt: string;
+
+  readonly expiresAt?: string;
+
+  readonly reference?: string;
+}
+```
+
+The distinction is important:
+
+```text
+claim
+  ≠ evidence
+  ≠ verification
+  ≠ authorization
+```
+
+A declaration can contain evidence without that evidence necessarily
+being independently verified.
+
+Therefore admission should retain its status.
+
+## 422. Admission status
+
+Use an explicit state rather than a Boolean.
+
+```ts
+type AdmissionStatus = "admitted" | "rejected" | "pending_review" | "expired";
+```
+
+And:
+
+```ts
+interface AdmissionDecision {
+  readonly status: AdmissionStatus;
+
+  readonly adapterId: string;
+
+  readonly reasons: readonly AdmissionReason[];
+
+  readonly evidenceIds: readonly string[];
+
+  readonly evaluatedAt: string;
+}
+```
+
+Reasons should be machine-readable:
+
+```ts
+type AdmissionReason =
+  | "missing_authorization_evidence"
+  | "unsupported_authorization_mode"
+  | "expired_authorization"
+  | "missing_required_identity"
+  | "unsupported_media_type"
+  | "stream_capability_missing"
+  | "network_policy_violation"
+  | "invalid_declaration"
+  | "duplicate_adapter_id"
+  | "operator_disabled";
+```
+
+This gives us:
+
+```text
+REJECTED
+```
+
+without losing **why**.
+
+## 423. Admission is not health
+
+This distinction should become a hard invariant.
+
+| State | Meaning |
+| --- | --- |
+| admitted | source is permitted to participate |
+| healthy | source currently appears operational |
+| circuit closed | requests may currently execute |
+| identity available | media mapping is sufficient |
+| candidate valid | returned stream has valid structure |
+| authorized candidate | particular playback candidate is permitted |
+
+These are independent dimensions.
+
+For example:
+
+```text
+Adapter A
+
+admission     = admitted
+identity      = resolved
+health        = unhealthy
+circuit       = open
+```
+
+Result:
+
+```text
+DO NOT EXECUTE
+```
+
+But not:
+
+```text
+SOURCE IS UNAUTHORIZED
+```
+
+Conversely:
+
+```text
+admission     = rejected
+health        = healthy
+circuit       = closed
+```
+
+Result:
+
+```text
+DO NOT EXECUTE
+```
+
+The source being reachable cannot grant authority.
+
+## 424. Capability consistency
+
+The declaration itself must be validated.
+
+Suppose an adapter declares:
+
+```json
+{
+  "providesStreams": false
+}
+```
+
+but its implementation returns playback URLs.
+
+That is a contract violation.
+
+Likewise:
+
+```text
+supportsEpisodes: false
+```
+
+must prevent execution against:
+
+```json
+{
+  "type": "series",
+  "season": 2,
+  "episode": 7
+}
+```
+
+Define:
+
+```ts
+interface SourceCapabilities {
+  readonly mediaTypes: readonly MediaType[];
+
+  readonly supportsMovies: boolean;
+  readonly supportsSeries: boolean;
+  readonly supportsEpisodes: boolean;
+
+  readonly providesStreams: boolean;
+  readonly providesSubtitles: boolean;
+  readonly providesMetadata: boolean;
+
+  readonly identityKinds: readonly IdentityKind[];
+
+  readonly authorizationMode:
+    | "configured_owned"
+    | "public_domain"
+    | "licensed"
+    | "unknown";
+}
+```
+
+Then enforce consistency:
+
+```text
+mediaTypes
+     │
+     ├── movie ──────► supportsMovies = true
+     │
+     └── series ─────► supportsSeries = true
+
+series episodes
+     │
+     └───────────────► supportsEpisodes = true
+```
+
+No contradictory declarations.
+
+## 425. Required identity policy
+
+An adapter should explicitly declare what identity it requires.
+
+Example:
+
+```ts
+const declaration: SourceDeclaration = {
+  id: "authorized-library",
+  name: "Authorized Media Library",
+
+  capabilities: {
+    mediaTypes: ["movie", "series"],
+    supportsMovies: true,
+    supportsSeries: true,
+    supportsEpisodes: true,
+    providesStreams: true,
+    providesSubtitles: false,
+    providesMetadata: false,
+    identityKinds: ["internal"],
+    authorizationMode: "configured_owned"
+  },
+
+  requiredIdentityKinds: ["internal"]
+
+  // ...
+};
+```
+
+Now routing can explain:
+
+```text
+Request: IMDb tt1234567
+
+Available: IMDb
+Required: internal
+
+Decision: identity_missing
+```
+
+The router must **not** silently invent:
+
+```text
+IMDb → internal
+```
+
+because a title happened to look similar.
+
+## 426. Identity evidence becomes a routing input
+
+The complete routing decision now becomes:
+
+```text
+External Identity
+       │
+       ▼
+Identity Resolver
+       │
+       ▼
+Identity State
+       │
+       ├── NOT_FOUND
+       ├── NOT_RESOLVED
+       ├── AMBIGUOUS
+       └── RESOLVED
+                │
+                ▼
+          CanonicalMedia
+                │
+                ▼
+        Source Declaration
+                │
+        ┌───────┴────────┐
+        ▼                ▼
+ identity sufficient   insufficient
+        │                │
+        ▼                ▼
+   admission         explanation
+```
+
+This is much safer than:
+
+```text
+title → scrape everything → hope
+```
+
+## 427. Network admission
+
+A source can be authorized while its network behavior is prohibited.
+
+Define:
+
+```ts
+interface NetworkDeclaration {
+  readonly outboundHosts: readonly string[];
+
+  readonly allowHttp: boolean;
+  readonly allowHttps: boolean;
+
+  readonly allowRedirects: boolean;
+
+  readonly maxRedirects: number;
+}
+```
+
+For example:
+
+```json
+{
+  "outboundHosts": ["media.example.org"],
+  "allowHttp": false,
+  "allowHttps": true,
+  "allowRedirects": true,
+  "maxRedirects": 3
+}
+```
+
+Then every extracted URL must pass:
+
+```text
+candidate URL
+     │
+     ▼
+parse
+     │
+     ▼
+scheme policy
+     │
+     ▼
+hostname policy
+     │
+     ▼
+IP policy
+     │
+     ▼
+redirect policy
+     │
+     ▼
+HTTP client
+```
+
+Never:
+
+```ts
+fetch(providerReturnedUrl);
+```
+
+without policy enforcement.
+
+## 428. Source limits
+
+An adapter must not be allowed to consume unlimited runtime resources.
+
+```ts
+interface SourceLimits {
+  readonly timeoutMs: number;
+
+  readonly maxConcurrentRequests: number;
+
+  readonly requestsPerMinute: number;
+
+  readonly maxCandidates: number;
+}
+```
+
+These are **operational constraints**, not authorization.
+
+For example:
+
+```text
+authorization     = licensed
+
+timeout     = 5000 ms
+concurrency     = 2
+rate     = 30/minute
+maxCandidates     = 20
+```
+
+This prevents an otherwise valid adapter from becoming an uncontrolled
+resource consumer.
+
+## 429. Admission engine
+
+The engine should be pure wherever possible.
+
+```ts
+function evaluateAdmission(
+  declaration: SourceDeclaration,
+  context: AdmissionContext
+): AdmissionDecision;
+```
+
+Input:
+
+```ts
+interface AdmissionContext {
+  readonly now: string;
+
+  readonly enabledAdapters: ReadonlySet<string>;
+
+  readonly verifiedEvidenceIds: ReadonlySet<string>;
+}
+```
+
+The engine does not perform HTTP.
+
+It does not access the database.
+
+It does not invoke the adapter.
+
+It evaluates facts.
+
+Conceptually:
+
+```text
+Declaration
+     + Evidence
+     + Operator configuration
+     + Current time
+     │
+     ▼
+AdmissionDecision
+```
+
+That makes it deterministic and testable.
+
+## 430. Admission algorithm
+
+```ts
+function evaluateAdmission(
+  declaration: SourceDeclaration,
+  context: AdmissionContext
+): AdmissionDecision {
+  const reasons: AdmissionReason[] = [];
+
+  if (!context.enabledAdapters.has(declaration.id)) {
+    reasons.push("operator_disabled");
+  }
+
+  if (declaration.capabilities.authorizationMode === "unknown") {
+    reasons.push("unsupported_authorization_mode");
+  }
+
+  if (declaration.authorization.evidence.length === 0) {
+    reasons.push("missing_authorization_evidence");
+  }
+
+  for (const evidence of declaration.authorization.evidence) {
+    if (evidence.expiresAt !== undefined && evidence.expiresAt <= context.now) {
+      reasons.push("expired_authorization");
+    }
+  }
+
+  if (!declaration.capabilities.providesStreams) {
+    reasons.push("stream_capability_missing");
+  }
+
+  if (reasons.length > 0) {
+    return {
+      status: "rejected",
+      adapterId: declaration.id,
+      reasons,
+      evidenceIds: declaration.authorization.evidence.map(
+        evidence => evidence.evidenceId
+      ),
+      evaluatedAt: context.now
+    };
+  }
+
+  return {
+    status: "admitted",
+    adapterId: declaration.id,
+    reasons: [],
+    evidenceIds: declaration.authorization.evidence.map(
+      evidence => evidence.evidenceId
+    ),
+    evaluatedAt: context.now
+  };
+}
+```
+
+This is deliberately conservative.
+
+## 431. The critical distinction: evidence verification
+
+The previous algorithm should **not** automatically equate:
+
+```text
+evidence exists
+```
+
+with:
+
+```text
+evidence verified
+```
+
+That distinction becomes important as the system grows.
+
+A stronger model is:
+
+```ts
+interface AuthorizationEvidence {
+  readonly evidenceId: string;
+  readonly kind: AuthorizationEvidenceKind;
+
+  readonly subject: string;
+  readonly observedAt: string;
+
+  readonly verification: "unverified" | "verified" | "expired";
+}
+```
+
+Then admission requires:
+
+```text
+at least one acceptable
+AND currently verified
+AND not expired
+```
+
+This gives:
+
+```text
+DECLARED
+    ↓
+OBSERVED
+    ↓
+VERIFIED
+    ↓
+ADMITTED
+```
+
+rather than:
+
+```text
+string says authorized → trust it
+```
+
+## 432. Source lifecycle
+
+The adapter now gets a formal lifecycle:
+
+```text
+DECLARED
+   │
+   ▼
+VALIDATED
+   │
+   ▼
+ADMISSION_EVALUATED
+   │
+   ├── rejected ──────────────┐
+   │                          │
+   ▼                          │
+ADMITTED                      │
+   │                          │
+   ▼                          │
+REGISTERED                    │
+   │                          │
+   ▼                          │
+HEALTH_MONITORED              │
+   │                          │
+   ▼                          │
+EXECUTABLE                    │
+   │                          │
+   ├──── disabled ────────────┤
+   │                          │
+   ├──── expired ─────────────┤
+   │                          │
+   └──── revoked ─────────────┘
+```
+
+Important:
+
+**Registered does not mean executable.**
+
+## 433. Registry redesign
+
+The previous registry stored only executable adapters.
+
+Now separate declarations from admitted implementations:
+
+```ts
+interface RegisteredSource {
+  readonly declaration: SourceDeclaration;
+  readonly admission: AdmissionDecision;
+  readonly adapter?: SourceAdapter;
+}
+```
+
+Registry:
+
+```ts
+class SourceRegistry {
+  private readonly sources = new Map<string, RegisteredSource>();
+
+  register(source: RegisteredSource): void {
+    if (this.sources.has(source.declaration.id)) {
+      throw new Error(`Duplicate source adapter: ${source.declaration.id}`);
+    }
+
+    this.sources.set(source.declaration.id, source);
+  }
+
+  all(): readonly RegisteredSource[] {
+    return [...this.sources.values()];
+  }
+
+  executable(): readonly SourceAdapter[] {
+    return [...this.sources.values()]
+      .filter(
+        source => source.admission.status === "admitted" && source.adapter !== undefined
+      )
+      .map(source => source.adapter!);
+  }
+}
+```
+
+The `!` here is structurally justified only because admission +
+adapter presence form an invariant.
+
+A stronger TypeScript design should eliminate even that assertion.
+
+## 434. Make impossible states unrepresentable
+
+Instead of:
+
+```ts
+adapter?: SourceAdapter
+```
+
+use a discriminated union:
+
+```ts
+type RegisteredSource =
+  | {
+      readonly status: "rejected";
+      readonly declaration: SourceDeclaration;
+      readonly admission: AdmissionDecision;
+    }
+  | {
+      readonly status: "admitted";
+      readonly declaration: SourceDeclaration;
+      readonly admission: AdmissionDecision;
+      readonly adapter: SourceAdapter;
+    };
+```
+
+Now:
+
+```ts
+if (source.status === "admitted") {
+  source.adapter.resolve(...);
+}
+```
+
+No nullable adapter.
+
+This aligns with the project's larger rule:
+
+**UNKNOWN must remain UNKNOWN; impossible states should not be encoded
+as ordinary nullable fields.**
+
+## 435. Source execution contract
+
+Once admitted, execution receives the **canonical media**, not the
+original Stremio request.
+
+Bad:
+
+```ts
+adapter.resolve({
+  type: args.type,
+  id: args.id
+});
+```
+
+Better:
+
+```ts
+adapter.resolve(canonicalMedia, {
+  signal,
+  timeoutMs,
+  preferredLanguages
+});
+```
+
+Therefore:
+
+```text
+Stremio syntax
+      ↓
+MediaRef
+      ↓
+Identity resolution
+      ↓
+CanonicalMedia
+      ↓
+Source routing
+      ↓
+Adapter
+```
+
+The adapter doesn't need to understand Stremio.
+
+## 436. First legitimate real-source category
+
+The first production-oriented adapter should **not** begin with an
+arbitrary public streaming website.
+
+Instead, use a source whose authorization boundary is naturally
+explicit:
+
+### User-owned media library
+
+Examples include an operator-controlled HTTP media server or object
+store containing media the operator is authorized to serve.
+
+The adapter contract becomes:
+
+```text
+configured endpoint
+        + configured credentials/token
+        + operator-controlled media
+        ↓
+authorized source
+```
+
+The source is not discovered by scraping the Internet.
+
+It is explicitly configured.
+
+## 437. Example: operator-owned HTTP library
+
+Configuration:
+
+```text
+MEDIA_LIBRARY_BASE_URL=https://media.example.org
+MEDIA_LIBRARY_TOKEN=...
+MEDIA_LIBRARY_AUTHORIZATION=owned
+```
+
+The adapter declaration:
+
+```ts
+const ownedLibraryDeclaration: SourceDeclaration = {
+  id: "owned-media-library",
+  name: "Operator-Owned Media Library",
+
+  capabilities: {
+    mediaTypes: ["movie", "series"],
+    supportsMovies: true,
+    supportsSeries: true,
+    supportsEpisodes: true,
+
+    providesStreams: true,
+    providesSubtitles: false,
+    providesMetadata: false,
+
+    identityKinds: ["internal"],
+
+    authorizationMode: "configured_owned"
+  },
+
+  requiredIdentityKinds: ["internal"],
+
+  authorization: {
+    mode: "configured_owned",
+    evidence: [
+      {
+        evidenceId: "config:owned-media-library",
+        kind: "configuration",
+        subject: "operator-owned-media-library",
+        observedAt: "2026-09-29T00:00:00Z"
+      }
+    ]
+  },
+
+  network: {
+    outboundHosts: ["media.example.org"],
+    allowHttp: false,
+    allowHttps: true,
+    allowRedirects: true,
+    maxRedirects: 3
+  },
+
+  limits: {
+    timeoutMs: 5000,
+    maxConcurrentRequests: 4,
+    requestsPerMinute: 60,
+    maxCandidates: 10
+  }
+};
+```
+
+The hostname is illustrative.
+
+It is **not** a real source.
+
+## 438. Mapping canonical media into owned-library paths
+
+Do not derive URLs directly from arbitrary user-controlled titles.
+
+Instead:
+
+```text
+CanonicalMedia
+      │
+      ▼
+OwnedLibraryIndex
+      │
+      ▼
+LibraryAsset
+      │
+      ▼
+Playback URL
+```
+
+For example:
+
+```ts
+interface LibraryAsset {
+  readonly assetId: string;
+  readonly canonicalId: string;
+
+  readonly mediaType: MediaType;
+
+  readonly url: string;
+
+  readonly container?: string;
+  readonly resolution?: number;
+  readonly bitrate?: number;
+}
+```
+
+The library index is authoritative for the operator's own media
+inventory.
+
+## 439. Why the index matters
+
+Without an index:
+
+```text
+IMDb ID
+  ↓
+guess filename
+  ↓
+guess path
+  ↓
+HTTP request
+```
+
+This creates brittle and potentially unsafe semantics.
+
+With an index:
+
+```text
+IMDb
+ ↓
+identity resolver
+ ↓
+canonicalId
+ ↓
+library index
+ ↓
+asset
+ ↓
+authorized playback URL
+```
+
+Now the source adapter answers a deterministic question:
+
+"Does this canonical media entity have a playable asset in my
+authorized library?"
+
+## 440. Asset authorization
+
+Even inside an authorized library, candidate authorization should
+remain explicit.
+
+```ts
+interface AssetAuthorization {
+  readonly status: "authorized" | "unauthorized" | "unknown";
+
+  readonly evidenceIds: readonly string[];
+}
+```
+
+Then:
+
+```ts
+interface LibraryAsset {
+  readonly assetId: string;
+  readonly canonicalId: string;
+  readonly url: string;
+
+  readonly authorization: AssetAuthorization;
+}
+```
+
+This may look redundant.
+
+It is intentionally redundant because:
+
+```text
+source authorization
+```
+
+does not necessarily prove:
+
+```text
+asset authorization
+```
+
+The architecture preserves the distinction.
+
+## 441. Adapter conformance suite v2
+
+Every admitted adapter must pass structural tests.
+
+```ts
+interface AdapterConformanceContext {
+  readonly adapter: SourceAdapter;
+  readonly declaration: SourceDeclaration;
+}
+```
+
+Tests:
+
+```text
+ADAPTER-CONFORMANCE
+
+[ ] unique ID
+[ ] declaration matches implementation
+[ ] declared media types are supported
+[ ] unsupported media rejected
+[ ] required identities enforced
+[ ] authorization declaration valid
+[ ] stream capability consistent
+[ ] timeout respected
+[ ] AbortSignal respected
+[ ] candidate URLs satisfy network policy
+[ ] candidate authorization preserved
+[ ] candidate sourceId correct
+[ ] malformed provider data rejected
+[ ] candidate count bounded
+[ ] deterministic output
+[ ] no hidden global state
+```
+
+## 442. Determinism requirement
+
+Given the same canonical media and equivalent source state:
+
+```text
+resolve(M, C)
+```
+
+should produce semantically equivalent output independent of:
+
+- candidate input order,
+- asynchronous completion order,
+- map iteration order,
+- logging order.
+
+Formally:
+
+```text
+Resolve(M, C) = Resolve(M, C)
+```
+
+under equivalent observations.
+
+And:
+
+```text
+Rank(A ∪ B) = Rank(B ∪ A)
+```
+
+This becomes especially important once multiple legitimate libraries
+are configured.
+
+## 443. Multi-source execution
+
+The architecture can now support:
+
+```text
+                    CanonicalMedia
+                          │
+           ┌──────────────┼──────────────┐
+           ▼              ▼              ▼
+    Owned Library     Licensed API    Public Domain
+           │              │              │
+           ▼              ▼              ▼
+       Candidate A    Candidate B    Candidate C
+           │              │              │
+           └──────────────┼──────────────┘
+                          ▼
+                     VALIDATE
+                          ▼
+                    AUTHORIZE
+                          ▼
+                      DEDUPE
+                          ▼
+                       RANK
+                          ▼
+                   Stremio streams
+```
+
+No source is special-cased in the resolver.
+
+That is the key architectural payoff.
+
+## 444. Failure semantics become richer
+
+At this point a resolution can produce:
+
+```text
+Identity:     RESOLVED
+
+Source A:     admitted     success
+Source B:     admitted     timeout
+Source C:     rejected     missing authorization evidence
+```
+
+The user-facing Stremio response might simply be:
+
+```json
+{
+  "streams": [
+    {
+      "name": "owned-library",
+      "title": "1080p · mp4",
+      "url": "https://..."
+    }
+  ]
+}
+```
+
+But internally the evidence ledger records:
+
+```text
+A → SUCCESS
+B → TIMEOUT
+C → REJECTED
+```
+
+This preserves the distinction between:
+
+```text
+no stream exists
+```
+
+and:
+
+```text
+stream existed but source was unavailable
+```
+
+and:
+
+```text
+source was deliberately excluded
+```
+
+## 445. The next architectural boundary
+
+We now have four separate admission questions:
+
+```text
+1. Identity
+   "What media is this?"
+
+2. Capability
+   "Can this adapter handle it?"
+
+3. Authorization
+   "Is this adapter/source allowed to participate?"
+
+4. Operational eligibility
+   "Can we execute it right now?"
+```
+
+Together:
+
+```text
+REQUEST
+  │
+  ▼
+IDENTITY
+  │
+  ▼
+CAPABILITY
+  │
+  ▼
+AUTHORIZATION
+  │
+  ▼
+NETWORK POLICY
+  │
+  ▼
+HEALTH
+  │
+  ▼
+CIRCUIT
+  │
+  ▼
+EXECUTION
+```
+
+That gives us a much stronger invariant:
+
+**A source is executable only when identity, capability,
+authorization, network policy, and operational state all
+independently permit execution.**
+
+## 446. New release gate: `GATE-SOURCE-ADMISSION-01`
+
+```text
+SOURCE ADMISSION
+────────────────────────────────────────
+
+[ ] SourceDeclaration exists
+[ ] declaration schema validated
+[ ] capability consistency validated
+[ ] authorization mode explicit
+[ ] authorization evidence required
+[ ] unknown authorization rejected
+[ ] expired evidence rejected
+[ ] required identities declared
+[ ] insufficient identity blocks routing
+[ ] network policy declared
+[ ] outbound hosts constrained
+[ ] redirect policy declared
+[ ] source limits declared
+[ ] adapter cannot self-authorize
+[ ] admission decision is deterministic
+[ ] rejection reasons are machine-readable
+[ ] admission != health
+[ ] admission != circuit state
+[ ] adapter execution requires admission
+[ ] rejected adapter cannot enter executable registry
+[ ] conformance suite passes
+```
+
+Current status:
+
+```text
+GATE-SOURCE-ADMISSION-01 = OPEN
+```
+
+because this is still architecture/code specification, not executed
+repository evidence.
+
+## 447. Updated system
+
+The architecture is now:
+
+```text
+                         ┌─────────────────────┐
+                          │      Stremio        │
+                          └──────────┬──────────┘
+                                     │
+                               Protocol Layer
+                                     │
+                                     ▼
+                               Media Request
+                                     │
+                                     ▼
+                          ┌─────────────────────┐
+                          │ Identity Resolution │
+                          └──────────┬──────────┘
+                                     │
+                          CanonicalMedia
+                                     │
+                                     ▼
+                          ┌─────────────────────┐
+                          │   Source Routing    │
+                          └──────────┬──────────┘
+                                     │
+                      ┌──────────────┼──────────────┐
+                      ▼              ▼              ▼
+                  Capability    Authorization    Identity
+                      │              │              │
+                      └──────────────┼──────────────┘
+                                     ▼
+                             Network Admission
+                                     │
+                                     ▼
+                              Health / Circuit
+                                     │
+                                     ▼
+                          Bounded Source Execution
+                                     │
+                                     ▼
+                               Candidate Set
+                                     │
+                          ┌──────────┴──────────┐
+                          ▼                     ▼
+                     Validate              Authorize
+                          │                     │
+                          └──────────┬──────────┘
+                                     ▼
+                                   Dedupe
+                                     │
+                                     ▼
+                                   Rank
+                                     │
+                                     ▼
+                            Stremio Stream DTO
+```
+
+The important change is that **source adapters are no longer merely
+functions that return URLs**.
+
+They are governed capabilities with explicit:
+
+```text
+identity requirements
++ capability declaration
++ authorization evidence
++ network constraints
++ resource limits
++ health state
++ execution contract
+```
+
+That gives us the foundation for the next major subsystem: **the
+actual authorized-source adapter runtime and its source-independent
+HTTP client**, including retries, redirect validation, rate limiting,
+cancellation, response-size limits, content validation, and how a
+real owned/licensed media backend becomes a `SourceCandidate` without
+contaminating the domain layer.
