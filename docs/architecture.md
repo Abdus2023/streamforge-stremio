@@ -13756,3 +13756,1417 @@ expected protocol response
 That is the first point at which we can legitimately say the addon
 executes as a Stremio addon, rather than merely having code that
 appears to implement one.
+
+## 354. Conformance Harness
+
+We now freeze the first test contract.
+
+The harness must prove **behavior**, not merely implementation
+details.
+
+```text
+                    ┌────────────────────┐
+                     │   Domain tests     │
+                     └─────────┬──────────┘
+                               │
+                     ┌─────────▼──────────┐
+                     │ Resolver tests     │
+                     └─────────┬──────────┘
+                               │
+                     ┌─────────▼──────────┐
+                     │ Adapter contract   │
+                     └─────────┬──────────┘
+                               │
+                     ┌─────────▼──────────┐
+                     │ Protocol tests     │
+                     └─────────┬──────────┘
+                               │
+                     ┌─────────▼──────────┐
+                     │ HTTP smoke test    │
+                     └─────────┬──────────┘
+                               │
+                     ┌─────────▼──────────┐
+                     │ CI release gate    │
+                     └────────────────────┘
+```
+
+The important distinction:
+
+```text
+unit test
+    ≠ protocol test
+    ≠ deployment test
+```
+
+All three are necessary.
+
+## 355. Parser Conformance
+
+`test/addon/parser.test.ts`
+
+```ts
+import { describe, expect, it } from "vitest";
+
+import {
+  parseStreamRequest,
+  RequestParseError
+} from "../../src/addon/parser.js";
+
+describe("parseStreamRequest", () => {
+  it("parses a movie", () => {
+    expect(parseStreamRequest("movie", "tt1234567")).toEqual({
+      media: {
+        type: "movie",
+        id: "tt1234567"
+      }
+    });
+  });
+
+  it("parses a series episode", () => {
+    expect(parseStreamRequest("series", "tt1234567:2:7")).toEqual({
+      media: {
+        type: "series",
+        id: "tt1234567",
+        season: 2,
+        episode: 7
+      }
+    });
+  });
+
+  it("rejects invalid series syntax", () => {
+    expect(() => parseStreamRequest("series", "tt1234567")).toThrow(
+      RequestParseError
+    );
+  });
+
+  it("rejects season zero", () => {
+    expect(() => parseStreamRequest("series", "tt1234567:0:7")).toThrow(
+      RequestParseError
+    );
+  });
+
+  it("rejects episode zero", () => {
+    expect(() => parseStreamRequest("series", "tt1234567:2:0")).toThrow(
+      RequestParseError
+    );
+  });
+
+  it("rejects unsupported media types", () => {
+    expect(() => parseStreamRequest("channel", "abc")).toThrow(
+      RequestParseError
+    );
+  });
+});
+```
+
+This establishes the first protocol theorem:
+
+```text
+valid Stremio ID
+        ⇔ valid MediaRef
+```
+
+within the supported request grammar.
+
+## 356. Candidate Validation
+
+`test/resolver/validation.test.ts`
+
+```ts
+import { describe, expect, it } from "vitest";
+
+import { validateCandidate } from "../../src/resolver/validate.js";
+
+const baseCandidate = {
+  sourceId: "fixture-authorized",
+
+  media: {
+    type: "movie" as const,
+    id: "tt1234567"
+  },
+
+  url: "https://media.example.test/movie.mp4",
+
+  provenance: {
+    adapterId: "fixture-authorized",
+    observedAt: "2026-09-28T00:00:00.000Z"
+  },
+
+  capabilities: {
+    directPlayback: true
+  },
+
+  authorization: {
+    status: "authorized" as const,
+    basis: "fixture"
+  }
+};
+
+describe("validateCandidate", () => {
+  it("accepts a structurally valid candidate", () => {
+    const result = validateCandidate(baseCandidate);
+
+    expect(result.valid).toBe(true);
+  });
+
+  it("rejects unsupported URL schemes", () => {
+    const result = validateCandidate({
+      ...baseCandidate,
+      url: "file:///etc/passwd"
+    });
+
+    expect(result.valid).toBe(false);
+  });
+
+  it("rejects missing source identity", () => {
+    const result = validateCandidate({
+      ...baseCandidate,
+      sourceId: ""
+    });
+
+    expect(result.valid).toBe(false);
+  });
+});
+```
+
+The test deliberately does not decide authorization.
+
+It asks only:
+
+Is this candidate structurally well-formed?
+
+That keeps:
+
+```text
+structure ≠ authorization
+```
+
+## 357. Authorization Tests
+
+`test/resolver/authorization.test.ts`
+
+```ts
+import { describe, expect, it } from "vitest";
+
+import { authorizeCandidate } from "../../src/resolver/policy.js";
+
+const candidate = {
+  sourceId: "test",
+
+  media: {
+    type: "movie" as const,
+    id: "tt1234567"
+  },
+
+  url: "https://example.test/movie.mp4",
+
+  provenance: {
+    adapterId: "test",
+    observedAt: "2026-09-28T00:00:00.000Z"
+  },
+
+  capabilities: {
+    directPlayback: true
+  },
+
+  authorization: {
+    status: "authorized" as const,
+    basis: "fixture"
+  }
+};
+
+describe("authorizeCandidate", () => {
+  it("accepts authorized direct playback", () => {
+    expect(authorizeCandidate(candidate).authorized).toBe(true);
+  });
+
+  it("rejects unknown authorization", () => {
+    expect(
+      authorizeCandidate({
+        ...candidate,
+        authorization: {
+          status: "unknown"
+        }
+      }).authorized
+    ).toBe(false);
+  });
+
+  it("rejects unauthorized candidates", () => {
+    expect(
+      authorizeCandidate({
+        ...candidate,
+        authorization: {
+          status: "unauthorized"
+        }
+      }).authorized
+    ).toBe(false);
+  });
+
+  it("rejects non-direct playback", () => {
+    expect(
+      authorizeCandidate({
+        ...candidate,
+        capabilities: {
+          directPlayback: false
+        }
+      }).authorized
+    ).toBe(false);
+  });
+});
+```
+
+This is one of the highest-value tests in the entire project.
+
+If this test disappears, the architecture has lost an important
+security boundary.
+
+## 358. Deduplication Test
+
+`test/resolver/dedupe.test.ts`
+
+```ts
+import { describe, expect, it } from "vitest";
+
+import { deduplicateCandidates } from "../../src/resolver/dedupe.js";
+
+function candidate(url: string, sourceId = "source-a") {
+  return {
+    sourceId,
+
+    media: {
+      type: "movie" as const,
+      id: "tt1234567"
+    },
+
+    url,
+
+    provenance: {
+      adapterId: sourceId,
+      observedAt: "2026-09-28T00:00:00.000Z"
+    },
+
+    capabilities: {
+      directPlayback: true
+    },
+
+    authorization: {
+      status: "authorized" as const,
+      basis: "fixture"
+    }
+  };
+}
+
+describe("deduplicateCandidates", () => {
+  it("removes URL fragments from identity", () => {
+    const result = deduplicateCandidates([
+      candidate("https://example.test/movie.mp4#one"),
+      candidate("https://example.test/movie.mp4#two")
+    ]);
+
+    expect(result).toHaveLength(1);
+  });
+
+  it("keeps genuinely different URLs", () => {
+    const result = deduplicateCandidates([
+      candidate("https://a.example/movie.mp4"),
+      candidate("https://b.example/movie.mp4")
+    ]);
+
+    expect(result).toHaveLength(2);
+  });
+});
+```
+
+## 359. Deterministic Ranking Test
+
+```ts
+describe("rankCandidates", () => {
+  it("does not depend on input order", () => {
+    const candidates = [
+      makeCandidate("source-z", "720p", 2_000_000),
+      makeCandidate("source-a", "1080p", 5_000_000),
+      makeCandidate("source-b", "1080p", 3_000_000)
+    ];
+
+    const first = rankCandidates(candidates);
+
+    const second = rankCandidates([...candidates].reverse());
+
+    expect(first).toEqual(second);
+  });
+});
+```
+
+This catches a class of bugs that ordinary example-based tests
+frequently miss.
+
+The invariant is:
+
+```text
+rank(A) = rank(permutation(A))
+```
+
+assuming candidate properties are unchanged.
+
+## 360. Resolver Partial-Success Test
+
+This is more important than another happy-path test.
+
+Create three adapters:
+
+```text
+source-a → candidate
+source-b → timeout
+source-c → candidate
+```
+
+Then:
+
+```ts
+it("preserves successful candidates when one source fails", async () => {
+  const registry = new SourceRegistry();
+
+  registry.register(new SuccessfulAdapter("source-a"));
+
+  registry.register(new FailingAdapter("source-b"));
+
+  registry.register(new SuccessfulAdapter("source-c"));
+
+  const resolver = new Resolver(registry, {
+    timeoutMs: 100,
+    preferredLanguages: ["en"]
+  });
+
+  const result = await resolver.resolve(
+    {
+      type: "movie",
+      id: "tt1234567"
+    },
+    new AbortController().signal
+  );
+
+  expect(result.status).toBe("partial");
+
+  expect(result.candidates).toHaveLength(2);
+
+  expect(result.failures).toHaveLength(1);
+});
+```
+
+This establishes:
+
+```text
+failure isolation
+```
+
+as a first-class property.
+
+## 361. Empty Is Not Failure
+
+Add the inverse test:
+
+```ts
+it("distinguishes empty from failed", async () => {
+  const registry = new SourceRegistry();
+
+  registry.register(new EmptyAdapter());
+
+  const resolver = makeResolver(registry);
+
+  const result = await resolver.resolve(movie(), new AbortController().signal);
+
+  expect(result.status).toBe("empty");
+
+  expect(result.candidates).toEqual([]);
+
+  expect(result.failures).toEqual([]);
+});
+```
+
+This distinction should survive all the way to observability.
+
+## 362. Timeout Test
+
+A deliberately slow adapter:
+
+```ts
+class SlowAdapter implements SourceAdapter {
+  readonly id = "slow";
+
+  readonly name = "Slow Adapter";
+
+  supports(): boolean {
+    return true;
+  }
+
+  async resolve(_media: MediaRef, ctx: ResolveContext) {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(resolve, 10_000);
+
+      ctx.signal.addEventListener(
+        "abort",
+        () => {
+          clearTimeout(timer);
+
+          reject(ctx.signal.reason ?? new Error("aborted"));
+        },
+        { once: true }
+      );
+    });
+
+    return [];
+  }
+}
+```
+
+Then:
+
+```ts
+it("propagates timeout cancellation", async () => {
+  const controller = new AbortController();
+
+  const promise = withTimeout(
+    signal => slowOperation(signal),
+    20,
+    controller.signal
+  );
+
+  await expect(promise).rejects.toThrow();
+});
+```
+
+This is a real runtime invariant:
+
+```text
+deadline exceeded
+       ↓
+AbortSignal
+       ↓
+adapter
+       ↓
+underlying operation
+```
+
+## 363. Semaphore Test
+
+The concurrency test should measure actual overlap.
+
+```ts
+it("never exceeds configured concurrency", async () => {
+  const limiter = new Semaphore(2);
+
+  let active = 0;
+  let maximum = 0;
+
+  const task = async () => {
+    await limiter.run(async () => {
+      active++;
+
+      maximum = Math.max(maximum, active);
+
+      await delay(20);
+
+      active--;
+    });
+  };
+
+  await Promise.all(Array.from({ length: 10 }, () => task()));
+
+  expect(maximum).toBeLessThanOrEqual(2);
+});
+```
+
+The test isn't checking an internal queue.
+
+It checks the actual observable invariant:
+
+```text
+maximum simultaneous operations ≤ capacity
+```
+
+## 364. Circuit Breaker Tests
+
+Three fundamental tests:
+
+```text
+CLOSED
+  ↓
+repeated failures
+OPEN
+```
+
+```text
+OPEN
+  ↓
+cooldown
+HALF_OPEN
+```
+
+```text
+HALF_OPEN + success
+  ↓
+CLOSED
+```
+
+And:
+
+```text
+HALF_OPEN + failure
+  ↓
+OPEN
+```
+
+Example:
+
+```ts
+it("opens after the configured failure threshold", async () => {
+  const breaker = new CircuitBreaker({
+    failureThreshold: 3,
+    cooldownMs: 100
+  });
+
+  await expect(
+    breaker.execute(() => Promise.reject(new Error("x")))
+  ).rejects.toThrow();
+
+  await expect(
+    breaker.execute(() => Promise.reject(new Error("x")))
+  ).rejects.toThrow();
+
+  await expect(
+    breaker.execute(() => Promise.reject(new Error("x")))
+  ).rejects.toThrow();
+
+  expect(breaker.state).toBe("open");
+});
+```
+
+## 365. Adapter Conformance
+
+Instead of writing bespoke tests for every source:
+
+```ts
+describeSourceAdapter(() => new FixtureAdapter());
+```
+
+Every future adapter must pass:
+
+```text
+                    SourceAdapter
+                          │
+           ┌──────────────┼──────────────┐
+           ▼              ▼              ▼
+       identity       capabilities     runtime
+           │              │              │
+           └──────────────┼──────────────┘
+                          ▼
+                   conformance suite
+```
+
+The suite eventually verifies:
+
+```text
+stable ID
+capability declaration
+supported media types
+cancellation
+timeout
+malformed response handling
+authorization semantics
+provenance
+determinism
+```
+
+This turns adapter development into a contract rather than a
+collection of conventions.
+
+## 366. Manifest Test
+
+```ts
+describe("manifest", () => {
+  it("declares the stream capability", () => {
+    const manifest = createManifest();
+
+    expect(manifest.resources).toEqual([
+      {
+        name: "stream",
+        types: ["movie", "series"],
+        idPrefixes: ["tt"]
+      }
+    ]);
+  });
+
+  it("does not advertise unsupported resources", () => {
+    const manifest = createManifest();
+
+    expect(manifest.resources).not.toContainEqual(
+      expect.objectContaining({
+        name: "catalog"
+      })
+    );
+  });
+});
+```
+
+This protects against a dangerous class of drift:
+
+```text
+manifest says supported
+        ↓
+implementation doesn't exist
+```
+
+A capability must not be advertised before it is actually implemented.
+
+## 367. Protocol Handler Test
+
+```ts
+describe("stream handler", () => {
+  it("maps candidates into Stremio streams", async () => {
+    const resolver = fakeResolver({
+      media: {
+        type: "movie",
+        id: "tt1234567"
+      },
+
+      status: "success",
+
+      candidates: [
+        {
+          sourceId: "source-a",
+          media: {
+            type: "movie",
+            id: "tt1234567"
+          },
+          url: "https://example.test/movie.mp4",
+          mediaInfo: {
+            resolution: "1080p",
+            container: "mp4"
+          },
+          provenance: {
+            adapterId: "source-a",
+            observedAt: "2026-09-28T00:00:00.000Z"
+          },
+          capabilities: {
+            directPlayback: true
+          },
+          authorization: {
+            status: "authorized",
+            basis: "test"
+          }
+        }
+      ],
+
+      failures: [],
+      sourceCount: 1,
+      durationMs: 1
+    });
+
+    const handler = createStreamHandler(resolver);
+
+    const result = await handler({
+      type: "movie",
+      id: "tt1234567"
+    });
+
+    expect(result).toEqual({
+      streams: [
+        {
+          name: "source-a",
+          title: "1080p · mp4",
+          url: "https://example.test/movie.mp4"
+        }
+      ]
+    });
+  });
+});
+```
+
+Now we have tested the presentation boundary independently of the
+source implementation.
+
+## 368. HTTP-Level Test
+
+The next layer must start the actual addon interface.
+
+Conceptually:
+
+```text
+test
+ │
+ ▼
+HTTP server
+ │
+ ├── GET /manifest.json
+ │
+ └── GET /stream/movie/tt1234567.json
+```
+
+The test should verify:
+
+```ts
+const manifestResponse = await fetch(`${baseUrl}/manifest.json`);
+
+expect(manifestResponse.status).toBe(200);
+
+const manifest = await manifestResponse.json();
+
+expect(manifest.id).toBe("org.authorized.sourceaggregator");
+```
+
+Then:
+
+```ts
+const response = await fetch(`${baseUrl}/stream/movie/tt1234567.json`);
+
+expect(response.status).toBe(200);
+
+const body = await response.json();
+
+expect(body.streams).toHaveLength(1);
+```
+
+This is the first test that proves the HTTP boundary.
+
+## 369. Important: Do Not Test Only the Handler
+
+This:
+
+```text
+handler()
+```
+
+can pass while:
+
+```text
+HTTP routing
+SDK registration
+manifest serialization
+server startup
+```
+
+is broken.
+
+Therefore:
+
+```text
+                 UNIT
+                   │
+            ┌──────┴──────┐
+            ▼             ▼
+         handler        resolver
+            │             │
+            └──────┬──────┘
+                   ▼
+               INTEGRATION
+                   │
+                   ▼
+               HTTP server
+                   │
+                   ▼
+              protocol test
+```
+
+Both layers are required.
+
+## 370. Health Endpoints Are Separate
+
+The application should expose:
+
+```text
+GET /health/live
+GET /health/ready
+```
+
+but these are **deployment endpoints**, not Stremio protocol resources.
+
+```text
+Stremio
+  │
+  ├── /manifest.json
+  └── /stream/...
+
+Orchestrator
+  │
+  ├── /health/live
+  └── /health/ready
+```
+
+Do not put health information into the Stremio manifest.
+
+## 371. Liveness
+
+Liveness answers:
+
+Is the process alive?
+
+Minimal response:
+
+```json
+{
+  "status": "ok"
+}
+```
+
+It should not require:
+
+```text
+source A
+source B
+database
+external API
+```
+
+Otherwise a dependency outage can cause a healthy process to be
+restarted unnecessarily.
+
+## 372. Readiness
+
+Readiness answers:
+
+Should this process receive traffic?
+
+For v0.1:
+
+```text
+configuration valid
++ application initialized
++ registry constructed
+= ready
+```
+
+Optional source outages should not necessarily make the whole addon
+unready.
+
+Again:
+
+```text
+source unhealthy ≠ application unhealthy
+```
+
+## 373. Observability Contract
+
+Every request gets:
+
+```text
+request_id
+```
+
+Example:
+
+```text
+req_01J8...
+```
+
+Then:
+
+```text
+request
+  │
+  ├── parse
+  ├── identity
+  ├── route
+  ├── source-a
+  ├── source-b
+  ├── validate
+  ├── authorize
+  ├── dedupe
+  ├── rank
+  └── present
+```
+
+All events carry the same request ID.
+
+This gives us causal reconstruction:
+
+```text
+request_id
+    ↓
+all events
+    ↓
+resolution history
+```
+
+without pretending the final dashboard is itself the source of truth.
+
+## 374. Structured Logging
+
+Use structured events:
+
+```ts
+logger.info(
+  {
+    requestId,
+    media,
+    sourceId,
+    candidateCount,
+    durationMs
+  },
+  "source resolution completed"
+);
+```
+
+Avoid logs like:
+
+```text
+"source worked!"
+```
+
+because they discard machine-readable semantics.
+
+The log should answer:
+
+```text
+WHO?
+WHAT?
+WHEN?
+WHICH SOURCE?
+WHICH MEDIA?
+HOW LONG?
+WHAT OUTCOME?
+```
+
+## 375. Metrics
+
+Derived metrics can include:
+
+```text
+resolution_requests_total
+resolution_success_total
+resolution_empty_total
+resolution_partial_total
+resolution_failed_total
+
+source_requests_total{source}
+source_failures_total{source}
+source_timeouts_total{source}
+
+resolution_duration_ms
+source_duration_ms
+
+circuit_open_total{source}
+```
+
+But remember:
+
+```text
+metrics = derived observations
+```
+
+not canonical evidence.
+
+The event ledger remains the more fundamental fact layer.
+
+## 376. Request Lifecycle
+
+The full lifecycle now becomes:
+
+```text
+┌─────────────────────────────────────────────┐
+│               STREMIO REQUEST               │
+└──────────────────────┬──────────────────────┘
+                       ▼
+                     PARSE
+                       │
+                       ▼
+                  CANONICALIZE
+                       │
+                       ▼
+                    IDENTITY
+                       │
+                       ▼
+                     ROUTE
+                       │
+                       ▼
+                SOURCE SELECTION
+                       │
+                       ▼
+                   CONCURRENCY
+                       │
+                       ▼
+                    EXECUTE
+                       │
+                       ▼
+                   NORMALIZE
+                       │
+                       ▼
+                    VALIDATE
+                       │
+                       ▼
+                   AUTHORIZE
+                       │
+                       ▼
+                   DEDUPLICATE
+                       │
+                       ▼
+                     RANK
+                       │
+                       ▼
+                     CACHE
+                       │
+                       ▼
+                   PRESENT
+                       │
+                       ▼
+                     STREMIO
+```
+
+And the evidence stream runs alongside it:
+
+```text
+                       ┌───────────────┐
+                        │ Evidence/Event│
+                        │    Ledger     │
+                        └───────▲───────┘
+                                │
+                      every meaningful transition
+                                │
+                  ──────────────┘
+```
+
+## 377. First Release Gate
+
+At this point the v0.1 gate can be formalized:
+
+```text
+GATE-V0.1-S1
+```
+
+### Contract
+
+```text
+[ ] package installs reproducibly
+[ ] TypeScript typecheck passes
+[ ] domain tests pass
+[ ] resolver tests pass
+[ ] runtime tests pass
+[ ] adapter conformance passes
+[ ] manifest test passes
+[ ] stream handler test passes
+[ ] HTTP integration test passes
+[ ] fixture adapter passes
+[ ] unauthorized candidate is rejected
+[ ] empty result is represented correctly
+[ ] partial result is represented correctly
+[ ] ranking is deterministic
+[ ] deduplication is deterministic
+[ ] cancellation works
+[ ] concurrency bound works
+[ ] circuit breaker works
+[ ] health endpoints work
+```
+
+Only then:
+
+```text
+GATE-V0.1-S1 = PASSED
+```
+
+But until those commands actually execute in CI:
+
+```text
+GATE-V0.1-S1 = OPEN
+```
+
+That distinction remains mandatory.
+
+## 378. CI Becomes the Authority
+
+The workflow should eventually be:
+
+```yaml
+name: conformance
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+```
+
+Then:
+
+```text
+developer inspection
+       ↓
+diagnostic evidence
+
+CI execution
+       ↓
+verification authority
+```
+
+A green editor is not a release gate.
+
+A successful local command is useful evidence, but the project rule
+remains:
+
+**CI is execution authority.**
+
+## 379. Container Gate
+
+After CI passes:
+
+```text
+source tree
+    ↓
+npm ci
+    ↓
+build
+    ↓
+dist/
+    ↓
+runtime image
+```
+
+The final image should contain only what the runtime needs.
+
+Conceptually:
+
+```dockerfile
+FROM node:22-alpine AS build
+
+WORKDIR /app
+
+COPY package*.json ./
+
+RUN npm ci
+
+COPY tsconfig.json ./
+COPY src ./src
+
+RUN npm run build
+
+
+FROM node:22-alpine AS runtime
+
+WORKDIR /app
+
+ENV NODE_ENV=production
+
+COPY package*.json ./
+
+RUN npm ci --omit=dev
+
+COPY --from=build /app/dist ./dist
+
+USER node
+
+EXPOSE 7000
+
+CMD ["node", "dist/index.js"]
+```
+
+The build environment and runtime environment are therefore separate.
+
+## 380. Artifact Identity
+
+After the image is built:
+
+```text
+image
+    ↓
+digest
+```
+
+Example form:
+
+```text
+sha256:<digest>
+```
+
+The release record should bind:
+
+```text
+source commit
+    + package lock
+    + build
+    + container digest
+```
+
+into one release identity.
+
+Conceptually:
+
+```text
+Git commit
+    + package-lock.json
+    + CI run
+    + container digest
+    ↓
+ARTIFACT IDENTITY
+```
+
+That is the beginning of:
+
+```text
+ARTIFACT_BOUND
+```
+
+## 381. What We Still Must Not Claim
+
+At this stage, even with the complete test suite designed, we cannot
+claim:
+
+```text
+"production ready"
+"works with all Stremio clients"
+"aggregates many providers"
+"has reliable streaming"
+"has real source coverage"
+```
+
+without corresponding evidence.
+
+Current honest status:
+
+```text
+Architecture             DESIGNED
+Contracts                DEFINED
+Implementation plan      COMPLETE
+SDK boundary             VERIFIED
+Tests                    SPECIFIED
+Execution                OPEN
+CI                       OPEN
+Container                OPEN
+Real adapter             OPEN
+Release artifact         OPEN
+```
+
+## 382. The Next Major Expansion
+
+Once `GATE-V0.1-S1` actually passes, the architecture should expand in
+this order:
+
+```text
+                    V0.1
+                      │
+                      ▼
+              Fixture vertical slice
+                      │
+                      ▼
+             ┌─────────────────┐
+             │ Identity Layer  │
+             └────────┬────────┘
+                      │
+                      ▼
+             ┌─────────────────┐
+             │ Source Admission│
+             └────────┬────────┘
+                      │
+                      ▼
+             ┌─────────────────┐
+             │ Real Authorized │
+             │    Adapter      │
+             └────────┬────────┘
+                      │
+           ┌──────────┼──────────┐
+           ▼          ▼          ▼
+        Metadata    Subtitles   Catalog
+           │          │          │
+           └──────────┼──────────┘
+                      ▼
+               Persistent Cache
+                      │
+                      ▼
+               Evidence Ledger
+                      │
+                      ▼
+              Multi-instance Runtime
+```
+
+The crucial change is that **real source integration comes before
+source proliferation**.
+
+One properly admitted adapter gives us a meaningful proof of the
+adapter contract.
+
+Twenty poorly characterized adapters merely multiply uncertainty.
+
+## 383. Current Architecture After the Conformance Layer
+
+```text
+                          STREMIO
+                              │
+                              ▼
+                     ┌────────────────┐
+                     │ Protocol Layer │
+                     └───────┬────────┘
+                             │
+                             ▼
+                     ┌────────────────┐
+                     │   Application  │
+                     │    Resolver    │
+                     └───────┬────────┘
+                             │
+           ┌─────────────────┼──────────────────┐
+           ▼                 ▼                  ▼
+      Identity           Routing            Runtime
+           │                 │                  │
+           │          ┌──────┴──────┐           │
+           │          ▼             ▼           │
+           │       Admission      Health        │
+           │          │             │           │
+           └──────────┼─────────────┼───────────┘
+                      ▼             ▼
+                   ADAPTERS     CIRCUITS
+                      │
+                      ▼
+               Source Candidates
+                      │
+                      ▼
+               ┌──────────────┐
+               │  Validate    │
+               └──────┬───────┘
+                      ▼
+               ┌──────────────┐
+               │ Authorize    │
+               └──────┬───────┘
+                      ▼
+               ┌──────────────┐
+               │ Deduplicate  │
+               └──────┬───────┘
+                      ▼
+               ┌──────────────┐
+               │    Rank      │
+               └──────┬───────┘
+                      ▼
+               ┌──────────────┐
+               │ Presentation │
+               └──────┬───────┘
+                      ▼
+                    STREMIO
+```
+
+And underneath the entire graph:
+
+```text
+               ┌──────────────────────┐
+                │ Evidence / Receipts  │
+                └──────────────────────┘
+```
+
+This is the point where the project stops being merely a "Stremio
+addon with multiple sources" and becomes a **governed
+source-resolution system with a Stremio protocol adapter**.
+
+The next block is the **identity layer**: canonical media,
+IMDb/TMDB/TVDB mappings, `NOT_FOUND` vs `NOT_RESOLVED` vs `AMBIGUOUS`,
+identity-provider adapters, cache semantics, and the routing algorithm
+that prevents an adapter from being queried when the identity evidence
+is insufficient.
