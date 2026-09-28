@@ -12485,3 +12485,1274 @@ ARTIFACT_BOUND
 The next step is therefore **324: turn this blueprint into the actual
 repository files and run the first conformance gate**, rather than
 adding more architecture.
+
+## 324. SDK Contract Correction — Verified Against Current Stremio Documentation
+
+There is one important correction to the previous blueprint.
+
+The current Stremio Node SDK uses:
+
+```text
+addonBuilder(...)
+builder.defineStreamHandler(...)
+builder.getInterface()
+serveHTTP(...)
+```
+
+— not the hypothetical `builder.defineAddon()` / `serveHTTP(addon)`
+composition shown earlier. The official SDK documentation confirms this
+interface.
+
+So the executable composition root should use the actual SDK boundary.
+
+## 325. Concrete `src/index.ts`
+
+```ts
+import { addonBuilder, serveHTTP } from "stremio-addon-sdk";
+
+import { createManifest } from "./addon/manifest.js";
+import { createStreamHandler } from "./addon/stream-handler.js";
+
+import { Resolver } from "./application/resolver.js";
+import { SourceRegistry } from "./adapters/registry.js";
+import { FixtureAdapter } from "./adapters/fixture/adapter.js";
+
+import { loadConfig } from "./config/config.js";
+
+const config = loadConfig();
+
+const registry = new SourceRegistry();
+
+registry.register(new FixtureAdapter());
+
+const resolver = new Resolver(registry, {
+  timeoutMs: config.sourceTimeoutMs,
+  preferredLanguages: config.preferredLanguages
+});
+
+const builder = new addonBuilder(createManifest());
+
+builder.defineStreamHandler(createStreamHandler(resolver));
+
+const addonInterface = builder.getInterface();
+
+serveHTTP(addonInterface, {
+  port: config.port
+});
+```
+
+This gives us a real composition root:
+
+```text
+index.ts
+                    │
+       ┌────────────┼─────────────┐
+       ▼            ▼             ▼
+    config       registry       resolver
+                    │             │
+                    ▼             │
+             FixtureAdapter ◄──────┘
+                                  │
+                                  ▼
+                           Stremio handler
+                                  │
+                                  ▼
+                           addonBuilder
+                                  │
+                                  ▼
+                            serveHTTP()
+```
+
+The SDK remains confined to `addon/` plus the composition root.
+
+## 326. Manifest — Actual SDK Shape
+
+The official protocol requires a manifest containing at least `id`,
+`version`, `name`, `description`, `resources`, and `types`. Resources
+may be strings or detailed objects.
+
+For our first stream-only slice:
+
+```ts
+export function createManifest() {
+  return {
+    id: "org.authorized.sourceaggregator",
+    version: "0.1.0",
+
+    name: "Authorized Source Aggregator",
+
+    description: "Aggregates playback streams from explicitly authorized sources.",
+
+    resources: [
+      {
+        name: "stream",
+        types: ["movie", "series"],
+        idPrefixes: ["tt"]
+      }
+    ],
+
+    types: ["movie", "series"],
+
+    idPrefixes: ["tt"],
+
+    catalogs: []
+  };
+}
+```
+
+This is significant because:
+
+```text
+idPrefixes: ["tt"]
+```
+
+means the first implementation integrates naturally with IMDb/Cinemeta
+IDs rather than inventing a second identity namespace. The Stremio
+documentation explicitly describes this pattern for stream-only
+addons.
+
+## 327. Protocol Surface v0.1
+
+The actual initial surface is therefore:
+
+```text
+GET /manifest.json
+
+GET /stream/movie/tt1234567.json
+
+GET /stream/series/tt1234567:2:7.json
+```
+
+No:
+
+```text
+/catalog
+/meta
+/subtitles
+```
+
+yet.
+
+This is intentional.
+
+The protocol itself supports all four resource classes — catalog, meta,
+stream, and subtitles — but an addon only needs at least one resource.
+
+## 328. Why IMDb IDs Are Useful Here
+
+For a stream-only addon:
+
+```text
+Stremio/Cinemeta
+       │
+       │ canonical IMDb ID
+       ▼
+tt1234567
+       │
+       ▼
+our addon
+       │
+       ├── source A
+       ├── source B
+       └── source C
+```
+
+We don't need to duplicate metadata merely to attach streams to an
+existing Cinemeta item.
+
+The SDK documentation explicitly describes this model: an addon
+declaring `tt` stream IDs can provide streams for Cinemeta items
+without implementing its own metadata resource.
+
+That means:
+
+```text
+META AUTHORITY
+     │
+     ▼
+Cinemeta / Stremio ecosystem
+
+STREAM AUTHORITY
+     │
+     ▼
+our addon
+```
+
+This is a cleaner separation.
+
+## 329. Series Identity
+
+For IMDb series, the SDK documents the video ID format:
+
+```text
+tt0898266:9:17
+```
+
+meaning:
+
+```text
+series:
+  id      = tt0898266
+  season  = 9
+  episode = 17
+```
+
+Our parser therefore has a direct protocol mapping:
+
+```text
+tt0898266:9:17
+       │
+       ▼
+{
+    type: "series",
+    id: "tt0898266",
+    season: 9,
+    episode: 17
+}
+```
+
+No adapter should receive the raw string.
+
+## 330. Stream Response Contract
+
+The external response remains extremely small:
+
+```json
+{
+  "streams": [
+    {
+      "name": "authorized-fixture",
+      "title": "1080p · mp4",
+      "url": "https://media.example.test/movie.mp4"
+    }
+  ]
+}
+```
+
+The Stremio protocol defines `streams` as the stream-result collection
+and `url` as a stream location.
+
+Internally, however, we retain much more information:
+
+```text
+SourceCandidate
+ ├── sourceId
+ ├── media
+ ├── url
+ ├── mediaInfo
+ ├── language
+ ├── provenance
+ ├── capabilities
+ └── authorization
+```
+
+Therefore:
+
+```text
+internal evidence model
+        ≠
+Stremio presentation model
+```
+
+This is exactly the semantic boundary we want.
+
+## 331. `src/config/config.ts`
+
+Configuration should be explicit and validated at startup.
+
+```ts
+import { z } from "zod";
+
+const ConfigSchema = z.object({
+  PORT: z.coerce.number().int().min(1).max(65535).default(7000),
+
+  SOURCE_TIMEOUT_MS: z.coerce.number().int().positive().default(5000),
+
+  PREFERRED_LANGUAGES: z.string().default("en")
+});
+
+export interface Config {
+  port: number;
+  sourceTimeoutMs: number;
+  preferredLanguages: readonly string[];
+}
+
+export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
+  const parsed = ConfigSchema.parse(env);
+
+  return {
+    port: parsed.PORT,
+    sourceTimeoutMs: parsed.SOURCE_TIMEOUT_MS,
+    preferredLanguages: parsed.PREFERRED_LANGUAGES.split(",")
+      .map(value => value.trim())
+      .filter(Boolean)
+  };
+}
+```
+
+This gives:
+
+```text
+environment
+    ↓
+schema
+    ↓
+validated configuration
+    ↓
+application
+```
+
+rather than allowing arbitrary environment variables to leak throughout
+the application.
+
+## 332. Configuration Is Not Policy
+
+An important distinction:
+
+```text
+SOURCE_TIMEOUT_MS=5000
+```
+
+is configuration.
+
+But:
+
+```text
+authorization.status === "authorized"
+```
+
+is policy.
+
+Therefore:
+
+```text
+configuration
+≠
+authorization
+```
+
+Changing a timeout must never accidentally alter whether a source is
+permitted.
+
+## 333. Runtime Timeout
+
+The adapter context should receive an actual deadline.
+
+```ts
+export interface ResolveContext {
+  readonly signal: AbortSignal;
+  readonly timeoutMs: number;
+  readonly preferredLanguages: readonly string[];
+}
+```
+
+The resolver should create a bounded operation:
+
+```ts
+export async function withTimeout<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  timeoutMs: number,
+  parentSignal?: AbortSignal
+): Promise<T> {
+  const controller = new AbortController();
+
+  const timeout = setTimeout(() => {
+    controller.abort(new Error("operation timed out"));
+  }, timeoutMs);
+
+  const onAbort = () => {
+    controller.abort(parentSignal?.reason);
+  };
+
+  parentSignal?.addEventListener("abort", onAbort, { once: true });
+
+  try {
+    return await operation(controller.signal);
+  } finally {
+    clearTimeout(timeout);
+
+    parentSignal?.removeEventListener("abort", onAbort);
+  }
+}
+```
+
+Now cancellation has a real propagation path:
+
+```text
+Stremio request
+      │
+      ▼
+application
+      │
+      ▼
+resolver
+      │
+      ▼
+adapter
+      │
+      ▼
+HTTP request
+```
+
+An upstream cancellation must be capable of reaching the bottom.
+
+## 334. Caller Cancellation vs Shared Work
+
+This becomes important once in-flight deduplication is enabled.
+
+Suppose:
+
+```text
+Request A ─┐
+           ├── shared resolution
+Request B ─┘
+```
+
+Then:
+
+```text
+A cancels
+```
+
+must not automatically mean:
+
+```text
+shared operation cancels
+```
+
+because B may still require it.
+
+The correct model is:
+
+```text
+shared operation
+             /               \
+        subscriber A       subscriber B
+             │                  │
+          cancel             active
+```
+
+The shared operation is cancelled only when:
+
+```text
+active subscribers = 0
+```
+
+This is the next runtime-level correctness requirement.
+
+## 335. In-flight Resolution Object
+
+Instead of:
+
+```ts
+Map<string, Promise<Result>>
+```
+
+we should eventually use:
+
+```ts
+interface InFlight<T> {
+  promise: Promise<T>;
+  controller: AbortController;
+  subscribers: number;
+}
+```
+
+Then:
+
+```text
+acquire(key)
+   ↓
+subscribers++
+
+release(key)
+   ↓
+subscribers--
+
+if subscribers === 0
+   ↓
+abort shared operation
+```
+
+This avoids a subtle cancellation bug.
+
+## 336. Source Health Must Not Become Authorization
+
+Consider:
+
+```text
+Source A:
+  authorization = authorized
+  health = unhealthy
+```
+
+That means:
+
+```text
+authorized
++
+temporarily unavailable
+```
+
+not:
+
+```text
+unauthorized
+```
+
+Likewise:
+
+```text
+authorization = unknown
+health = excellent
+```
+
+must remain:
+
+```text
+not eligible
+```
+
+So the state space is at least:
+
+```text
+AUTHORIZATION
+                ┌───────────────┐
+                │ authorized    │
+                │ unknown       │
+                │ unauthorized  │
+                └───────┬───────┘
+                        │
+                        +
+                     HEALTH
+                        │
+                ┌───────┴────────┐
+                │ healthy        │
+                │ degraded       │
+                │ unhealthy      │
+                │ circuit-open   │
+                └────────────────┘
+```
+
+These dimensions must not collapse into one boolean.
+
+## 337. Circuit Breaker
+
+The runtime state machine remains:
+
+```text
+failures ≥ threshold
+ CLOSED ─────────────────────────► OPEN
+   ▲                                  │
+   │                                  │ cooldown
+   │                                  ▼
+   │                              HALF_OPEN
+   │                                  │
+   │                         ┌────────┴────────┐
+   │                         │                 │
+   │                       success           failure
+   │                         │                 │
+   └─────────────────────────┘                 └──► OPEN
+```
+
+The breaker answers:
+
+> Should we attempt this source now?
+
+It does not answer:
+
+> Is this source authorized?
+
+That distinction should be enforced in code.
+
+## 338. Candidate Pipeline
+
+The actual pipeline is now:
+
+```text
+adapter output
+     │
+     ▼
+STRUCTURAL VALIDATION
+     │
+     ├── invalid → failure
+     │
+     ▼
+AUTHORIZATION
+     │
+     ├── not authorized → failure
+     │
+     ▼
+NORMALIZATION
+     │
+     ▼
+DEDUPLICATION
+     │
+     ▼
+RANKING
+     │
+     ▼
+Stremio mapping
+```
+
+Never:
+
+```text
+adapter
+  ↓
+URL
+  ↓
+Stremio
+```
+
+because that bypasses the evidence and policy layers.
+
+## 339. Candidate Normalization
+
+A useful intermediate type:
+
+```ts
+export interface NormalizedCandidate extends SourceCandidate {
+  canonicalUrl: string;
+}
+```
+
+Normalization:
+
+```ts
+export function normalizeCandidate(
+  candidate: SourceCandidate
+): NormalizedCandidate {
+  const parsed = new URL(candidate.url);
+
+  parsed.hash = "";
+
+  return {
+    ...candidate,
+    canonicalUrl: parsed.toString()
+  };
+}
+```
+
+Then deduplication uses:
+
+```text
+canonicalUrl
+```
+
+rather than raw URL strings.
+
+Example:
+
+```text
+https://example.test/movie.mp4#player
+https://example.test/movie.mp4
+```
+
+becomes one canonical candidate.
+
+## 340. Ranking Must Remain Deterministic
+
+For two otherwise identical candidates:
+
+```text
+A → source-z
+B → source-a
+```
+
+the result cannot depend on:
+
+```text
+Promise completion order
+network latency
+Map insertion order from concurrent execution
+```
+
+Use an explicit comparator:
+
+```ts
+export function compareCandidates(
+  a: SourceCandidate,
+  b: SourceCandidate
+): number {
+  const direct =
+    Number(b.capabilities.directPlayback) -
+    Number(a.capabilities.directPlayback);
+
+  if (direct !== 0) {
+    return direct;
+  }
+
+  const resolution =
+    resolutionValue(b.mediaInfo?.resolution) -
+    resolutionValue(a.mediaInfo?.resolution);
+
+  if (resolution !== 0) {
+    return resolution;
+  }
+
+  const bitrate = (b.mediaInfo?.bitrate ?? 0) - (a.mediaInfo?.bitrate ?? 0);
+
+  if (bitrate !== 0) {
+    return bitrate;
+  }
+
+  return a.sourceId.localeCompare(b.sourceId);
+}
+```
+
+Then:
+
+```ts
+export function rankCandidates(
+  candidates: readonly SourceCandidate[]
+): SourceCandidate[] {
+  return [...candidates].sort(compareCandidates);
+}
+```
+
+## 341. Concurrency Must Be Explicit
+
+If 20 adapters exist:
+
+```text
+20 adapters
+    ↓
+Promise.all(...)
+```
+
+is not automatically acceptable.
+
+It creates:
+
+```text
+20 simultaneous external operations
+```
+
+The runtime needs a bounded semaphore:
+
+```text
+MAX_CONCURRENCY = 5
+
+A B C D E
+│ │ │ │ │
+└─┴─┴─┴─┘
+    ↓
+capacity = 5
+
+F waits
+G waits
+H waits
+...
+```
+
+The limit belongs to the runtime, not individual adapters.
+
+## 342. Source Execution
+
+The resolver should eventually evolve toward:
+
+```ts
+const eligible = routeAdapters(media);
+
+const executions = eligible.map(adapter =>
+  limiter.run(() =>
+    breaker.execute(adapter.id, () =>
+      withTimeout(
+        signal =>
+          adapter.resolve(media, {
+            signal,
+            timeoutMs,
+            preferredLanguages
+          }),
+        timeoutMs,
+        parentSignal
+      )
+    )
+  )
+);
+
+const results = await Promise.allSettled(executions);
+```
+
+`Promise.allSettled()` is particularly important.
+
+We want:
+
+```text
+A fulfilled
+B rejected
+C fulfilled
+D rejected
+```
+
+to become:
+
+```text
+candidates from A + C
+failures from B + D
+```
+
+rather than losing all results because one promise rejected.
+
+## 343. Failure Normalization
+
+Every infrastructure failure should eventually become a domain failure.
+
+```text
+AbortError
+   ↓
+source_aborted
+
+timeout
+   ↓
+source_timeout
+
+HTTP 429
+   ↓
+source_rate_limited
+
+HTTP 500
+   ↓
+source_invalid_response / source_network_error
+   depending on semantics
+
+breaker open
+   ↓
+source_circuit_open
+```
+
+This is where operational reality becomes domain evidence.
+
+## 344. Evidence Event
+
+Every source execution should eventually emit:
+
+```ts
+interface ResolutionEvent {
+  requestId: string;
+  timestamp: string;
+
+  media: MediaRef;
+
+  adapterId: string;
+
+  stage: "selected" | "started" | "completed" | "failed" | "rejected";
+
+  outcome: "success" | "empty" | "partial" | "failure" | "unauthorized";
+
+  durationMs?: number;
+
+  candidateCount?: number;
+
+  failureCode?: FailureCode;
+}
+```
+
+Example:
+
+```json
+{
+  "requestId": "req_01J...",
+  "adapterId": "fixture-authorized",
+  "stage": "completed",
+  "outcome": "success",
+  "candidateCount": 1,
+  "durationMs": 14
+}
+```
+
+This is a fact.
+
+A dashboard such as:
+
+```text
+Source A availability = 99.2%
+```
+
+is a derived view.
+
+That preserves:
+
+```text
+facts
+  ↓
+events
+  ↓
+derived metrics
+```
+
+rather than storing conclusions as if they were observations.
+
+## 345. SSRF Boundary
+
+The moment a real adapter consumes external metadata, the returned URL
+becomes untrusted.
+
+The safe path is:
+
+```text
+remote provider
+      │
+      ▼
+untrusted JSON
+      │
+      ▼
+extract URL
+      │
+      ▼
+URL syntax validation
+      │
+      ▼
+network policy
+      │
+      ├── forbidden
+      │
+      └── allowed
+             │
+             ▼
+          HTTP client
+```
+
+The HTTP client must not simply do:
+
+```ts
+fetch(candidate.url);
+```
+
+because candidate URLs may target:
+
+```text
+127.0.0.1
+localhost
+::1
+private IPv4 ranges
+private IPv6 ranges
+link-local addresses
+cloud metadata endpoints
+internal DNS names
+```
+
+And redirects create a second validation point:
+
+```text
+allowed URL
+   ↓
+redirect
+   ↓
+new URL
+   ↓
+validate again
+```
+
+## 346. No Torrent/Piracy Layer
+
+The multi-source architecture remains deliberately source-neutral but
+authorization-bound.
+
+Permitted adapter classes include:
+
+```text
+user-owned media server
+licensed provider API
+public-domain repository
+explicitly authorized HTTP source
+local filesystem/media server
+organization-controlled storage
+```
+
+The architecture does not include:
+
+```text
+torrent index aggregation
+pirated-content scraping
+DRM bypass
+paywall bypass
+unauthorized provider extraction
+credential theft
+hidden/private APIs
+```
+
+This isn't merely a legal disclaimer; it is an architectural invariant:
+
+```text
+unknown authorization
+      ↓
+REJECT
+```
+
+## 347. What the First Real Adapter Should Look Like
+
+After the fixture adapter passes, the next adapter should be chosen
+according to this contract:
+
+```text
+SOURCE ADMISSION
+
+1. Identity authority documented
+2. API/source terms permit intended use
+3. Authentication mechanism documented
+4. Playback URL acquisition documented
+5. URL ownership/authorization documented
+6. Rate limits known
+7. Failure semantics known
+8. No credential bypass
+9. No DRM circumvention
+10. Adapter conformance tests pass
+```
+
+Only then:
+
+```text
+RawAdapter
+    ↓
+Capability validation
+    ↓
+Authorization validation
+    ↓
+Admission
+    ↓
+Runtime registry
+```
+
+## 348. Metadata Comes After Stream Stability
+
+Once stream resolution is executable, metadata can be added without
+contaminating it.
+
+The future architecture:
+
+```text
+CanonicalMedia
+                      │
+          ┌───────────┼───────────┐
+          ▼           ▼           ▼
+       Streams       Meta      Subtitles
+          │           │           │
+          └───────────┼───────────┘
+                      ▼
+                 Presentation
+                      │
+                      ▼
+                   Stremio
+```
+
+Shared identity, separate capabilities.
+
+That prevents:
+
+```text
+metadata provider unavailable
+        ↓
+stream provider considered unavailable
+```
+
+which would be an unnecessary coupling.
+
+## 349. Catalog Must Be a Separate System
+
+A catalog is not:
+
+```text
+run every stream adapter
+```
+
+Instead:
+
+```text
+CatalogIndex
+    │
+    ├── canonical media
+    ├── title
+    ├── type
+    ├── identities
+    ├── availability facts
+    └── provenance
+```
+
+Then:
+
+```text
+/catalog
+   ↓
+CatalogIndex
+```
+
+while:
+
+```text
+/stream
+   ↓
+Resolver
+   ↓
+SourceAdapters
+```
+
+This avoids turning a simple catalog request into an expensive fan-out
+across every provider.
+
+## 350. Subtitles Follow the Same Candidate Model
+
+Instead of special-casing subtitles:
+
+```ts
+interface SubtitleCandidate {
+  id: string;
+  media: MediaRef;
+
+  url: string;
+
+  language: string;
+
+  format: "srt" | "vtt" | "ass" | "ssa" | "unknown";
+
+  hearingImpaired: boolean;
+
+  provenance: Provenance;
+
+  authorization: Authorization;
+}
+```
+
+Pipeline:
+
+```text
+subtitle adapter
+      ↓
+validate
+      ↓
+authorize
+      ↓
+dedupe
+      ↓
+rank
+      ↓
+Stremio subtitle object
+```
+
+The protocol documentation confirms subtitles are a first-class addon
+resource.
+
+## 351. The Actual Release Ladder
+
+We now have a much cleaner release sequence:
+
+```text
+R0 — Architecture
+     ↓
+R1 — Compileable skeleton
+     ↓
+R2 — Fixture vertical slice
+     ↓
+R3 — CI conformance
+     ↓
+R4 — Local Stremio protocol test
+     ↓
+R5 — Containerized deployment
+     ↓
+R6 — First authorized real adapter
+     ↓
+R7 — Identity resolver
+     ↓
+R8 — Metadata
+     ↓
+R9 — Subtitles
+     ↓
+R10 — Catalog
+     ↓
+R11 — Persistent evidence/cache
+     ↓
+R12 — Multi-instance deployment
+```
+
+Each stage has its own evidence.
+
+## 352. Verification Matrix
+
+| Claim | Evidence required | Current |
+| --- | --- | --- |
+| Manifest conforms | SDK validation + test | OPEN |
+| `/stream` works | integration test | OPEN |
+| Parser handles IMDb movie | unit test | OPEN |
+| Parser handles IMDb episode | unit test | OPEN |
+| Unknown authorization rejected | unit test | OPEN |
+| Dedup deterministic | unit test | OPEN |
+| Ranking deterministic | unit test | OPEN |
+| Timeout cancellation works | runtime test | OPEN |
+| Concurrent requests bounded | runtime test | OPEN |
+| Circuit breaker works | runtime test | OPEN |
+| SDK server starts | execution evidence | OPEN |
+| Stremio client consumes addon | client smoke test | OPEN |
+| Container works | CI execution | OPEN |
+| Real source works | adapter evidence | OPEN |
+| Release artifact reproducible | digest | OPEN |
+
+Therefore the honest state remains:
+
+> IMPLEMENTATION BLUEPRINT — NOT YET EXECUTION-VERIFIED
+
+The current Stremio protocol assumptions themselves are now externally
+verified against the official SDK documentation.
+
+## 353. Next Boundary
+
+The next implementation block should be the actual conformance
+harness, not another abstraction layer:
+
+```text
+test/
+├── addon/
+│   ├── manifest.test.ts
+│   ├── stream-handler.test.ts
+│   └── parser.test.ts
+│
+├── application/
+│   └── resolver.test.ts
+│
+├── resolver/
+│   ├── authorization.test.ts
+│   ├── dedupe.test.ts
+│   ├── ranking.test.ts
+│   └── validation.test.ts
+│
+├── runtime/
+│   ├── timeout.test.ts
+│   ├── semaphore.test.ts
+│   ├── breaker.test.ts
+│   └── inflight.test.ts
+│
+├── adapters/
+│   └── conformance.test.ts
+│
+└── integration/
+    ├── protocol.test.ts
+    └── http.test.ts
+```
+
+The decisive test is not merely:
+
+```text
+"the function returned the expected object"
+```
+
+but:
+
+```text
+Stremio-shaped request
+        ↓
+real SDK interface
+        ↓
+real addon handler
+        ↓
+real HTTP server
+        ↓
+/manifest.json
+        ↓
+/stream/movie/tt1234567.json
+        ↓
+expected protocol response
+```
+
+That is the first point at which we can legitimately say the addon
+executes as a Stremio addon, rather than merely having code that
+appears to implement one.
