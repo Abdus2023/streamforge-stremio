@@ -11632,3 +11632,856 @@ The next step is therefore the **real repository implementation and
 protocol integration test**, followed by the first admitted adapter
 under the source-policy contract — not an uncontrolled collection of
 media sources.
+
+## 308. Implement the First Executable Vertical Slice
+
+The architecture is now sufficiently specified to stop adding
+abstractions and begin implementation.
+
+The first slice should be deliberately narrow:
+
+**Stremio request → parse → identity/capability routing → authorized
+fixture adapter → validate → deduplicate → rank → Stremio stream
+response**
+
+No real third-party media-source scraping yet.
+
+### 308.1 Freeze the first executable contract
+
+```text
+INPUT
+GET /stream/movie/tt1234567.json
+         ↓
+ Stremio parser
+        ↓
+MediaRef {
+  type: "movie",
+  id: "tt1234567"
+}
+         ↓
+ SourceRegistry
+        ↓
+eligible adapters
+         ↓
+ FixtureAdapter
+        ↓
+SourceCandidate[]
+         ↓
+structural validation
+        ↓
+authorization policy
+        ↓
+deduplication
+        ↓
+deterministic ranking
+        ↓
+ Stremio mapper
+         ↓
+{
+  streams: [...]
+}
+```
+
+The key release rule remains:
+
+```text
+NO EXECUTION EVIDENCE
+        ↓
+NO VERIFIED CLAIM
+```
+
+## 309. `src/addon/parser.ts`
+
+The protocol parser should terminate at the domain boundary.
+
+```ts
+import type { MediaRef, MediaType } from "../domain/media.js";
+
+export interface ParsedStreamRequest {
+  media: MediaRef;
+}
+
+export class RequestParseError extends Error {
+  readonly code = "invalid_request";
+
+  constructor(message: string) {
+    super(message);
+    this.name = "RequestParseError";
+  }
+}
+
+export function parseStreamRequest(
+  type: string,
+  rawId: string
+): ParsedStreamRequest {
+  if (type !== "movie" && type !== "series") {
+    throw new RequestParseError(`Unsupported media type: ${type}`);
+  }
+
+  if (!rawId) {
+    throw new RequestParseError("Missing media ID");
+  }
+
+  if (type === "movie") {
+    return {
+      media: {
+        type: "movie",
+        id: rawId
+      }
+    };
+  }
+
+  const parts = rawId.split(":");
+
+  if (parts.length !== 3) {
+    throw new RequestParseError(
+      "Series ID must use <id>:<season>:<episode>"
+    );
+  }
+
+  const [id, seasonRaw, episodeRaw] = parts;
+
+  const season = Number(seasonRaw);
+  const episode = Number(episodeRaw);
+
+  if (
+    !id ||
+    !Number.isInteger(season) ||
+    !Number.isInteger(episode) ||
+    season < 1 ||
+    episode < 1
+  ) {
+    throw new RequestParseError("Invalid series episode identifier");
+  }
+
+  return {
+    media: {
+      type: "series",
+      id,
+      season,
+      episode
+    }
+  };
+}
+```
+
+The important property is that the rest of the application never needs
+to understand:
+
+```text
+tt1234567:2:7
+```
+
+It receives:
+
+```json
+{
+  "type": "series",
+  "id": "tt1234567",
+  "season": 2,
+  "episode": 7
+}
+```
+
+That is the protocol/domain separation boundary.
+
+## 310. `src/application/resolver.ts`
+
+The application layer becomes the orchestration authority.
+
+```ts
+import type { MediaRef } from "../domain/media.js";
+import type { SourceCandidate } from "../domain/candidate.js";
+import type { Failure } from "../domain/failure.js";
+import type { ResolutionResult } from "../domain/result.js";
+
+import type { SourceRegistry } from "../adapters/registry.js";
+import { validateCandidate } from "../resolver/validate.js";
+import { authorizeCandidate } from "../resolver/policy.js";
+import { deduplicateCandidates } from "../resolver/dedupe.js";
+import { rankCandidates } from "../resolver/rank.js";
+
+export interface ResolverOptions {
+  timeoutMs: number;
+  preferredLanguages: readonly string[];
+}
+
+export class Resolver {
+  constructor(
+    private readonly registry: SourceRegistry,
+    private readonly options: ResolverOptions
+  ) {}
+
+  async resolve(
+    media: MediaRef,
+    signal: AbortSignal
+  ): Promise<ResolutionResult> {
+    const started = performance.now();
+
+    const adapters = this.registry
+      .all()
+      .filter(adapter => adapter.supports(media));
+
+    const candidates: SourceCandidate[] = [];
+    const failures: Failure[] = [];
+
+    for (const adapter of adapters) {
+      try {
+        const result = await adapter.resolve(media, {
+          signal,
+          timeoutMs: this.options.timeoutMs,
+          preferredLanguages: this.options.preferredLanguages
+        });
+
+        for (const candidate of result) {
+          const structural = validateCandidate(candidate);
+
+          if (!structural.valid) {
+            failures.push(structural.failure);
+            continue;
+          }
+
+          const authorization = authorizeCandidate(candidate);
+
+          if (!authorization.authorized) {
+            failures.push(authorization.failure);
+            continue;
+          }
+
+          candidates.push(candidate);
+        }
+      } catch (error) {
+        failures.push({
+          code: "source_network_error",
+          sourceId: adapter.id,
+          message: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
+
+    const unique = deduplicateCandidates(candidates);
+    const ranked = rankCandidates(unique);
+
+    const durationMs = performance.now() - started;
+
+    let status: ResolutionResult["status"];
+
+    if (ranked.length > 0 && failures.length === 0) {
+      status = "success";
+    } else if (ranked.length > 0) {
+      status = "partial";
+    } else if (failures.length > 0) {
+      status = "failed";
+    } else {
+      status = "empty";
+    }
+
+    return {
+      media,
+      status,
+      candidates: ranked,
+      failures,
+      sourceCount: adapters.length,
+      durationMs
+    };
+  }
+}
+```
+
+This establishes a critical distinction:
+
+```text
+adapter failure ≠ resolver failure
+```
+
+One source being unavailable should not automatically erase successful
+results from other sources.
+
+## 311. Partial success is first-class
+
+Consider:
+
+```text
+Source A → 2 candidates
+Source B → timeout
+Source C → 1 candidate
+Source D → unauthorized candidate
+```
+
+The resolver should produce:
+
+```text
+status = partial
+
+candidates = 3
+
+failures:
+  B → timeout
+  D → candidate_not_authorized
+```
+
+Not:
+
+```text
+status = failed
+```
+
+And certainly not:
+
+```text
+HTTP 500
+```
+
+The request itself was valid.
+
+This distinction matters operationally:
+
+| Condition | Result |
+| --- | --- |
+| Invalid Stremio request | protocol/application error |
+| Valid request, no sources applicable | empty |
+| Sources queried, none returned | empty |
+| Some sources failed, candidates exist | partial |
+| All sources failed | failed |
+| Candidates returned and accepted | success |
+
+## 312. Protocol handler
+
+`src/addon/stream-handler.ts`:
+
+```ts
+import type { Resolver } from "../application/resolver.js";
+import { parseStreamRequest } from "./parser.js";
+
+export function createStreamHandler(resolver: Resolver) {
+  return async (args: { type: string; id: string }) => {
+    const { media } = parseStreamRequest(args.type, args.id);
+
+    const controller = new AbortController();
+
+    try {
+      const result = await resolver.resolve(media, controller.signal);
+
+      return {
+        streams: result.candidates.map(candidate => ({
+          name: candidate.sourceId,
+          title: buildStreamTitle(candidate),
+          url: candidate.url
+        }))
+      };
+    } finally {
+      controller.abort();
+    }
+  };
+}
+
+function buildStreamTitle(candidate: {
+  mediaInfo?: {
+    resolution?: string;
+    container?: string;
+  };
+}): string {
+  const parts = [];
+
+  if (candidate.mediaInfo?.resolution) {
+    parts.push(candidate.mediaInfo.resolution);
+  }
+
+  if (candidate.mediaInfo?.container) {
+    parts.push(candidate.mediaInfo.container);
+  }
+
+  return parts.join(" · ");
+}
+```
+
+Notice that `ResolutionResult` does **not** escape directly into the
+Stremio API.
+
+The mapper controls that boundary.
+
+## 313. Empty result semantics
+
+A perfectly valid request may result in:
+
+```json
+{
+  "streams": []
+}
+```
+
+That is not necessarily an error.
+
+For example:
+
+```text
+GET /stream/movie/tt1234567.json
+             ↓
+valid IMDb identity
+             ↓
+authorized sources available
+             ↓
+none currently contain the requested media
+             ↓
+streams: []
+```
+
+This is substantially different from:
+
+```text
+malformed request
+```
+
+or:
+
+```text
+internal exception
+```
+
+The distinction should survive logging and metrics.
+
+## 314. The first adapter
+
+The first adapter should remain intentionally boring.
+
+```ts
+import type { SourceAdapter, ResolveContext } from "../interface.js";
+
+import type { MediaRef } from "../../domain/media.js";
+import type { SourceCandidate } from "../../domain/candidate.js";
+
+export class FixtureAdapter implements SourceAdapter {
+  readonly id = "fixture-authorized";
+
+  readonly name = "Authorized Fixture Source";
+
+  supports(media: MediaRef): boolean {
+    return media.type === "movie";
+  }
+
+  async resolve(
+    media: MediaRef,
+    _ctx: ResolveContext
+  ): Promise<SourceCandidate[]> {
+    if (media.id !== "tt1234567") {
+      return [];
+    }
+
+    return [
+      {
+        sourceId: this.id,
+
+        media,
+
+        url: "https://media.example.test/movie.mp4",
+
+        mediaInfo: {
+          container: "mp4",
+          resolution: "1080p",
+          bitrate: 5_000_000
+        },
+
+        language: "en",
+
+        provenance: {
+          adapterId: this.id,
+          observedAt: new Date().toISOString()
+        },
+
+        capabilities: {
+          directPlayback: true
+        },
+
+        authorization: {
+          status: "authorized",
+          basis: "fixture"
+        }
+      }
+    ];
+  }
+}
+```
+
+This URL is deliberately a **test fixture**, not a real media source.
+
+The purpose is to prove the pipeline.
+
+## 315. Registry construction
+
+```ts
+import type { SourceAdapter } from "./interface.js";
+
+export class SourceRegistry {
+  private readonly adapters = new Map<string, SourceAdapter>();
+
+  register(adapter: SourceAdapter): void {
+    if (this.adapters.has(adapter.id)) {
+      throw new Error(`Duplicate source adapter: ${adapter.id}`);
+    }
+
+    this.adapters.set(adapter.id, adapter);
+  }
+
+  get(id: string): SourceAdapter | undefined {
+    return this.adapters.get(id);
+  }
+
+  all(): readonly SourceAdapter[] {
+    return [...this.adapters.values()];
+  }
+}
+```
+
+The registry is deliberately deterministic.
+
+No implicit:
+
+```text
+filesystem scanning
+dynamic imports
+magic discovery
+```
+
+yet.
+
+Those mechanisms introduce another authority surface.
+
+## 316. Application composition root
+
+`src/index.ts` should be the place where dependencies become concrete.
+
+Conceptually:
+
+```ts
+const config = loadConfig();
+
+const registry = new SourceRegistry();
+
+registry.register(new FixtureAdapter());
+
+const resolver = new Resolver(registry, {
+  timeoutMs: config.sourceTimeoutMs,
+  preferredLanguages: config.preferredLanguages
+});
+
+const streamHandler = createStreamHandler(resolver);
+
+const manifest = createManifest();
+
+const addon = builder.defineAddon(manifest).defineStreamHandler(streamHandler);
+
+serveHTTP(addon);
+```
+
+This is the **composition root**.
+
+The domain does not instantiate infrastructure.
+
+## 317. Dependency direction
+
+The resulting dependency graph should be enforced:
+
+```text
+                    ┌──────────────┐
+                     │   Stremio    │
+                     │   Protocol   │
+                     └──────┬───────┘
+                            │
+                            ▼
+                     ┌──────────────┐
+                     │     addon    │
+                     └──────┬───────┘
+                            │
+                            ▼
+                     ┌──────────────┐
+                     │ application  │
+                     └───┬──────┬───┘
+                         │      │
+              ┌──────────┘      └──────────┐
+              ▼                            ▼
+        ┌──────────┐                ┌──────────┐
+        │  domain  │                │ runtime  │
+        └──────────┘                └──────────┘
+              ▲                            ▲
+              │                            │
+        ┌─────┴────────────────────────────┴─────┐
+        │                adapters                 │
+        └────────────────────────────────────────┘
+```
+
+The forbidden direction is:
+
+```text
+domain → Stremio SDK
+domain → HTTP
+domain → filesystem
+domain → database
+domain → logger implementation
+```
+
+## 318. First protocol integration test
+
+The first meaningful integration test should prove the entire chain.
+
+```ts
+it("resolves an authorized fixture through Stremio", async () => {
+  const registry = new SourceRegistry();
+
+  registry.register(new FixtureAdapter());
+
+  const resolver = new Resolver(registry, {
+    timeoutMs: 1_000,
+    preferredLanguages: ["en"]
+  });
+
+  const handler = createStreamHandler(resolver);
+
+  const response = await handler({
+    type: "movie",
+    id: "tt1234567"
+  });
+
+  expect(response.streams).toHaveLength(1);
+
+  expect(response.streams[0]).toMatchObject({
+    name: "fixture-authorized",
+    url: "https://media.example.test/movie.mp4"
+  });
+});
+```
+
+This single test establishes:
+
+```text
+Stremio syntax
+      ↓
+parser
+      ↓
+domain MediaRef
+      ↓
+registry
+      ↓
+adapter
+      ↓
+candidate
+      ↓
+validation
+      ↓
+authorization
+      ↓
+deduplication
+      ↓
+ranking
+      ↓
+Stremio representation
+```
+
+That is the first **vertical proof obligation**.
+
+## 319. Then test the rejection path
+
+The positive test alone is insufficient.
+
+Add:
+
+```text
+authorized candidate
+        → accepted
+
+unknown authorization
+        → rejected
+
+unauthorized candidate
+        → rejected
+
+malformed URL
+        → rejected
+
+duplicate candidate
+        → one candidate
+
+adapter timeout
+        → failure recorded
+
+one adapter fails
+        → other adapters continue
+```
+
+The most important negative test:
+
+```ts
+expect(
+  authorizeCandidate({
+    // ...
+    authorization: {
+      status: "unknown"
+    }
+  }).authorized
+).toBe(false);
+```
+
+This protects the architectural rule:
+
+**Unknown authorization is not authorization.**
+
+## 320. Source adapter conformance suite
+
+Every future adapter should automatically receive the same contract
+tests.
+
+```ts
+export function describeSourceAdapter(createAdapter: () => SourceAdapter) {
+  describe("SourceAdapter contract", () => {
+    it("has a stable ID", () => {
+      const adapter = createAdapter();
+
+      expect(adapter.id).toMatch(/^[a-z0-9][a-z0-9-]*$/);
+    });
+
+    it("has a name", () => {
+      expect(createAdapter().name.length).toBeGreaterThan(0);
+    });
+
+    it("supports() is deterministic", () => {
+      const adapter = createAdapter();
+
+      const media = {
+        type: "movie" as const,
+        id: "tt1234567"
+      };
+
+      expect(adapter.supports(media)).toBe(adapter.supports(media));
+    });
+  });
+}
+```
+
+Later this becomes:
+
+```text
+adapter implementation
+       │
+       ▼
+conformance suite
+       │
+       ├── capability correctness
+       ├── authorization semantics
+       ├── cancellation
+       ├── timeout
+       ├── malformed response handling
+       ├── deterministic identity
+       └── evidence emission
+```
+
+## 321. Important architectural correction
+
+At this point, **do not** add ten source adapters.
+
+That would create:
+
+```text
+many adapters
+       ↓
+uncertain authorization
+       ↓
+uncertain provenance
+       ↓
+uncertain behavior
+       ↓
+large debugging surface
+```
+
+Instead:
+
+```text
+1 fixture adapter
+        ↓
+full pipeline
+        ↓
+CI
+        ↓
+protocol smoke test
+        ↓
+artifact
+        ↓
+digest
+        ↓
+release gate
+        ↓
+first real authorized adapter
+```
+
+This is much closer to the project's evidence model.
+
+## 322. Next gate: executable evidence
+
+The next milestone is no longer architectural.
+
+It is:
+
+```text
+GATE V0.1-S1
+
+[ ] repository compiles
+[ ] typecheck passes
+[ ] unit tests pass
+[ ] integration test passes
+[ ] Stremio manifest endpoint works
+[ ] Stremio stream endpoint works
+[ ] fixture authorization is enforced
+[ ] unauthorized fixture is rejected
+[ ] duplicate candidates collapse
+[ ] ranking is deterministic
+[ ] timeout is observable
+[ ] container builds
+[ ] container starts
+[ ] health endpoint works
+[ ] protocol smoke test passes
+[ ] artifact digest recorded
+```
+
+Only after these are actually executed should the project state change
+from:
+
+```text
+DESIGNED
+```
+
+to:
+
+```text
+IMPLEMENTATION_VERIFIED
+```
+
+and eventually:
+
+```text
+ARTIFACT_BOUND
+```
+
+## 323. Current state
+
+| Layer | State |
+| --- | --- |
+| Stremio protocol model | **DESIGNED** |
+| Domain model | **DESIGNED** |
+| Source contract | **DESIGNED** |
+| Capability model | **DESIGNED** |
+| Authorization boundary | **DESIGNED** |
+| Identity architecture | **DESIGNED** |
+| Resolver pipeline | **IMPLEMENTATION BLUEPRINT** |
+| Fixture adapter | **IMPLEMENTATION BLUEPRINT** |
+| Protocol integration | **IMPLEMENTATION BLUEPRINT** |
+| Real source adapters | **OPEN** |
+| Metadata | **DESIGNED** |
+| Catalog | **DESIGNED** |
+| Subtitles | **DESIGNED** |
+| SSRF policy | **DESIGNED** |
+| Evidence ledger | **DESIGNED** |
+| CI | **DESIGNED** |
+| Actual CI execution | **OPEN** |
+| Release artifact | **NOT ADMITTED** |
+
+The next step is therefore **324: turn this blueprint into the actual
+repository files and run the first conformance gate**, rather than
+adding more architecture.
