@@ -10243,3 +10243,1392 @@ Stremio
 ```
 
 **Current status: PROVISIONAL until actually built and executed.**
+
+## 270. Capability-aware source routing
+
+The next layer should make the registry **semantically aware** rather
+than treating every adapter as interchangeable.
+
+The key distinction is:
+
+```text
+Adapter exists
+    ≠ Adapter admitted
+    ≠ Adapter applicable
+    ≠ Adapter capable
+    ≠ Adapter currently healthy
+    ≠ Adapter returned an eligible candidate
+```
+
+That gives us a much cleaner execution model.
+
+## 271. Capability contract
+
+Add:
+
+```text
+src/adapters/capabilities.ts
+```
+
+```ts
+import type { MediaType } from "../domain/media.js";
+
+export type IdentityKind = "imdb" | "tmdb" | "tvdb" | "internal";
+
+export type AuthorizationMode =
+  | "configured_owned"
+  | "public_domain"
+  | "licensed"
+  | "unknown";
+
+export interface SourceCapabilities {
+  readonly mediaTypes: readonly MediaType[];
+
+  readonly supportsMovies: boolean;
+  readonly supportsSeries: boolean;
+  readonly supportsEpisodes: boolean;
+
+  readonly providesStreams: boolean;
+  readonly providesSubtitles: boolean;
+  readonly providesMetadata: boolean;
+
+  readonly identityKinds: readonly IdentityKind[];
+
+  readonly authorizationMode: AuthorizationMode;
+}
+```
+
+The adapter becomes:
+
+```ts
+export interface SourceAdapter {
+  readonly id: string;
+  readonly name: string;
+
+  readonly capabilities: SourceCapabilities;
+
+  supports(media: MediaRef): boolean;
+
+  resolve(
+    media: MediaRef,
+    ctx: ResolveContext
+  ): Promise<readonly SourceCandidate[]>;
+}
+```
+
+## 272. Why capabilities belong to the adapter
+
+Do not infer capabilities from arbitrary runtime behavior.
+
+Avoid:
+
+```text
+call adapter
+    ↓
+it happens to return subtitles
+    ↓
+therefore adapter supports subtitles
+```
+
+Instead:
+
+```text
+adapter declaration
+        ↓
+capability contract
+        ↓
+admission
+```
+
+This makes routing deterministic.
+
+## 273. Capability validation
+
+Create:
+
+```ts
+export function validateCapabilities(capabilities: SourceCapabilities): void {
+  if (capabilities.mediaTypes.length === 0) {
+    throw new Error("adapter_has_no_media_types");
+  }
+
+  if (
+    capabilities.providesStreams === false &&
+    capabilities.providesSubtitles === false &&
+    capabilities.providesMetadata === false
+  ) {
+    throw new Error("adapter_has_no_capability");
+  }
+
+  if (capabilities.supportsEpisodes && !capabilities.supportsSeries) {
+    throw new Error("episode_support_requires_series");
+  }
+}
+```
+
+This turns inconsistent declarations into startup failures.
+
+## 274. Admission becomes explicit
+
+Introduce:
+
+```ts
+export interface AdapterAdmission {
+  readonly admitted: boolean;
+
+  readonly reasons: readonly string[];
+
+  readonly admittedAt: string;
+}
+```
+
+Then:
+
+```ts
+export function admitAdapter(adapter: SourceAdapter): AdapterAdmission {
+  const reasons: string[] = [];
+
+  try {
+    validateCapabilities(adapter.capabilities);
+  } catch (error) {
+    reasons.push(error instanceof Error ? error.message : String(error));
+  }
+
+  if (adapter.capabilities.authorizationMode === "unknown") {
+    reasons.push("authorization_mode_unknown");
+  }
+
+  return {
+    admitted: reasons.length === 0,
+
+    reasons,
+
+    admittedAt: new Date().toISOString()
+  };
+}
+```
+
+Notice that this is **configuration admission**, not runtime source
+verification.
+
+## 275. Registry becomes an authority boundary
+
+Instead of:
+
+```ts
+registry.register(adapter);
+```
+
+use:
+
+```ts
+registry.register(adapter, admission);
+```
+
+or, preferably:
+
+```ts
+registry.registerAdmitted(admittedAdapter);
+```
+
+where an adapter cannot reach the runtime registry unless admission has
+succeeded.
+
+Conceptually:
+
+```text
+RawAdapter
+    │
+    ▼
+validate
+    │
+    ▼
+admission decision
+    │
+    ├── reject
+    │
+    ▼
+AdmittedAdapter
+    │
+    ▼
+RuntimeRegistry
+```
+
+This is much safer than a boolean flag floating around the
+application.
+
+## 276. Make invalid states harder to represent
+
+We can encode the distinction:
+
+```ts
+export interface AdmittedAdapter {
+  readonly adapter: SourceAdapter;
+  readonly admission: AdapterAdmission & {
+    readonly admitted: true;
+  };
+}
+```
+
+Then:
+
+```ts
+export function admit(adapter: SourceAdapter): AdmittedAdapter {
+  const result = admitAdapter(adapter);
+
+  if (!result.admitted) {
+    throw new Error(`adapter_rejected:${adapter.id}`);
+  }
+
+  return {
+    adapter,
+    admission: result as AdapterAdmission & {
+      admitted: true;
+    }
+  };
+}
+```
+
+The type system now carries an important semantic fact.
+
+## 277. Capability routing
+
+Given:
+
+```ts
+const media: MediaRef = {
+  type: "series",
+  id: "tt1234567",
+  season: 2,
+  episode: 7
+};
+```
+
+we don't want to execute every adapter.
+
+Routing becomes:
+
+```ts
+export function isApplicable(
+  adapter: AdmittedAdapter,
+  media: MediaRef
+): boolean {
+  const { capabilities } = adapter.adapter;
+
+  if (!capabilities.mediaTypes.includes(media.type)) {
+    return false;
+  }
+
+  if (media.type === "movie" && !capabilities.supportsMovies) {
+    return false;
+  }
+
+  if (media.type === "series" && !capabilities.supportsSeries) {
+    return false;
+  }
+
+  if (
+    media.type === "series" &&
+    media.season !== undefined &&
+    media.episode !== undefined &&
+    !capabilities.supportsEpisodes
+  ) {
+    return false;
+  }
+
+  return true;
+}
+```
+
+Now capability mismatch costs **zero provider requests**.
+
+## 278. Identity compatibility
+
+Capabilities also need identity compatibility.
+
+Suppose a provider accepts:
+
+```text
+IMDb
+```
+
+while another requires:
+
+```text
+TMDB
+```
+
+The resolver shouldn't blindly call both.
+
+Represent identity explicitly:
+
+```ts
+export interface CanonicalMedia {
+  readonly canonicalId: string;
+
+  readonly identities: ReadonlyMap<IdentityKind, string>;
+
+  readonly media: MediaRef;
+}
+```
+
+Example:
+
+```text
+canonical
+    │
+    ├── imdb → tt1234567
+    ├── tmdb → 12345
+    └── tvdb → 67890
+```
+
+## 279. Identity resolution
+
+The identity layer becomes:
+
+```text
+Stremio ID
+    │
+    ▼
+CanonicalMedia
+    │
+    ├── IMDb
+    ├── TMDB
+    └── TVDB
+```
+
+Then adapter routing asks:
+
+```text
+adapter.capabilities.identityKinds
+```
+
+rather than guessing.
+
+## 280. Identity failure must be explicit
+
+There are three fundamentally different cases:
+
+```text
+NOT_FOUND
+```
+
+means:
+
+We searched the identity authority and found nothing.
+
+```text
+NOT_RESOLVED
+```
+
+means:
+
+We don't have enough information to establish identity.
+
+```text
+AMBIGUOUS
+```
+
+means:
+
+Multiple candidates remain possible.
+
+Never collapse those into:
+
+```text
+id = undefined
+```
+
+because that destroys evidence.
+
+## 281. Identity graph
+
+The identity subsystem is naturally a graph:
+
+```text
+                 Canonical Media
+                        │
+         ┌──────────────┼──────────────┐
+         ▼              ▼              ▼
+       IMDb            TMDB           TVDB
+         │              │              │
+         └───────┬──────┴──────┬───────┘
+                 │              │
+                 ▼              ▼
+              aliases
+```
+
+The canonical object is not necessarily any one provider's ID.
+
+That's important.
+
+```text
+canonical identity
+    ≠ IMDb identity
+```
+
+## 282. Source routing pipeline
+
+We now get:
+
+```text
+                    MediaRef
+                        │
+                        ▼
+                 IdentityResolver
+                        │
+                        ▼
+                  CanonicalMedia
+                        │
+                        ▼
+                CapabilityRouter
+                        │
+             ┌──────────┼──────────┐
+             ▼          ▼          ▼
+           A            C          F
+        eligible     eligible    rejected
+             │          │
+             ▼          ▼
+          breaker    breaker
+             │          │
+             ▼          ▼
+          execute    execute
+             │          │
+             └────┬─────┘
+                  ▼
+             candidates
+```
+
+This is substantially more efficient than fan-out to everything.
+
+## 283. Source selection policy
+
+Routing should be deterministic.
+
+A useful first policy:
+
+```text
+1. admitted
+2. capability-compatible
+3. identity-compatible
+4. not circuit-open
+5. within concurrency budget
+6. execute
+```
+
+Don't rank sources by subjective quality yet.
+
+First establish **eligibility**.
+
+Then rank returned candidates.
+
+This preserves:
+
+```text
+source selection ≠ candidate ranking
+```
+
+## 284. Candidate ranking is downstream
+
+For example:
+
+```text
+Source A
+    ↓
+1080p candidate
+
+Source B
+    ↓
+720p candidate
+
+Source C
+    ↓
+1080p candidate
+```
+
+Source A isn't automatically "better" because its adapter was
+preferred.
+
+The ranking layer evaluates the actual candidate:
+
+```text
+resolution
+codec
+bitrate
+language
+direct playback
+source reliability
+```
+
+This is a critical separation.
+
+## 285. Reliability becomes measurable
+
+We should eventually maintain:
+
+```ts
+export interface SourceHealth {
+  readonly adapterId: string;
+
+  readonly requests: number;
+  readonly successes: number;
+  readonly empty: number;
+  readonly failures: number;
+
+  readonly timeoutCount: number;
+
+  readonly consecutiveFailures: number;
+
+  readonly latency: Readonly<{
+    p50?: number;
+    p95?: number;
+    p99?: number;
+  }>;
+}
+```
+
+But **health must never silently mutate semantic eligibility**.
+
+For example:
+
+```text
+authorization = authorized
+health = poor
+```
+
+means:
+
+```text
+authorized but currently unhealthy
+```
+
+not:
+
+```text
+unauthorized
+```
+
+## 286. Health state machine
+
+```text
+                 success
+                     │
+                     ▼
+                ┌─────────┐
+           ┌────│ CLOSED  │────┐
+           │    └─────────┘    │
+           │ failure            │
+           │ threshold          │
+           ▼                    │
+       ┌─────────┐              │
+       │  OPEN   │              │
+       └────┬────┘              │
+            │ cooldown          │
+            ▼                   │
+       ┌───────────┐            │
+       │ HALF-OPEN │────────────┘
+       └─────┬─────┘
+             │ failure
+             ▼
+           OPEN
+```
+
+This state machine belongs to runtime health, not source policy.
+
+## 287. In-flight deduplication
+
+There is another important optimization.
+
+Suppose ten Stremio requests arrive simultaneously:
+
+```text
+R1 ─┐
+R2 ─┤
+R3 ─┤
+R4 ─┼──→ same media
+R5 ─┤
+R6 ─┤
+R7 ─┘
+```
+
+Without coordination:
+
+```text
+7 × provider queries
+```
+
+With in-flight deduplication:
+
+```text
+             ┌── R1
+             ├── R2
+             ├── R3
+media ───────┼── R4
+             ├── R5
+             ├── R6
+             └── R7
+                  │
+                  ▼
+             one resolution
+```
+
+## 288. In-flight cache
+
+```ts
+export class Inflight<T> {
+  private readonly active = new Map<string, Promise<T>>();
+
+  getOrCreate(key: string, operation: () => Promise<T>): Promise<T> {
+    const existing = this.active.get(key);
+
+    if (existing) {
+      return existing;
+    }
+
+    const promise = operation();
+
+    this.active.set(key, promise);
+
+    void promise.finally(() => {
+      if (this.active.get(key) === promise) {
+        this.active.delete(key);
+      }
+    });
+
+    return promise;
+  }
+}
+```
+
+One subtle point: callers can cancel their own request without
+necessarily cancelling the shared underlying resolution.
+
+That requires a later distinction between:
+
+```text
+caller cancellation
+```
+
+and:
+
+```text
+shared operation cancellation
+```
+
+## 289. Cache semantics
+
+The cache must not be:
+
+```text
+"whatever was returned last time"
+```
+
+Instead define:
+
+```text
+CacheKey
+CacheValue
+Freshness
+Stale policy
+Invalidation
+Provenance
+```
+
+For example:
+
+```ts
+export interface CacheEntry<T> {
+  readonly value: T;
+
+  readonly createdAt: number;
+  readonly expiresAt: number;
+
+  readonly sourceGeneration?: string;
+}
+```
+
+## 290. Don't cache authorization blindly
+
+This is another important boundary.
+
+You can cache:
+
+```text
+metadata
+```
+
+for relatively long periods.
+
+But an authorization-sensitive candidate may require:
+
+```text
+short TTL
+```
+
+or revalidation.
+
+Otherwise:
+
+```text
+authorized yesterday
+```
+
+could become:
+
+```text
+implicitly authorized forever
+```
+
+through cache persistence.
+
+## 291. Cache layers
+
+A practical hierarchy:
+
+```text
+L1 in-flight
+milliseconds → seconds
+
+L2 memory cache
+seconds → minutes
+
+L3 persistent cache
+minutes → hours/days
+
+L4 external metadata
+provider-dependent
+```
+
+Each layer has different semantics.
+
+Don't call them all simply:
+
+```text
+cache
+```
+
+in diagnostics.
+
+## 292. Stream URLs are special
+
+A returned stream URL may be:
+
+```text
+stable
+```
+
+or:
+
+```text
+expiring
+```
+
+or:
+
+```text
+session-bound
+```
+
+Therefore the candidate model should eventually support:
+
+```ts
+readonly availability?: {
+  readonly expiresAt?: string;
+  readonly requiresRefresh?: boolean;
+};
+```
+
+Then the cache can distinguish:
+
+```text
+candidate cache
+```
+
+from:
+
+```text
+URL cache
+```
+
+Those are not necessarily the same thing.
+
+## 293. Do not proxy streams by default
+
+A Popcorn-Time-like architecture can be tempted to do:
+
+```text
+Stremio
+    ↓
+addon
+    ↓
+download/relay
+    ↓
+user
+```
+
+That introduces:
+
+```text
+bandwidth
+memory
+connection lifecycle
+range requests
+TLS content handling
+abuse surface
+privacy
+legal obligations
+```
+
+The first implementation should instead return eligible direct-playback
+URLs:
+
+```text
+addon
+    ↓
+Stremio
+    ↓
+authorized source
+```
+
+A media proxy should be a separate subsystem requiring an independent
+threat and resource model.
+
+## 294. SSRF boundary
+
+Any future URL-fetching component must assume:
+
+```text
+provider URL = untrusted
+```
+
+Do not permit arbitrary access to:
+
+```text
+127.0.0.1
+localhost
+RFC1918 ranges
+link-local addresses
+cloud metadata endpoints
+Unix sockets
+```
+
+and equivalent IPv6 forms.
+
+The safer architecture is:
+
+```text
+provider response
+       │
+       ▼
+URL parser
+       │
+       ▼
+network policy
+       │
+       ├── deny
+       │
+       ▼
+HTTP client
+```
+
+not:
+
+```ts
+fetch(providerReturnedUrl);
+```
+
+## 295. Redirects are part of SSRF
+
+Even if:
+
+```text
+https://approved.example/
+```
+
+is allowed,
+
+the response could redirect to:
+
+```text
+http://127.0.0.1/
+```
+
+Therefore the policy must be applied **per redirect**.
+
+Conceptually:
+
+```text
+URL₀
+ ↓
+policy
+ ↓
+HTTP
+ ↓
+Location
+ ↓
+policy again
+ ↓
+HTTP
+```
+
+Never treat the initial hostname as sufficient authorization.
+
+## 296. DNS rebinding
+
+Hostname validation alone is insufficient.
+
+A hostile hostname could resolve differently later.
+
+The production network client therefore needs:
+
+```text
+hostname policy
++ DNS resolution policy
++ IP range policy
++ redirect policy
+```
+
+This is another reason not to use the default fetch path blindly for
+arbitrary provider URLs.
+
+## 297. Request identity
+
+Every resolution should have an internal request ID:
+
+```text
+req_01K...
+```
+
+Flow:
+
+```text
+request ID
+   │
+   ├── HTTP
+   ├── resolver
+   ├── adapter A
+   ├── adapter B
+   ├── policy
+   └── response
+```
+
+Then logs can reconstruct the complete request.
+
+## 298. Evidence event
+
+Instead of only logs, define a structured event:
+
+```ts
+export interface ResolutionEvent {
+  readonly requestId: string;
+
+  readonly timestamp: string;
+
+  readonly media: MediaRef;
+
+  readonly adapterId?: string;
+
+  readonly stage:
+    | "request"
+    | "identity"
+    | "routing"
+    | "source"
+    | "validation"
+    | "authorization"
+    | "dedupe"
+    | "ranking"
+    | "response";
+
+  readonly outcome: string;
+
+  readonly durationMs?: number;
+}
+```
+
+This is much closer to an evidence architecture.
+
+## 299. Persist facts, derive views
+
+The same principle applies here.
+
+Persist:
+
+```text
+adapter called
+adapter returned N candidates
+candidate rejected
+candidate admitted
+candidate deduplicated
+candidate ranked
+```
+
+Derive:
+
+```text
+success rate
+provider health
+average latency
+source quality
+```
+
+Don't persist:
+
+```text
+"provider is bad"
+```
+
+as a primitive fact.
+
+That's a derived interpretation.
+
+## 300. Complete aggregation state
+
+The system is now:
+
+```text
+                 REQUEST
+                     │
+                     ▼
+                  PARSE
+                     │
+                     ▼
+                CANONICALIZE
+                     │
+                     ▼
+                 IDENTITY
+                     │
+                     ▼
+                 ROUTING
+                     │
+              ┌──────┼──────┐
+              ▼      ▼      ▼
+              A      B      C
+              │      │      │
+          admission health  health
+              │      │      │
+              └──────┼──────┘
+                     ▼
+                  EXECUTE
+                     │
+                     ▼
+               NORMALIZE
+                     │
+                     ▼
+                VALIDATE
+                     │
+                     ▼
+               AUTHORIZE
+                     │
+                     ▼
+                  DEDUPE
+                     │
+                     ▼
+                  RANK
+                     │
+                     ▼
+                  CACHE
+                     │
+                     ▼
+                 PRESENT
+                     │
+                     ▼
+                  STREMIO
+```
+
+The architecture now has a clean separation between:
+
+```text
+identity
+capability
+admission
+health
+execution
+evidence
+policy
+presentation
+```
+
+## 301. Next milestone: metadata and subtitles
+
+Only after the stream path is stable should we expand the protocol
+surface:
+
+```text
+/manifest.json
+        │
+        ├── /meta
+        │
+        ├── /catalog
+        │
+        ├── /stream
+        │
+        └── /subtitles
+```
+
+But these should share the same canonical identity layer.
+
+The target is:
+
+```text
+                  CanonicalMedia
+                        │
+         ┌──────────────┼──────────────┐
+         ▼              ▼              ▼
+      Metadata        Streams       Subtitles
+         │              │              │
+         ▼              ▼              ▼
+    MetaProvider   SourceAdapter   SubtitleAdapter
+```
+
+rather than three independent implementations of media identity.
+
+## 302. Metadata should be merged, not blindly overwritten
+
+Suppose:
+
+```text
+Provider A:
+title = X
+year = 1999
+poster = A
+
+Provider B:
+title = X
+year = 1999
+poster = B
+
+Provider C:
+description = D
+```
+
+The merger should preserve provenance:
+
+```ts
+interface FieldValue<T> {
+  readonly value: T;
+  readonly source: string;
+  readonly observedAt: string;
+}
+```
+
+Then:
+
+```text
+title
+  ├── A → X
+  └── B → X
+
+poster
+  ├── A → ...
+  └── B → ...
+
+description
+  └── C → ...
+```
+
+Only afterward do we derive:
+
+```text
+display title
+display poster
+display description
+```
+
+Again:
+
+**Persist facts; derive views.**
+
+## 303. Subtitle model
+
+Keep subtitles separate from streams:
+
+```ts
+export interface SubtitleCandidate {
+  readonly id: string;
+
+  readonly media: MediaRef;
+
+  readonly url: string;
+
+  readonly language: string;
+
+  readonly format: "srt" | "vtt" | "ass" | "ssa" | "unknown";
+
+  readonly hearingImpaired?: boolean;
+
+  readonly provenance: {
+    readonly adapter: string;
+    readonly observedAt: string;
+  };
+
+  readonly authorization: {
+    readonly status: "authorized" | "unknown" | "denied";
+  };
+}
+```
+
+This avoids polluting `SourceCandidate` with subtitle-specific
+semantics.
+
+## 304. Subtitle ranking
+
+Possible dimensions:
+
+```text
+language match
+forced/full
+hearing-impaired preference
+format
+provider reliability
+authorization
+```
+
+Again:
+
+```text
+eligibility
+    ↓
+deduplication
+    ↓
+ranking
+```
+
+not one giant function.
+
+## 305. Catalog is a different problem
+
+A catalog is potentially huge.
+
+Do not make:
+
+```text
+/catalog
+```
+
+execute:
+
+```text
+every source adapter
+```
+
+Catalog should have its own authority:
+
+```text
+CatalogIndex
+    │
+    ├── title
+    ├── canonical ID
+    ├── type
+    ├── year
+    └── metadata
+```
+
+Then source availability is queried only after the user selects an
+item.
+
+That produces:
+
+```text
+browse
+    ↓
+catalog
+    ↓
+select
+    ↓
+resolve streams
+```
+
+rather than:
+
+```text
+browse
+    ↓
+resolve thousands of streams
+```
+
+## 306. The resulting system is no longer "a scraper"
+
+Its architecture is now closer to:
+
+```text
+             MEDIA RESOLUTION PLATFORM
+
+┌──────────────────────────────────────────────┐
+│                Stremio API                    │
+└──────────────────────┬───────────────────────┘
+                        │
+┌──────────────────────▼───────────────────────┐
+│             Application Layer                 │
+│ identity / routing / orchestration            │
+└───────────┬───────────────┬──────────────────┘
+            │               │
+      ┌─────▼─────┐   ┌────▼────────┐
+      │   Domain  │   │   Runtime   │
+      │ semantics │   │ reliability │
+      └─────┬─────┘   └────┬────────┘
+            │               │
+            └───────┬───────┘
+                     ▼
+           ┌────────────────────┐
+           │  Adapter Registry  │
+           └─────────┬──────────┘
+                     │
+        ┌────────────┼────────────┐
+        ▼            ▼            ▼
+    Metadata      Streams     Subtitles
+    adapters      adapters     adapters
+        │            │            │
+        └────────────┼────────────┘
+                     ▼
+               External world
+```
+
+The external sources are deliberately kept at the edge.
+
+## 307. Current release state
+
+The architectural state is now:
+
+| Layer | State |
+| --- | --- |
+| Domain model | Defined |
+| Candidate model | Defined |
+| Authorization semantics | Defined |
+| Adapter contract | Defined |
+| Capability contract | Defined |
+| Admission | Defined |
+| Identity architecture | Defined |
+| Routing | Defined |
+| Timeout | Defined |
+| Concurrency | Defined |
+| Circuit breaker | Defined |
+| In-flight dedup | Defined |
+| Candidate validation | Defined |
+| Deduplication | Defined |
+| Ranking | Defined |
+| Stremio mapping | Defined |
+| Manifest | Defined |
+| Stream vertical slice | Defined |
+| Metadata | Designed |
+| Subtitles | Designed |
+| Catalog | Designed |
+| SSRF policy | Designed |
+| Evidence events | Designed |
+| CI gate | Designed |
+| Actual execution evidence | **OPEN** |
+| Real authorized source adapters | **OPEN** |
+| `v0.1.0` release | **NOT ADMITTED** |
+
+The critical boundary remains:
+
+```text
+DESIGNED
+    ≠ IMPLEMENTED
+    ≠ EXECUTED
+    ≠ VERIFIED
+```
+
+The next step is therefore the **real repository implementation and
+protocol integration test**, followed by the first admitted adapter
+under the source-policy contract — not an uncontrolled collection of
+media sources.
