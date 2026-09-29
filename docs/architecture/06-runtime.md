@@ -1576,9 +1576,18 @@ async function readLimited(
 
 ## HTTP failure taxonomy
 
+> **Historical (standalone, not paired with its own `AdapterExecution`),
+> per `ADR-007` (2026-09-29, second session).** This 10-value expansion
+> (adding `http_error`) was not adopted as canonical — the canonical
+> `AdapterStatus` (9 values, without `http_error`) is defined further
+> below in this file's "Source execution status" section and mirrored in
+> [`docs/contracts/result.md`](../contracts/result.md). `http_error` is
+> recorded as a plausible future refinement, not silently discarded.
+
 Expand the previous status model:
 
 ```ts
+// HISTORICAL variant — see note above and docs/contracts/result.md
 export type AdapterStatus =
   | "success"
   | "empty"
@@ -2123,6 +2132,11 @@ export class CircuitBreaker {
 ```
 
 ## Source execution status
+
+> **Canonical source, per `ADR-007` (2026-09-29, second session).** This
+> `AdapterExecution`/`AdapterStatus` pair is mirrored verbatim as the
+> normative contract in
+> [`docs/contracts/result.md`](../contracts/result.md).
 
 ```ts
 export type AdapterStatus =

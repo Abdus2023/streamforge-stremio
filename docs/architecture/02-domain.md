@@ -969,6 +969,16 @@ Human-readable `message` remains diagnostic.
 
 ## Domain: result
 
+> **Canonical source, per `ADR-007` (2026-09-29, second session).** This
+> `ResolutionResult`/`Failure` pair is now mirrored verbatim as the
+> normative contract in
+> [`docs/contracts/result.md`](../contracts/result.md). A competing draft
+> in `docs/architecture/03-resolution.md` (which embeds a full execution
+> ledger instead of `status`/`failures`/`sourceCount`/`durationMs`) is
+> HISTORICAL/SUPERSEDED — see `docs/contracts/result.md` for the boundary
+> rationale (`ResolutionResult` = final outcome, `AdapterExecution[]` =
+> execution-level evidence, never embedded in the result itself).
+
 ```ts
 import type { SourceCandidate } from "./candidate.js";
 import type { Failure } from "./failure.js";

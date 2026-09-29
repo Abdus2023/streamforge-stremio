@@ -733,8 +733,22 @@ First establish deterministic semantics.
 
 ## Resolver
 
+> **Historical/non-normative example.** This sketch predates three later
+> decisions and does not reflect the frozen V0.1 contracts: (1) it calls
+> `resolve()`/`executeAdapter()` with a raw `media: MediaRef` rather than
+> an identity-resolved `CanonicalMedia` (superseded by `ADR-001`); (2) it
+> calls `registry.applicable(media)`, a single-method registry shape
+> superseded by `ADR-006`'s `applicableByMedia`/`applicableByIdentity`;
+> (3) its inline `ResolutionResult` (embedding the full `executions`
+> ledger) is superseded by `ADR-007` — the canonical `ResolutionResult` is
+> defined in [`docs/contracts/result.md`](../contracts/result.md) and does
+> not embed the execution ledger. This block is retained because it is
+> still a useful illustration of the overall pipeline shape (fetch →
+> validate → policy-filter → dedupe → rank), not because its exact types
+> are normative.
+
 ```ts
-// src/resolver/resolver.ts
+// src/resolver/resolver.ts (illustrative only — see note above)
 
 import type { MediaRef } from "../domain/media.js";
 
@@ -754,6 +768,7 @@ import { deduplicate } from "./dedupe.js";
 
 import { rank } from "./rank.js";
 
+// HISTORICAL shape — superseded by docs/contracts/result.md (see ADR-007)
 export interface ResolutionResult {
   readonly media: MediaRef;
 
