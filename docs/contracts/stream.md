@@ -134,19 +134,22 @@ See [`ADR-005`](../decisions/ADR-005-subtitle-v0.1-scope.md) for the full
 reasoning. **No V0.1 implementer needs to read further to build
 `/manifest` or `/stream`.**
 
-## `ResolutionResult` — gap identified, not yet a frozen contract in this file
+## `ResolutionResult` / `AdapterExecution`
 
-`docs/architecture/13-roadmap.md` lists `ResolutionResult` in the V0.1
-`CORE` scope, but it has no canonical home in `docs/contracts/`. Two
-non-identical drafts exist: `docs/architecture/02-domain.md` (`{ media:
-MediaRef, status: ResolutionStatus, candidates, failures, sourceCount,
-durationMs }`) and `docs/architecture/03-resolution.md` (`{ media,
-executions, candidates }`, no `status`/`failures`/`sourceCount`/
-`durationMs`). This gap was identified during the 2026-09-29
-normalization pass but is **not yet resolved** — see `OPEN-12` in
-`docs/decisions/README.md`. Until resolved, an implementer MUST NOT guess
-which draft to use; this is a genuine, unresolved contract-freeze
-blocker, distinct from the subtitle deferral above (which is resolved).
+The canonical request-level outcome and per-adapter execution evidence are
+defined in [`docs/contracts/result.md`](./result.md), which was added by
+ADR-007.
+
+This file intentionally does not redefine those types. The semantic boundary
+is:
+
+```
+ResolutionResult    = final request-level outcome
+AdapterExecution[]  = execution-level evidence used to derive that outcome
+```
+
+The older `ResolutionResult` draft in `docs/architecture/03-resolution.md`
+that embedded `executions` directly is historical/superseded.
 
 ## Binding invariants
 
