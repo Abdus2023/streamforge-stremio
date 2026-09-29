@@ -78,6 +78,13 @@
 
 Don't let external source formats leak into the addon.
 
+> **HISTORICAL / SUPERSEDED.** The `MediaRef` below is an early draft that
+> embeds `imdbId`/`tmdbId` directly on the type. It is superseded by the
+> frozen `MediaRef` in [`../contracts/identity.md`](../contracts/identity.md),
+> which keeps external identifiers in `ExternalIdentity` instead. See
+> `docs/decisions/README.md` (`OPEN-5`, `RESOLVED`). The `SourceCandidate`
+> below is also an early draft — see the note further down for details.
+
 ```ts
 export type MediaType = "movie" | "series";
 
@@ -89,7 +96,16 @@ export interface MediaRef {
   season?: number;
   episode?: number;
 }
+```
 
+> **HISTORICAL / SUPERSEDED.** `capabilities.authorized: boolean` below
+> cannot represent the required `authorized | unknown | denied` tri-state
+> and conflicts with the authorization invariant (see `05-policy.md`).
+> Superseded by the frozen shape in
+> [`../contracts/stream.md`](../contracts/stream.md). See
+> `docs/decisions/README.md` (`OPEN-7`, `RESOLVED`).
+
+```ts
 export interface SourceCandidate {
   sourceId: string;
 
@@ -181,6 +197,12 @@ Use a canonical identity layer:
 
 For example:
 
+> **HISTORICAL / SUPERSEDED.** Earliest `CanonicalMedia` draft — conflates
+> identity with presentation fields (`title`, `year`, `imdbId`, `tmdbId`).
+> Superseded by the frozen shape in
+> [`../contracts/identity.md`](../contracts/identity.md). See
+> `docs/decisions/README.md` (`OPEN-6`, `RESOLVED`).
+
 ```ts
 interface CanonicalMedia {
   imdbId?: string;
@@ -237,6 +259,11 @@ src/domain/
 
 ### `media.ts`
 
+> **HISTORICAL / SUPERSEDED.** Same issue as the other early `MediaRef`
+> drafts — embeds `imdbId`/`tmdbId` directly. See
+> [`../contracts/identity.md`](../contracts/identity.md) and
+> `docs/decisions/README.md` (`OPEN-5`, `RESOLVED`).
+
 ```ts
 export type MediaType = "movie" | "series";
 
@@ -282,6 +309,11 @@ into an episode.
 ## Candidate is not yet a stream
 
 This distinction is fundamental.
+
+> **HISTORICAL.** This intermediate `SourceCandidate` draft matches the
+> frozen field structure but omits the `authorization` block entirely.
+> See [`../contracts/stream.md`](../contracts/stream.md) and
+> `docs/decisions/README.md` (`OPEN-7`).
 
 ```ts
 export interface SourceCandidate {
@@ -346,6 +378,11 @@ authorized = true
 ```
 
 ## Media identity
+
+> **HISTORICAL / SUPERSEDED.** Same issue as the earlier `MediaRef` draft
+> above — embeds `imdbId`/`tmdbId` directly. See
+> [`../contracts/identity.md`](../contracts/identity.md) and
+> `docs/decisions/README.md` (`OPEN-5`, `RESOLVED`).
 
 ```ts
 // src/domain/media.ts
@@ -433,6 +470,12 @@ For Stremio, the catalog/metadata layer should ideally provide a
 stable external identifier before stream resolution.
 
 ## Canonical media identity
+
+> **HISTORICAL / SUPERSEDED.** Embeds `imdbId`/`tmdbId`/`title`/`year`
+> directly rather than a provenance-bearing `identities` array. Superseded
+> by the frozen shape in
+> [`../contracts/identity.md`](../contracts/identity.md). See
+> `docs/decisions/README.md` (`OPEN-6`, `RESOLVED`).
 
 Create:
 
@@ -799,6 +842,11 @@ The project now becomes:
 
 ## Domain: `media.ts`
 
+> **See the normative contract:** [`../contracts/identity.md`](../contracts/identity.md)
+> defines `MediaRef` once, authoritatively. This occurrence matches it
+> exactly and was used as the canonical source when the contract was
+> extracted.
+
 ```ts
 export type MediaType = "movie" | "series";
 
@@ -982,6 +1030,12 @@ TMDB
 The resolver shouldn't blindly call both.
 
 Represent identity explicitly:
+
+> **HISTORICAL / SUPERSEDED.** This intermediate draft represents
+> `identities` as a `ReadonlyMap<IdentityKind, string>`, losing
+> per-identity provenance (`source`, `observedAt`). Superseded by the
+> frozen shape in [`../contracts/identity.md`](../contracts/identity.md).
+> See `docs/decisions/README.md` (`OPEN-6`, `RESOLVED`).
 
 ```ts
 export interface CanonicalMedia {

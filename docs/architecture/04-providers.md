@@ -110,6 +110,14 @@ export interface SourceAdapter {
 
 Context:
 
+> **HISTORICAL / see `docs/decisions/README.md` (`OPEN-9`, `RESOLVED-1`).**
+> This is the only occurrence of `ResolveContext` with `locale`/
+> `userConfig` and non-`readonly` fields. Four later, independent
+> occurrences converged on a smaller, fully-`readonly` shape, which is
+> what [`../contracts/source-adapter.md`](../contracts/source-adapter.md)
+> now freezes. `locale`/`userConfig` are tracked as a possible future
+> extension (`OPEN-9`), not silently dropped.
+
 ```ts
 export interface ResolveContext {
   signal: AbortSignal;
@@ -585,6 +593,13 @@ optional garbage.
 
 ## Source adapter contract changes
 
+> **HISTORICAL.** This section explores a query-object-style
+> `SourceAdapter` (`resolve(query: SourceQuery, ctx)`, `supports(media:
+> CanonicalMedia)`) that differs structurally from the frozen contract in
+> [`../contracts/source-adapter.md`](../contracts/source-adapter.md). Kept
+> for the design rationale; does not supersede the frozen contract. See
+> `docs/decisions/README.md` (`OPEN-8`).
+
 Earlier:
 
 ```ts
@@ -928,6 +943,13 @@ export interface SourceCapabilities {
 ```
 
 The adapter becomes:
+
+> **OPEN — see `docs/decisions/README.md` (`OPEN-8`).** This draft adds
+> `readonly capabilities: SourceCapabilities` to `SourceAdapter`, which the
+> frozen contract in
+> [`../contracts/source-adapter.md`](../contracts/source-adapter.md) does
+> not have. Whether capability declaration belongs on the frozen adapter
+> contract is an open decision, not yet resolved.
 
 ```ts
 export interface SourceAdapter {
@@ -1361,6 +1383,16 @@ supports(media: CanonicalMedia): boolean;
 But we should not remove the lower-level media check.
 
 A useful contract is:
+
+> **OPEN — see `docs/decisions/README.md` (`OPEN-8`), highest-priority
+> open contract question.** This is the most-evolved `SourceAdapter` shape
+> in the document set: it splits `supportsMedia`/`supportsIdentity` and
+> resolves against an already identity-resolved `CanonicalMedia` rather
+> than a raw `MediaRef`. It was never reconciled with the frozen,
+> `MediaRef`-based contract in
+> [`../contracts/source-adapter.md`](../contracts/source-adapter.md).
+> Do not assume either shape is "the" contract without resolving `OPEN-8`
+> first.
 
 ```ts
 export interface SourceAdapter {
