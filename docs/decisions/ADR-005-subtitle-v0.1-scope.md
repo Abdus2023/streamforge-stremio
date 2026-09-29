@@ -19,7 +19,7 @@ enums), and none was ever marked canonical.
 
 ## Problem
 
-Should V0.1 freeze one of the three `SubtitleCandidate` drafts, or is
+Should V0.1 freeze one of the four `SubtitleCandidate` drafts, or is
 subtitle support out of scope for V0.1 entirely?
 
 ## Observed evidence
@@ -40,7 +40,7 @@ freeze a subtitle contract at all.
 ## Decision
 
 **Subtitles are deferred to V0.2+.** No `SubtitleCandidate` shape is
-frozen in this revision. The three existing drafts remain in
+frozen in this revision. The four existing drafts remain in
 `docs/architecture/02-domain.md` as PROPOSED/EXPLORATORY material for a
 future subtitle contract, explicitly not part of the V0.1 freeze.
 

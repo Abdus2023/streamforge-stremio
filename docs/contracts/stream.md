@@ -127,7 +127,7 @@ V0.1 component requires a frozen subtitle contract, and
 of language codes, not a reference to a subtitle candidate object, so
 nothing in this file's frozen V0.1 shapes depends on it.
 
-The three non-identical `SubtitleCandidate` drafts in
+The four non-identical `SubtitleCandidate` drafts in
 `docs/architecture/02-domain.md` remain as PROPOSED/EXPLORATORY material
 for a future V0.2+ subtitle contract; none is chosen as canonical here.
 See [`ADR-005`](../decisions/ADR-005-subtitle-v0.1-scope.md) for the full

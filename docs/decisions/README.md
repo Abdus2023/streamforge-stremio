@@ -12,19 +12,33 @@ stated decision *and* a stated rationale grounded in repository evidence
 evidence, it stays `OPEN` — see `docs/architecture.md`, "Maintenance
 rules."
 
-Last updated: 2026-09-29 (contract-normalization / pre-freeze audit pass —
-second pass; see "ADR index" below for the 5 ADRs written during this
-pass).
+Last updated: 2026-09-29 (contract-normalization & pre-freeze execution
+pass — third pass; `ADR-006`/`ADR-007` added, `ADR-001` amended, resolving
+`OPEN-11`/`OPEN-12`/`OPEN-13`; `OPEN-14` newly recorded, non-blocking; a
+stale "three `SubtitleCandidate` drafts" wording (should be four, per
+`ADR-005`'s own corrected count) fixed in `ADR-005` and
+`docs/contracts/stream.md`; see "ADR index" below for all 7 ADRs).
+
+**Freeze-gate verdict as of this pass:** only `OPEN-9`, `OPEN-10`, and
+`OPEN-14` remain `OPEN`, and all three are explicitly non-blocking for
+the V0.1 CORE/RUNTIME/PROVIDER scope named in
+`docs/architecture/13-roadmap.md`. No `OPEN` item blocks
+`CONTRACT_FREEZE` as of this revision — see
+`docs/architecture/documentation-audit.md` §7 for the itemized
+resolution of each previously-blocking item (`OPEN-11`, `OPEN-12`,
+`OPEN-13`).
 
 ## ADR index
 
 | ADR | Title | Resolves | Status |
 |---|---|---|---|
-| [`ADR-001`](./ADR-001-source-adapter-identity-boundary.md) | `SourceAdapter` identity/capability boundary | `OPEN-8` | ACCEPTED |
+| [`ADR-001`](./ADR-001-source-adapter-identity-boundary.md) | `SourceAdapter` identity/capability boundary (amended: minimal V0.1 surface — `name`/`capabilities`/`health()` moved to optional extensions) | `OPEN-8` | ACCEPTED (amended) |
 | [`ADR-002`](./ADR-002-identity-confidence-ownership.md) | Identity confidence ownership | `OPEN-2` | ACCEPTED |
 | [`ADR-003`](./ADR-003-provider-registry-ownership.md) | Provider registry ownership (`SourceRegistry` vs. `ProviderRegistry<T>`) | `OPEN-4` | ACCEPTED |
 | [`ADR-004`](./ADR-004-health-model-layering.md) | Health model layering (`HealthResult`/`SourceHealthCounters`/`SourceHealthSnapshot`) | `OPEN-1` | ACCEPTED |
 | [`ADR-005`](./ADR-005-subtitle-v0.1-scope.md) | Subtitle scope deferred past V0.1 | `OPEN-3` | ACCEPTED |
+| [`ADR-006`](./ADR-006-source-registry-admission-boundary.md) | `SourceRegistry` vs. admission (control-plane) boundary | `OPEN-11`, `OPEN-13` | ACCEPTED |
+| [`ADR-007`](./ADR-007-resolution-result-outcome-boundary.md) | `ResolutionResult` vs. `AdapterExecution` outcome/evidence boundary | `OPEN-12` | ACCEPTED |
 
 ---
 
@@ -145,9 +159,9 @@ pass).
 - **Why it matters:** an implementer copying `SourceRegistry` verbatim would write code against a method (`supports`) that no longer exists on `SourceAdapter`. This is a direct, mechanical consequence of `ADR-001` that has not yet been designed.
 - **Possible interpretations:** (1) split `applicable()` into `applicableByMedia(media: MediaRef)` (pre-identity) and `applicableByIdentity(identities: readonly ExternalIdentity[])` (post-identity). (2) keep one `applicable()` method with an overload or a discriminated parameter. (3) move filtering entirely out of the registry and into the resolver.
 - **Evidence available:** `ADR-001`'s new `SourceAdapter` shape; no evidence yet on which registry-method-splitting approach the rest of the pipeline expects.
-- **Decision:** none yet — flagged explicitly in `docs/contracts/source-adapter.md` rather than silently patched with a guessed signature.
-- **Decision rationale:** picking a specific method split without pipeline-level evidence for how the resolver calls the registry at each stage would be inventing a contract, not extracting one.
-- **Status:** `OPEN`, **blocking for `SourceRegistry` implementation**, non-blocking for the identity/adapter-boundary decision itself (`ADR-001` is otherwise fully decided).
+- **Decision:** interpretation (1) — `applicable()` is split into `applicableByMedia(media: MediaRef)` and `applicableByIdentity(identities: readonly ExternalIdentity[])`. See [`ADR-006`](./ADR-006-source-registry-admission-boundary.md).
+- **Decision rationale:** this is the minimal, most direct fix consistent with `ADR-001`'s own two-stage filter design (`supportsMedia`/`supportsIdentity`), with no need to invent an overload or move filtering to a different layer.
+- **Status:** `RESOLVED` by `ADR-006` (2026-09-29, second session).
 
 ### OPEN-12 — `ResolutionResult` has no canonical contract-file home
 
@@ -156,9 +170,9 @@ pass).
 - **Why it matters:** this is a V0.1-CORE-listed type with two competing shapes and no frozen owner — exactly the kind of gap that would let two implementers diverge while both believing they followed the docs.
 - **Possible interpretations:** (1) `02-domain.md`'s richer shape is canonical (more complete, and part of the same already-frozen domain-module sequence as `MediaRef`/`SourceCandidate`). (2) `03-resolution.md`'s shape is canonical (it's the one actually returned by the one worked-through `resolveMedia()` implementation sketch). (3) Both need reconciling, and `media` should be updated to `CanonicalMedia` to stay consistent with `ADR-001`.
 - **Evidence available:** both shapes extracted verbatim during the 2026-09-29 normalization pass; discovered as a side effect of auditing V0.1 CORE scope against `docs/contracts/`.
-- **Decision:** none yet. This was discovered late in this pass and evidence does not clearly favor one draft strongly enough to avoid guessing (richness alone is not sufficient justification, unlike the chronological/majority evidence available for `OPEN-5`/`OPEN-6`/`OPEN-7`).
-- **Decision rationale:** N/A — left explicitly open rather than silently resolved.
-- **Status:** `OPEN`, **BLOCKING for `CONTRACT_FREEZE`** — `ResolutionResult` is named in the V0.1 CORE scope and has no single, unambiguous, frozen shape.
+- **Decision:** interpretation (1) — `02-domain.md`'s richer shape (`status`/`failures`/`sourceCount`/`durationMs`) is canonical, now mirrored verbatim in the new `docs/contracts/result.md`. `03-resolution.md`'s embedded-execution-ledger draft is marked HISTORICAL/SUPERSEDED. A separate, dedicated `AdapterExecution`/`AdapterStatus` contract was also frozen in the same file to hold the execution-level evidence that `03-resolution.md`'s draft had incorrectly embedded directly in `ResolutionResult`. See [`ADR-007`](./ADR-007-resolution-result-outcome-boundary.md).
+- **Decision rationale:** `02-domain.md`'s shape is part of the same already-frozen domain-module sequence as `MediaRef`/`SourceCandidate`/`Failure`; keeping the execution ledger out of `ResolutionResult` matches the `execution ≠ success` semantic boundary this whole audit is built around.
+- **Status:** `RESOLVED` by `ADR-007` (2026-09-29, second session).
 
 ### OPEN-13 — a sixth `SourceRegistry` shape is admission-lifecycle-integrated, not reconciled with the frozen registry
 
@@ -168,8 +182,21 @@ pass).
 - **Why it matters:** this is not cosmetic. It changes what the registry *is*: a passive collection of already-admitted adapters (frozen shape), vs. the system-of-record for the full source lifecycle including admission decisions (redesigned shape). An implementer following the frozen contract alone would never build the `SourceDeclaration`/`AdmissionDecision`/lifecycle machinery that `05-policy.md`'s admission model depends on somewhere existing.
 - **Possible interpretations:** (1) the admission-lifecycle registry is a **V0.2+ control-plane evolution** of the simple registry, analogous to `ADR-003`'s `ProviderRegistry<T>` deferral — plausible, but not stated anywhere as such. (2) The admission-lifecycle registry **is** the intended V0.1 registry, and the simpler `register(adapter)` shape (frozen in the contract file) is the one that's actually superseded/incomplete, since it has no way to represent `SourceDeclaration`/`AdmissionDecision` at all. (3) They operate at different points in the same pipeline — a `SourceDeclaration` is validated/admitted once (via the admission-lifecycle registry, at deployment/composition time) and only the resulting admitted `SourceAdapter`s are ever handed to the simple, frozen `SourceRegistry` for per-request `applicable()`/`resolve()` use — i.e., not a contradiction but two different layers that were never explicitly connected in the documentation.
 - **Evidence available:** all three interpretations are structurally plausible from the text; no explicit statement anywhere says which is intended, and `ADR-001`/`ADR-003` (written earlier in this same pass) did not consider this 5th occurrence at all — it was missed until the independent Phase 24 re-scan.
-- **Decision:** none — this is a genuine architectural gap, not silently resolved. Interpretation (3) is the most structurally plausible (it would explain why the frozen contract's `SourceRegistry` never mentions `SourceDeclaration`/`AdmissionDecision` at all — those may simply belong one layer up), but plausibility is not the same as evidence, and adopting it here would be exactly the kind of unreviewed architectural call this ledger exists to prevent.
-- **Status:** `OPEN` — **BLOCKING for `CONTRACT_FREEZE`** of `source-adapter.md`'s registry portion. Requires a dedicated ADR before `SourceRegistry` can be implemented without an implementer guessing whether admission-lifecycle state belongs inside the registry or upstream of it.
+- **Decision:** interpretation (3) — admission and registration are different points in the same pipeline (`DECLARATION → ADMISSION → COMPOSITION → EXECUTION`). `SourceRegistry` (V0.1-frozen) holds only already-admitted adapters and is never itself the admission authority; `SourceDeclaration`/`AdmissionDecision`/`evaluateAdmission()` (`05-policy.md`) remain the sole admission mechanism. The "Registry redesign" section in `04-providers.md` is re-labeled as admission-process material, not a competing registry contract. See [`ADR-006`](./ADR-006-source-registry-admission-boundary.md).
+- **Decision rationale:** this is the interpretation that requires the least invention — it reuses `05-policy.md`'s already fully-specified `AdmissionDecision` model as-is, and explains why the frozen `SourceRegistry` never referenced `SourceDeclaration`/`AdmissionDecision` (they belong one layer upstream, not inside the registry). It also directly enforces the standing `admission ≠ execution ≠ registry` semantic-boundary principle.
+- **Status:** `RESOLVED` by `ADR-006` (2026-09-29, second session).
+
+### OPEN-14 — receipt family: `sourceId` vs. `adapterId` naming, and `ReceiptEnvelope`'s payload composition is unspecified
+
+- **Affected documents:** `docs/architecture/07-evidence.md`, `docs/contracts/result.md`, `docs/contracts/evidence.md`
+- **Discovered during:** Phase 6 receipt-family audit (2026-09-29, second session) — a field-level pass across `EvidenceRecord<T>`, `IdentityReceipt`, `SourceExecutionReceipt`, `MetadataReceipt`, `ReceiptEnvelope`, and `AdapterExecution`.
+- **Observed contradiction (part 1, minor):** `SourceExecutionReceipt.sourceId` and `AdapterExecution.adapterId` (`docs/contracts/result.md`) both identify the same underlying `SourceAdapter.id`, but use two different field names.
+- **Observed gap (part 2, more substantive):** `ReceiptEnvelope` is introduced as a common wrapper for the various receipts ("subsystem-specific payloads remain strongly typed"), but no example anywhere shows the actual composition — e.g. whether it's a generic `ReceiptEnvelope<T> { ...envelope fields...; payload: T }`, or each receipt independently duplicates the envelope fields it needs.
+- **Why it matters:** part 1 is cosmetic (no type references the other's field, so no functional ambiguity yet) but should be fixed before implementation for consistency. Part 2 is more substantive: an implementer building the receipt/evidence persistence layer would have to guess how `ReceiptEnvelope` and e.g. `IdentityReceipt` actually compose into one persisted record.
+- **Possible interpretations (part 2):** (1) `ReceiptEnvelope<T> = { ...envelope fields...; payload: T }`, generic over the specific receipt type. (2) Each receipt type independently includes envelope-equivalent fields (as `IdentityReceipt`/`SourceExecutionReceipt`/`MetadataReceipt` already do with their own `receiptId`/timestamps) and `ReceiptEnvelope` is a separate, storage-layer-only wrapper never merged into the domain-level receipt types.
+- **Evidence available:** all receipt/envelope shapes extracted verbatim during this pass; no explicit composition example exists in the source material.
+- **Decision:** none — left explicitly open. Part 1 (`sourceId` vs. `adapterId`) is a straightforward future fix once an implementer needs both types side by side. Part 2 requires a dedicated future ADR once the persistence/storage layer is designed.
+- **Status:** `OPEN`, low severity for part 1; **non-blocking for V0.1 CORE freeze**, but blocking for `docs/contracts/evidence.md`'s receipt portion specifically (already `NOT_FROZEN` for this and other reasons — see `docs/architecture/documentation-audit.md`).
 
 ### RESOLVED-2 — `README.md` placed Identity/`CanonicalMedia` in a later roadmap phase, contradicting `13-roadmap.md`'s V0.1 scope
 
