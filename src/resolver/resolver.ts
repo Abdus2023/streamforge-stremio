@@ -96,7 +96,7 @@ export async function resolveCanonicalMedia(
       failures.push({
         code: execution.status === "aborted" ? "source_aborted" : "internal_error",
         sourceId: execution.adapterId,
-        message: execution.error
+        ...(execution.error ? { message: execution.error } : {})
       });
       continue;
     }
