@@ -1,4 +1,4 @@
-# Documentation Audit — Contract-Freeze Verification (2026-09-29)
+# Documentation Audit — Contract-Freeze Verification (2026-09-29, updated)
 
 [⇧ Architecture index](../architecture.md) · [⇆ Document map](./README.md)
 
@@ -8,6 +8,19 @@
 > in `docs/architecture.md` and `docs/decisions/README.md`. It may go
 > stale; re-run the checks described here (see "How this was produced")
 > before trusting it after further edits.
+>
+> **Updated 2026-09-29 (second pass, same day): 5 of the 9 `OPEN` items**
+> this file originally recorded (`OPEN-1`, `OPEN-2`, `OPEN-3`, `OPEN-4`,
+> `OPEN-8`) were resolved via explicit ADRs
+> (`docs/decisions/ADR-001..005-*.md`) and the corresponding contract/
+> architecture files were updated to match. This file was updated in
+> place — not rewritten — to reflect that. Three new items were also
+> discovered during that pass: `OPEN-10` and `OPEN-11` (both low-severity/
+> non-blocking or narrowly-scoped) and `OPEN-12` (`ResolutionResult` has
+> no canonical contract-file home — **this is now the single blocking
+> item preventing full `CONTRACT_FREEZE`**). See
+> `docs/decisions/README.md` for the full, current ledger — it is the
+> source of truth; this file summarizes it.
 >
 > **Scope limitation, stated up front.** This repository declares ~150
 > distinct named interfaces/types across `docs/architecture/*.md`. This
@@ -24,14 +37,14 @@
 
 ---
 
-## 1. Repository baseline (re-verified 2026-09-29)
+## 1. Repository baseline (re-verified 2026-09-29, second pass)
 
 | Fact | Value | Evidence |
 |---|---|---|
 | Branch | `arena/01a0e9bd-streamforge-stremio` | `git branch --show-current` |
-| HEAD | `9081018` at start of this pass | `git rev-parse HEAD` |
+| HEAD | `514bdc2` after the ADR-normalization commit | `git rev-parse HEAD` |
 | Base branch | `main` | `git fetch origin main` |
-| Ahead/behind `main` | 26 ahead / 0 behind | `git rev-list --left-right --count origin/main...HEAD` |
+| Ahead/behind `main` | 30 ahead / 0 behind | `git rev-list --left-right --count origin/main...HEAD` |
 | `src/`, `test/`, `tests/` | absent | `find` |
 | `.github/workflows/` | absent | `find` |
 | `tsconfig.json`, `Dockerfile`, `compose.*` | absent | `find` |
@@ -48,13 +61,17 @@ repository's documentation must be `DESIGNED` or `PROPOSED`, never
 
 | Contract file | Owned concepts | Internally consistent? | Blocking `OPEN` items | Contract status |
 |---|---|---|---|---|
-| `contracts/source-adapter.md` | `SourceAdapter`, `ResolveContext`, `HealthResult`, `SourceRegistry`/`ProviderRegistry<T>` | `ResolveContext` corrected to the converged shape (see `RESOLVED-1`); `SourceAdapter` has an unresolved shape question | `OPEN-1`, `OPEN-4`, `OPEN-8`, `OPEN-9` | **NOT_FROZEN** |
-| `contracts/identity.md` | `MediaRef`, `ExternalIdentity`, `CanonicalMedia` | Yes, after superseding 3 `MediaRef` and 3 `CanonicalMedia` drafts (`RESOLVED`) | `OPEN-2` (confidence placement) | **NOT_FROZEN** |
-| `contracts/stream.md` | `SourceCandidate`, `Stream`, subtitle candidates | `SourceCandidate`/`Stream` consistent after superseding 1 draft; subtitle candidate never frozen | `OPEN-3`, `OPEN-7` (resolved, informational) | **NOT_FROZEN** (subtitle portion is the blocker; `SourceCandidate`/`Stream` are freeze-ready pending `OPEN-8` upstream) |
-| `contracts/runtime.md` | `RuntimeSnapshot`, `ConfigurationTransaction`, `RuntimePolicy` | Yes — the only occurrence of each in `09-control-plane.md` matches this file exactly, no competing drafts found | none directly; indirectly depends on `SourceAdapter` shape via `AdmittedSource` | **NOT_FROZEN** (indirect dependency on `OPEN-8`) |
-| `contracts/evidence.md` | 4 evidence levels, receipt/evidence-graph shape | The 4 levels are consistent everywhere they're named; `ReceiptEnvelope`/`EvidenceRecord<T>`/receipts were inventoried but not field-level diffed against each other this pass | not diffed — see scope limitation | **NOT_FROZEN** (evidence levels alone would qualify; receipts are unverified) |
+| `contracts/source-adapter.md` | `SourceAdapter`, `ResolveContext`, `HealthResult`, `SourceHealthCounters`/`SourceHealthSnapshot`, `SourceRegistry`/`ProviderRegistry<T>` | `ResolveContext` converged (`RESOLVED-1`); `SourceAdapter` boundary resolved (`ADR-001`); health layering resolved (`ADR-004`); registry ownership resolved (`ADR-003`) | `OPEN-9` (low severity, additive); `OPEN-11` (registry `applicable()` needs re-specification — **blocks implementation, not the shape freeze**) | **FREEZE-READY** for the `SourceAdapter`/`HealthResult`/`SourceHealthCounters`/`SourceHealthSnapshot`/`SourceRegistry` shapes themselves; `OPEN-11` must still be closed before an implementer can write `SourceRegistry.applicable()` without guessing |
+| `contracts/identity.md` | `MediaRef`, `ExternalIdentity`, `CanonicalMedia` | Yes, after superseding 3 `MediaRef` and 3 `CanonicalMedia` drafts (`RESOLVED`); confidence ownership resolved (`ADR-002`) | `OPEN-10` (low severity, non-blocking — `IdentityResolution` vs. `IdentityReceipt.outcome` state-count mismatch) | **FROZEN** |
+| `contracts/stream.md` | `SourceCandidate`, `Stream`, `ResolutionResult`, subtitle candidates (deferred) | `SourceCandidate`/`Stream` consistent after superseding 1 draft; subtitles formally deferred, not a blocker (`ADR-005`); `ResolutionResult` has no canonical shape | `OPEN-7` (resolved, informational); `OPEN-12` (**blocking** — `ResolutionResult` has two non-identical drafts and no contract-file home) | **NOT_FROZEN** — `SourceCandidate`/`Stream` are freeze-ready; `ResolutionResult` (listed in V0.1 CORE scope) is the blocker |
+| `contracts/runtime.md` | `RuntimeSnapshot`, `ConfigurationTransaction`, `RuntimePolicy` | Yes — the only occurrence of each in `09-control-plane.md` matches this file exactly, no competing drafts found | none — its `SourceAdapter`-shaped dependency (`AdmittedSource`) is now resolved via `ADR-001` | **FROZEN** |
+| `contracts/evidence.md` | 4 evidence levels, receipt/evidence-graph shape, `IdentityObservation` (extended, `ADR-002`) | The 4 levels are consistent everywhere they're named; `ReceiptEnvelope`/`EvidenceRecord<T>`/receipts were inventoried but not field-level diffed against each other this pass | not diffed — see scope limitation | **NOT_FROZEN** (evidence levels alone would qualify; receipts are unverified) |
 
-No contract in this repository currently qualifies for `CONTRACT_FREEZE` per the gate in `docs/architecture.md`. See §7 for the precise unblocking conditions.
+Two contracts (`identity.md`, `runtime.md`) now qualify for
+`CONTRACT_FREEZE` per the 14-point checklist in `docs/architecture.md`.
+`source-adapter.md`'s shapes are freeze-ready but implementation is
+blocked by `OPEN-11`. `stream.md` and `evidence.md` remain `NOT_FROZEN`.
+See §7 for the precise remaining unblocking conditions.
 
 ---
 
@@ -65,13 +82,14 @@ No contract in this repository currently qualifies for `CONTRACT_FREEZE` per the
 | `MediaRef` | `contracts/identity.md` | `02-domain.md` ×4 (3 non-canonical) | Yes — 3 drafts embed `imdbId`/`tmdbId` | Annotated in place as HISTORICAL/SUPERSEDED, recorded as `OPEN-5` | `RESOLVED` |
 | `ExternalIdentity` | `contracts/identity.md` | `02-domain.md` (canonical match, inside already-annotated section), `07-evidence.md` (minimal restatement) | Minor — minimal restatement drops provenance fields | Annotated in `contracts/identity.md` | `RESOLVED` (informational) |
 | `CanonicalMedia` | `contracts/identity.md` | `02-domain.md` ×4 (3 non-canonical) | Yes — 3 drafts (presentation-conflated, Map-based) | Annotated in place, recorded as `OPEN-6` | `RESOLVED` |
-| `SourceAdapter` | `contracts/source-adapter.md` | `04-providers.md` ×6 (5 non-canonical) | Yes — capability field and identity-aware resolve() unresolved | Annotated in place; contract file documents all variants; recorded as `OPEN-8` | `OPEN` (highest priority) |
+| `SourceAdapter` | `contracts/source-adapter.md` | `04-providers.md` ×6 (5 now HISTORICAL) | Resolved — adapter selection happens after identity resolution | `ADR-001` adopted the identity/capability-aware shape (`supportsMedia`/`supportsIdentity`/`resolve(CanonicalMedia, ...)`/`health?()`); all 5 other drafts marked HISTORICAL/SUPERSEDED | `RESOLVED` by `ADR-001` |
 | `ResolveContext` | `contracts/source-adapter.md` | `04-providers.md` ×3, `06-runtime.md` ×2 | Contract previously froze the minority (1×) shape instead of the converged (4×) shape | **Corrected** the contract to the converged shape; annotated the outlier; recorded as `RESOLVED-1` / `OPEN-9` | `RESOLVED` |
-| `HealthResult` | `contracts/source-adapter.md` | (unique) | Overlaps semantically with two `SourceHealth` shapes | Cross-referenced in contract file; recorded as `OPEN-1` | `OPEN` |
-| `SourceRegistry` / `ProviderRegistry<T>` | `contracts/source-adapter.md` | `04-providers.md` ×4 | Evolution vs. duplication unresolved | Both shapes recorded in contract file; recorded as `OPEN-4` | `OPEN`, low severity |
+| `HealthResult` / `SourceHealthCounters` / `SourceHealthSnapshot` | `contracts/source-adapter.md` (`HealthResult`); `04-providers.md` (`SourceHealthCounters`); `10-observability.md` (`SourceHealthSnapshot`) | Previously both non-`HealthResult` types were named `SourceHealth` | Resolved — three distinct layers, not duplicates | `ADR-004` renamed the two colliding `SourceHealth` types; all three now have distinct names and a stated relationship | `RESOLVED` by `ADR-004` |
+| `SourceRegistry` / `ProviderRegistry<T>` | `contracts/source-adapter.md` | `04-providers.md` ×4 | Resolved — chronological evolution, not competing designs | `ADR-003`: `SourceRegistry` is the V0.1-frozen registry; `ProviderRegistry<T>` explicitly deferred to V0.2+ | `RESOLVED` by `ADR-003` (see also `OPEN-11`: `SourceRegistry.applicable()`'s method signature needs re-specification post-`ADR-001`) |
 | `SourceCandidate` | `contracts/stream.md` | `02-domain.md` ×4 (2 non-canonical), `03-resolution.md` (canonical match) | Yes — 1 draft uses `authorized: boolean`, violating the tri-state invariant | Annotated in place; superseded; recorded as `OPEN-7` | `RESOLVED` |
 | `Stream` | `contracts/stream.md` | none found duplicated | No | none needed | `RESOLVED` |
-| `SubtitleCandidate` | *(none — never frozen)* | `02-domain.md` ×3 | Not diffed field-by-field this pass | Recorded as `OPEN-3` | `OPEN` |
+| `SubtitleCandidate` | *(none — deferred, not frozen)* | `02-domain.md` ×4 (corrected count; was previously miscounted as 3) | Not diffed field-by-field — moot, since none is being frozen | `ADR-005`: subtitles deferred to V0.2+; all 4 drafts kept as PROPOSED/EXPLORATORY, none promoted | `RESOLVED` (deferred, not frozen) by `ADR-005` |
+| `ResolutionResult` | *(none — no canonical home)* | `02-domain.md` (richer draft), `03-resolution.md` (simpler draft) | Yes — two non-identical drafts, both using `MediaRef` not `CanonicalMedia` despite `ADR-001` | Discovered this pass; recorded as `OPEN-12`, not resolved (insufficient evidence to prefer one draft) | `OPEN` — **blocking**, since `13-roadmap.md` lists this in V0.1 CORE scope |
 | `RuntimeSnapshot` | `contracts/runtime.md` | `09-control-plane.md` (identical, canonical source) | No | Pointer already present | `RESOLVED` |
 | `ConfigurationTransaction` | `contracts/runtime.md` | `09-control-plane.md` (identical) | No | Pointer already present | `RESOLVED` |
 | `RuntimePolicy` | `contracts/runtime.md` | `09-control-plane.md` (identical, canonical source) | No | Pointer already present | `RESOLVED` |
@@ -90,7 +108,7 @@ read, not a final verdict. None were edited this pass beyond what's noted.
 | `PolicyDecision` | `05-policy.md` ×3 | Likely legitimate evolution (reasons list grows across drafts); not diffed field-by-field | Future audit pass; low risk — `05-policy.md` is a single self-contained document |
 | `AdapterExecution` | `04-providers.md`, `06-runtime.md`, `07-evidence.md` | Plausibly three different layers (execution options / execution context / execution receipt) rather than one duplicated type — **names are ambiguous enough to warrant renaming**, not merging | Recommend an ADR that gives each a distinct name (e.g. `AdapterExecutionOptions`, `AdapterExecutionContext`, `AdapterExecutionReceipt`) |
 | `AdapterStatus` | `06-runtime.md` ×2, `04-providers.md` (as a type alias) | Two enum-like shapes with different value sets — not diffed | Future audit pass |
-| `SourceHealth` | `04-providers.md`, `10-observability.md` | Different field sets (see `OPEN-1`) | Covered by `OPEN-1` |
+| ~~`SourceHealth`~~ → `SourceHealthCounters` / `SourceHealthSnapshot` | `04-providers.md`, `10-observability.md` | Resolved by `ADR-004` — renamed to distinct names, no longer a naming collision | None — see `ADR-004` |
 | `CircuitBreaker` (class) | `06-runtime.md` ×2 | Two implementations shown at different points in the runtime narrative; likely the same evolving class shown twice, not two designs | Low priority |
 | `Semaphore` (class) | `06-runtime.md` ×2 | Same as above | Low priority |
 | `CatalogProvider` | `02-domain.md`, `08-protocols.md` | Plausibly legitimate — domain-level provider abstraction vs. protocol-facing interface | No action; names should stay distinct if semantics differ, but this wasn't verified |
@@ -144,35 +162,57 @@ domain/resolution/provider/policy/runtime/evidence documents. `StremioStream`,
 
 ---
 
-## 7. Precise CONTRACT_FREEZE blocking conditions
+## 7. Precise CONTRACT_FREEZE blocking conditions (updated, second pass)
 
-For each contract, this is exactly what would need to happen for it to
-move to `CONTRACT_FREEZE`:
+Five of the original nine blocking `OPEN` items (`OPEN-1`, `OPEN-2`,
+`OPEN-3`, `OPEN-4`, `OPEN-8`) were resolved this pass via `ADR-001`
+through `ADR-005`. Remaining conditions for full `CONTRACT_FREEZE`:
 
-1. **`source-adapter.md`**: an ADR resolving `OPEN-8` (which `SourceAdapter`
-   tier ships in v0.1: minimal `MediaRef`-based, or identity/capability-aware)
-   and `OPEN-4` (registry generic vs. specialized); `OPEN-1` needs the
-   `HealthResult`/`SourceHealth` relationship stated explicitly (three
-   layers or a merge).
-2. **`identity.md`**: an ADR resolving `OPEN-2` (where identity confidence
-   lives: on `ExternalIdentity`, on `CanonicalMedia`, or via a separate
-   `IdentityEvidence` linkage).
-3. **`stream.md`**: freezing a `SubtitleCandidate` shape (`OPEN-3`) — the
-   `SourceCandidate`/`Stream` portion has no remaining blocker.
-4. **`runtime.md`**: blocked only transitively by `OPEN-8` (its
-   `AdmittedSource` type is adapter-shaped); otherwise ready.
-5. **`evidence.md`**: a follow-up audit diffing `ReceiptEnvelope`,
-   `EvidenceRecord<T>`, `IdentityReceipt`, `MetadataReceipt`, and
-   `SourceExecutionReceipt` against each other, which this pass did not
-   perform (see scope limitation at the top of this file).
+1. **`source-adapter.md`**: shapes themselves are now freeze-ready
+   (`ADR-001`, `ADR-003`, `ADR-004`). `OPEN-11` must still be closed
+   (`SourceRegistry.applicable()`'s method signature needs re-specifying
+   into the two-stage `supportsMedia`/`supportsIdentity` filter implied
+   by `ADR-001`) before an implementer can build `SourceRegistry` without
+   guessing. `OPEN-9` remains open but is explicitly non-blocking
+   (additive, does not change the frozen shape).
+2. **`identity.md`**: **FROZEN.** `OPEN-2` resolved by `ADR-002`.
+   `OPEN-10` (a 3-state vs. 4-state mismatch between `IdentityResolution`
+   and `IdentityReceipt.outcome`) remains open but does not block any
+   currently-frozen V0.1 contract.
+3. **`stream.md`**: subtitle deferral (`ADR-005`) removed that blocker.
+   The remaining, **newly-discovered** blocker is `OPEN-12`:
+   `ResolutionResult` is named in `13-roadmap.md`'s V0.1 CORE scope but
+   has two non-identical drafts and no canonical home in
+   `docs/contracts/`. This must be resolved (either by an ADR picking one
+   draft, or by explicitly re-scoping V0.1 CORE to exclude it) before
+   `stream.md`/the CORE scope can be called fully frozen.
+4. **`runtime.md`**: **FROZEN.** Its only dependency (`AdmittedSource`
+   being adapter-shaped) is resolved transitively by `ADR-001`.
+5. **`evidence.md`**: unchanged from the previous pass — a follow-up
+   audit diffing `ReceiptEnvelope`, `EvidenceRecord<T>`, `IdentityReceipt`,
+   `MetadataReceipt`, and `SourceExecutionReceipt` against each other was
+   out of scope for both passes (see scope limitation at the top of this
+   file). This is a stated, not silently dropped, limitation.
 
 ---
 
 ## 8. Changes made in this audit pass
 
-See the final report in the task response for the itemized file list and
-per-change rationale (git history is also authoritative: this audit's
-commits are named `docs: ...` and touch only `docs/`, `README.md`).
+**First pass (2026-09-29, commits `e2de799`, `481d359`, `a065298`):** the
+contradiction/status inventory recorded in this file's first version.
+
+**Second pass (2026-09-29, commit `514bdc2`):** wrote 5 ADRs
+(`docs/decisions/ADR-001` through `ADR-005`), resolving `OPEN-1`,
+`OPEN-2`, `OPEN-3`, `OPEN-4`, and `OPEN-8`; applied matching edits to
+`docs/contracts/source-adapter.md`, `docs/contracts/identity.md`,
+`docs/contracts/stream.md`, and `docs/architecture/{02-domain,
+04-providers,07-evidence,10-observability,13-roadmap}.md`; fixed a
+`README.md` vs. `13-roadmap.md` V0.1-scope contradiction (`RESOLVED-2`);
+discovered and recorded three new items (`OPEN-10`, `OPEN-11`, `OPEN-12`);
+updated `docs/decisions/README.md` and this file in place. See the final
+report in the task response for the itemized file list and per-change
+rationale (git history is also authoritative: all commits are named
+`docs: ...` and touch only `docs/`, `README.md`).
 
 ---
 
