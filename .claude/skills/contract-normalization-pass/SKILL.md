@@ -18,6 +18,14 @@ starting — it's the constitution the rest of this pass operates under.
 
 ## The pass, phase by phase
 
+0. **Monolith migration (first time only).** If the documentation doesn't
+   yet exist as a partitioned structure — it's still one large design
+   document — use **docs-monolith-partition** first to split it into
+   normative contracts / explanatory architecture / decision authority /
+   implementation, via a migration matrix, without resolving any
+   contradictions the split surfaces. Skip this phase entirely on any
+   later pass over an already-partitioned repository.
+
 1. **Partition check.** Confirm (or establish, if this is the first
    pass) a clean split: normative contracts / explanatory architecture /
    decision authority (ADRs + ledger) / implementation. No two locations
@@ -75,11 +83,13 @@ starting — it's the constitution the rest of this pass operates under.
 
 | Skill | Used for |
 |---|---|
+| `docs-monolith-partition` | Phase 0 (first-time migration from a single monolith into a partitioned structure). |
 | `docs-integrity-check` | Fence-balance and link-validity checks — run after every batch of edits in every phase above, not just once at the end. |
 | `doc-symbol-audit` | Phase 2 (finding and diffing contradictions). |
 | `adr-writer` | Phase 3–4 (recording decisions, annotating historical material). |
 | `contract-freeze-gate` | Phase 6 (regenerating the audit artifact, running the checklist). |
 | `docs-normalization-commit-plan` | Phase 7 (landing the work in git). |
+| `skill-creator` | Not part of the pass itself — use it separately if a step of this pass turns out to need a new reusable tool/skill of its own. |
 
 ## Common failure modes to avoid (see `references/operating-principles.md` for the full list)
 

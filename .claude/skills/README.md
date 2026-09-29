@@ -15,15 +15,24 @@ specify interfaces before code exists) and reused as-is.
 
 | Skill | Role | Depends on |
 |---|---|---|
+| [`docs-monolith-partition`](./docs-monolith-partition/) | Migrates a single large monolithic doc into a topic-partitioned structure using a migration matrix, without resolving contradictions along the way. Captures Task 1's original process (splitting a 703-section, ~26,500-line monolith into `docs/contracts/`, `docs/architecture/`, `docs/decisions/`). | — |
 | [`docs-integrity-check`](./docs-integrity-check/) | Verifies Markdown fence balance and internal link validity. Real, working scripts (`check_fences.sh`, `check_links.py`) — no dependencies beyond bash/Python 3. | — |
 | [`doc-symbol-audit`](./doc-symbol-audit/) | Finds every declaration of a named type/interface/class across a docs tree and extracts each occurrence's full body for diffing. Real scripts (`list_declared_symbols.py`, `extract_symbol_occurrences.py`), tested against this repo's own `docs/` tree. | `docs-integrity-check` |
 | [`adr-writer`](./adr-writer/) | Writes an Architecture Decision Record resolving a found contradiction and keeps the decision ledger in sync. Templates + a status-discipline reference. | `doc-symbol-audit` |
 | [`contract-freeze-gate`](./contract-freeze-gate/) | Regenerates a documentation-audit artifact from current `HEAD` and evaluates a named freeze-gate checklist to a `READY`/`BLOCKED` verdict. | `docs-integrity-check`, `adr-writer` |
 | [`docs-normalization-commit-plan`](./docs-normalization-commit-plan/) | Plans and executes a coherent, ordered git commit sequence for a normalization pass, docs-only, no fabricated test/CI evidence. | `docs-integrity-check` |
-| [`contract-normalization-pass`](./contract-normalization-pass/) | Top-level orchestrator tying all of the above into the full end-to-end pass, plus the two final-report templates (short/long) actually used this session. | all of the above |
+| [`contract-normalization-pass`](./contract-normalization-pass/) | Top-level orchestrator tying all of the above into the full end-to-end pass (including the monolith-migration phase for a first-time pass), plus the two final-report templates (short/long) actually used this session. | all of the above |
+| [`skill-creator`](./skill-creator/) | Creates new skills, improves existing ones, and validates any skill directory against the open Agent Skills spec. Real script (`validate_skill.py`) — used to build and check every skill in this directory, and caught a real mistake in its own `SKILL.md` while being built (see its `references/lessons-learned.md`). | — |
 
 ## Where each process from this session ended up
 
+- **Splitting the original monolithic architecture document** into
+  `docs/contracts/`, `docs/architecture/`, `docs/decisions/` via a
+  temporary migration matrix, moving content without deleting or silently
+  resolving contradictions along the way (documented in
+  `docs/architecture.md` §9, "Provenance of this document set") →
+  `docs-monolith-partition`, including its migration-matrix template and
+  the five maintenance rules from `docs/architecture.md` §10.
 - **Symbol grep + field-by-field contradiction diffing** (used manually,
   over and over, across every task in this session, including catching a
   real "these are identical" mistake in `06-runtime.md`'s `AdapterStatus`
@@ -62,12 +71,17 @@ specify interfaces before code exists) and reused as-is.
 
 ## Quick start
 
-For a full pass: trigger `contract-normalization-pass` (e.g. "run a
-pre-freeze contract audit on this repo"). For a narrower request, trigger
-the specific skill directly (e.g. "check the docs for broken links" →
-`docs-integrity-check`; "does this interface get redefined anywhere?" →
-`doc-symbol-audit`).
+For a brand-new, not-yet-partitioned monolith: trigger
+`docs-monolith-partition` first. For a full normalization pass over an
+already-partitioned repo: trigger `contract-normalization-pass` (e.g.
+"run a pre-freeze contract audit on this repo"). For a narrower request,
+trigger the specific skill directly (e.g. "check the docs for broken
+links" → `docs-integrity-check`; "does this interface get redefined
+anywhere?" → `doc-symbol-audit`; "make this workflow into a skill" →
+`skill-creator`).
 
 All scripts are dependency-free (bash + Python 3 standard library only)
 and have been smoke-tested against this repository's own `docs/` tree as
-part of building this skill set.
+part of building this skill set. Every skill in this directory passes
+`skill-creator/scripts/validate_skill.py --all .claude/skills` with zero
+errors.
