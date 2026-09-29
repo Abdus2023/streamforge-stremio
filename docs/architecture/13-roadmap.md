@@ -2640,7 +2640,36 @@ has yet been produced in this conversation.
 - `/subtitles` (`NOT YET ADVERTISED` above) has no frozen contract and
   needs none for V0.1 — subtitles are formally deferred to V0.2+
   (`docs/decisions/ADR-005-subtitle-v0.1-scope.md`).
-- `ResolutionResult` is listed in `CORE` above but currently has **no**
-  single canonical shape in `docs/contracts/` (two non-identical drafts
-  exist) — this is an **unresolved, freeze-blocking gap**, tracked as
-  `OPEN-12` in `docs/decisions/README.md`, not silently picked.
+- `ResolutionResult` (in `CORE` above) is now frozen in
+  `docs/contracts/result.md`, separated from per-adapter
+  `AdapterExecution` evidence
+  (`docs/decisions/ADR-007-resolution-result-outcome-boundary.md`).
+- `SourceRegistry`'s two-stage filter (`applicableByMedia`/
+  `applicableByIdentity`) is frozen, and admission
+  (`SourceDeclaration`/`AdmissionDecision`, `05-policy.md`) is confirmed as
+  a separate, upstream, control-plane concern — never part of
+  `SourceRegistry` itself
+  (`docs/decisions/ADR-006-source-registry-admission-boundary.md`).
+- `SourceAdapter`'s core V0.1 surface is minimal: `id`,
+  `supportsMedia`, `supportsIdentity`, `resolve`. `name`, `capabilities`,
+  and `health()` are optional, adapter-declared extensions, not required
+  members (`ADR-001`, amended 2026-09-29, second session).
+
+**Scope explicitly kept deferred past V0.1** (do not implement these
+merely because their documentation exists):
+
+```
+○ generic ProviderRegistry<T>              (ADR-003)
+○ subtitle execution / SubtitleCandidate   (ADR-005)
+○ advanced health orchestration            (HealthCheckable is optional; no
+                                             orchestration layer is V0.1)
+○ provider marketplace / discovery         (SourceRegistry is static,
+                                             composition-time only — ADR-006)
+○ authentication framework                 (not named in V0.1 CORE/RUNTIME/
+                                             PROVIDER/EVIDENCE scope above)
+○ user-specific policy engine              (not named in V0.1 scope above)
+○ complex/ML ranking systems               (deterministic ranking only,
+                                             see docs/architecture/03-resolution.md)
+○ distributed control plane                (single-process composition
+                                             root assumed for V0.1)
+```
