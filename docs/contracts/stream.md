@@ -63,6 +63,30 @@ export interface SourceCandidate {
 }
 ```
 
+## Known variants (audit findings, not part of the frozen shape)
+
+Re-auditing `02-domain.md` and `03-resolution.md` on 2026-09-29 found two
+earlier `SourceCandidate` drafts that do not match the frozen shape above:
+
+- An early draft uses a flat `quality?: { width?, height?, label? }`
+  block, string-array `language?`/`subtitles?` fields, an embedded
+  `metadata: { title?, releaseYear? }` block, and — most importantly —
+  `capabilities: { directPlayback, authorized: boolean, stableUrl }`.
+  **`authorized: boolean` cannot represent `"unknown"`.** This directly
+  conflicts with the tri-state `authorized | unknown | denied`
+  authorization model that is treated as a core, repeated invariant
+  everywhere else in the documentation set (including `README.md` and
+  `docs/architecture/05-policy.md`). This draft is classified
+  **SUPERSEDED**, not merely historical, precisely because keeping it
+  live would silently violate a load-bearing invariant. Recorded as
+  `OPEN-7` in `docs/decisions/README.md` for visibility, with a strong
+  recommendation (not yet a formal ADR) that it stay superseded.
+- An intermediate draft matches the frozen `location`/`mediaInfo`/
+  `language`/`provenance`/`capabilities` structure exactly, but omits the
+  `authorization` block entirely. This is classified **HISTORICAL** — it
+  looks like a snapshot taken mid-way through adding the authorization
+  block, not a competing design.
+
 ## `Stream` (Stremio-facing, protocol output)
 
 ```json
