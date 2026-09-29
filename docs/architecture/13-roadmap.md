@@ -2623,3 +2623,24 @@ surface.**
 `GATE-V0.1-S1` should remain **OPEN** until the actual repository is
 built and the checks are executed. No implementation or CI evidence
 has yet been produced in this conversation.
+
+**Decisions applied to this scope (2026-09-29 normalization pass):**
+
+- `Identity`/`CanonicalMedia` is part of CORE, resolved *before* adapter
+  selection (`docs/decisions/ADR-001-source-adapter-identity-boundary.md`);
+  confidence for identity lives on `IdentityObservation`/`IdentityReceipt`,
+  not on `CanonicalMedia` itself
+  (`docs/decisions/ADR-002-identity-confidence-ownership.md`).
+- `PROVIDER` scope (`operator-owned media library` only) is served by the
+  non-generic `SourceRegistry`; the generalized `ProviderRegistry<T>` is
+  deferred past V0.1 (`docs/decisions/ADR-003-provider-registry-ownership.md`).
+- The three health-shaped types (`HealthResult`, `SourceHealthCounters`,
+  `SourceHealthSnapshot`) are three distinct, non-competing layers
+  (`docs/decisions/ADR-004-health-model-layering.md`).
+- `/subtitles` (`NOT YET ADVERTISED` above) has no frozen contract and
+  needs none for V0.1 — subtitles are formally deferred to V0.2+
+  (`docs/decisions/ADR-005-subtitle-v0.1-scope.md`).
+- `ResolutionResult` is listed in `CORE` above but currently has **no**
+  single canonical shape in `docs/contracts/` (two non-identical drafts
+  exist) — this is an **unresolved, freeze-blocking gap**, tracked as
+  `OPEN-12` in `docs/decisions/README.md`, not silently picked.

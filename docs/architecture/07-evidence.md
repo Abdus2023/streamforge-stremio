@@ -174,7 +174,19 @@ export interface ExternalIdentity {
 
 Then:
 
+> **SUPERSEDED by `ADR-002` (2026-09-29).** `MediaIdentity`/
+> `IdentityEvidence` below are retained as historical rationale for *why*
+> confidence-bearing identity evidence matters — they are **not** part of
+> the frozen contract. Their `matchedBy`/`confidence` fields were merged
+> into `IdentityObservation` (`04-providers.md`) instead, so evidence
+> stays on the type identity-provider adapters already produce, rather
+> than living in a second, disconnected model. Do not implement against
+> `MediaIdentity`/`IdentityEvidence` directly — use `IdentityObservation`
+> and `IdentityReceipt` (below). See
+> [`ADR-002`](../decisions/ADR-002-identity-confidence-ownership.md).
+
 ```ts
+// SUPERSEDED — see ADR-002. Kept for historical rationale only.
 export interface MediaIdentity {
   readonly canonical?: ExternalIdentity;
 
@@ -184,9 +196,11 @@ export interface MediaIdentity {
 }
 ```
 
-## Identity evidence
+## Identity evidence (SUPERSEDED, see ADR-002)
 
 ```ts
+// SUPERSEDED — merged into IdentityObservation.matchedBy/confidence
+// (docs/architecture/04-providers.md). See ADR-002.
 export interface IdentityEvidence {
   readonly provider: string;
 

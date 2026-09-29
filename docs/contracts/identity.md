@@ -101,25 +101,20 @@ provenance — no `source`, no `observedAt`); the frozen shape uses
 `readonly ExternalIdentity[]`, which is the only variant that preserves
 full provenance per identity. Recorded as `OPEN-6`.
 
-**Confidence is not missing from the architecture — it is unreconciled.**
-`OPEN-2` (previously "CanonicalMedia confidence... may need to be added")
-is now backed by concrete evidence: `docs/architecture/07-evidence.md`
-defines a *separate*, more detailed identity-evidence model —
-`MediaIdentity { canonical, aliases, evidence: readonly IdentityEvidence[] }`
-and `IdentityEvidence { provider, matchedBy, confidence: "verified" |
-"probable" | "ambiguous" }` — that already carries a confidence concept,
-but it has never been wired into `CanonicalMedia`/`ExternalIdentity`
-above. Compounding this, `07-evidence.md` also restates a *minimal*
-`ExternalIdentity { kind; value }` (dropping `source`/`observedAt`)
-immediately before introducing `MediaIdentity`/`IdentityEvidence` — that
-restatement is superseded by the frozen `ExternalIdentity` above and
-should be read as scaffolding for the `MediaIdentity` discussion, not as
-a competing frozen shape. The open question is not "should confidence exist" (it already
-does, in `07-evidence.md`) but "which type owns it": does `ExternalIdentity`
-gain a `confidence` field, does `CanonicalMedia` gain an `evidence` array
-of `IdentityEvidence`, or do `CanonicalMedia` and `MediaIdentity` need to
-be merged/reconciled into one identity model? See `OPEN-2` in
-`docs/decisions/README.md` for the updated framing.
+**RESOLVED by `ADR-002` (2026-09-29).** `CanonicalMedia` and
+`ExternalIdentity` above stay confidence-free by design — they represent
+current resolved domain state, not evidence, per the `evidence ≠ truth`
+boundary. Confidence lives one layer down, on `IdentityObservation`
+(`docs/architecture/04-providers.md`), which gains optional `confidence`
+and `matchedBy` fields carried through into `IdentityReceipt`
+(`docs/architecture/07-evidence.md`). The separate `MediaIdentity`/
+`IdentityEvidence` model in `07-evidence.md` — which is where the
+`confidence` concept originally appeared — is now marked SUPERSEDED,
+merged into `IdentityObservation`. See
+[`ADR-002`](../decisions/ADR-002-identity-confidence-ownership.md) for
+the full rationale, and `OPEN-10` in `docs/decisions/README.md` for one
+small remaining follow-up (a state-list mismatch between
+`IdentityResolution` and `IdentityReceipt.outcome`, non-blocking).
 
 ## Binding invariants
 

@@ -842,36 +842,47 @@ release tag
 > `test/` directory yet (verified 2026-09-29). See
 > [`docs/architecture/13-roadmap.md`](docs/architecture/13-roadmap.md) for
 > the authoritative, evidence-based implementation-status ledger.
+>
+> **Corrected 2026-09-29:** this section previously placed `Identity`/
+> `CanonicalMedia` in a later expansion phase (see the old "Phase 2 —
+> Identity" section below), which contradicted `13-roadmap.md`'s explicit
+> V0.1 freeze scope. `13-roadmap.md` is the more detailed, later, and more
+> carefully evidenced statement, so it wins: `CanonicalMedia` and
+> `Identity` are part of the V0.1 CORE scope, not a later phase.
 
-The initial release is designed to cover the aggregation kernel:
+The initial release (V0.1) is designed to cover the aggregation kernel,
+matching `docs/architecture/13-roadmap.md`'s "V0.1 implementation freeze"
+scope exactly:
 
 ```
-✓ domain model            (DESIGNED)
-✓ source adapter contract (DESIGNED)
-✓ registry                (DESIGNED)
-✓ candidate validation    (DESIGNED)
-✓ authorization policy    (DESIGNED)
-✓ deduplication           (DESIGNED)
-✓ deterministic ranking   (DESIGNED)
-✓ timeout propagation     (DESIGNED)
-✓ concurrency control     (DESIGNED)
-✓ resolver result semantics (DESIGNED)
-✓ Stremio stream mapping  (DESIGNED)
-✓ health model            (DESIGNED)
-✓ test architecture       (DESIGNED)
+✓ domain model             (DESIGNED)
+✓ identity / CanonicalMedia (DESIGNED — see ADR-001, ADR-002)
+✓ source adapter contract  (DESIGNED — see ADR-001)
+✓ registry                 (DESIGNED — see ADR-003)
+✓ candidate validation     (DESIGNED)
+✓ authorization policy     (DESIGNED)
+✓ deduplication            (DESIGNED)
+✓ deterministic ranking    (DESIGNED)
+✓ timeout propagation      (DESIGNED)
+✓ concurrency control      (DESIGNED)
+✓ resolver result semantics (DESIGNED — ResolutionResult contract gap open, see docs/decisions/README.md OPEN-12)
+✓ Stremio stream mapping   (DESIGNED)
+✓ health model             (DESIGNED — see ADR-004)
+✓ test architecture        (DESIGNED)
 ```
 
 Here, "✓" means "the design for this is written down," not "this is
 built." Nothing in this list has a corresponding file in `src/` or `test/`
 yet.
 
-The following remain separate expansion stages:
+The following are explicitly **deferred past V0.1** (per
+`13-roadmap.md`'s `NOT YET ADVERTISED` list and `ADR-003`/`ADR-005`):
 
 ```
-○ identity provider
 ○ metadata provider
 ○ catalog provider
-○ subtitle protocol
+○ subtitle protocol            (deferred — see ADR-005)
+○ generalized ProviderRegistry<T> (deferred — see ADR-003)
 ○ production cache
 ○ production SSRF-safe HTTP client
 ○ source-specific adapters
@@ -911,6 +922,17 @@ CI
 ```
 
 ### Phase 2 — Identity
+
+> **Note (2026-09-29):** the pipeline sketch below is retained as a
+> simplified narrative illustration. It is **not a separate later
+> phase** — per `docs/architecture/13-roadmap.md`'s V0.1 freeze scope and
+> `ADR-001`/`ADR-002`, identity resolution (`CanonicalMedia`) is part of
+> V0.1 itself, folded into "Phase 1 — Conformance kernel" above, and
+> happens *before* source adapter selection. "Identity Evidence" here
+> corresponds to `IdentityObservation`/`IdentityReceipt`
+> (`docs/architecture/07-evidence.md`), and "Source Query" corresponds to
+> capability/identity-filtered adapter selection, not a separate protocol
+> concept.
 
 ```
 Stremio ID

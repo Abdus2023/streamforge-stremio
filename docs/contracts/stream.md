@@ -118,16 +118,35 @@ authorization basis, and raw provider identifiers are never leaked to the
 protocol layer (see `docs/architecture/08-protocols.md`, "Do not leak
 provider internals").
 
-## Subtitle candidate
+## Subtitle candidate — DEFERRED, out of V0.1 freeze scope
 
-Subtitles follow the same candidate model as source candidates: a
-subtitle-specific candidate type, produced by subtitle provider adapters,
-deduplicated and ranked before being mapped to the Stremio `/subtitles`
-response shape. See `docs/architecture/04-providers.md` and
-`docs/architecture/08-protocols.md` for the subtitle-specific provider
-contract and protocol mapping respectively; the exact frozen subtitle
-candidate field list was not finalized in the source monolith and is
-tracked as **OPEN** — see `docs/decisions/README.md`.
+**RESOLVED by `ADR-005` (2026-09-29).** `docs/architecture/13-roadmap.md`
+explicitly places `/subtitles` under `NOT YET ADVERTISED` for V0.1 — no
+V0.1 component requires a frozen subtitle contract, and
+`SourceCandidate.language.subtitle` above is a plain `readonly string[]`
+of language codes, not a reference to a subtitle candidate object, so
+nothing in this file's frozen V0.1 shapes depends on it.
+
+The three non-identical `SubtitleCandidate` drafts in
+`docs/architecture/02-domain.md` remain as PROPOSED/EXPLORATORY material
+for a future V0.2+ subtitle contract; none is chosen as canonical here.
+See [`ADR-005`](../decisions/ADR-005-subtitle-v0.1-scope.md) for the full
+reasoning. **No V0.1 implementer needs to read further to build
+`/manifest` or `/stream`.**
+
+## `ResolutionResult` — gap identified, not yet a frozen contract in this file
+
+`docs/architecture/13-roadmap.md` lists `ResolutionResult` in the V0.1
+`CORE` scope, but it has no canonical home in `docs/contracts/`. Two
+non-identical drafts exist: `docs/architecture/02-domain.md` (`{ media:
+MediaRef, status: ResolutionStatus, candidates, failures, sourceCount,
+durationMs }`) and `docs/architecture/03-resolution.md` (`{ media,
+executions, candidates }`, no `status`/`failures`/`sourceCount`/
+`durationMs`). This gap was identified during the 2026-09-29
+normalization pass but is **not yet resolved** — see `OPEN-12` in
+`docs/decisions/README.md`. Until resolved, an implementer MUST NOT guess
+which draft to use; this is a genuine, unresolved contract-freeze
+blocker, distinct from the subtitle deferral above (which is resolved).
 
 ## Binding invariants
 

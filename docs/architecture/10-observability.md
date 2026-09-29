@@ -483,8 +483,17 @@ That distinction matters enormously once you have multiple sources.
 
 We should eventually maintain:
 
+> **Renamed by `ADR-004` (2026-09-29):** this type was originally also
+> called `SourceHealth`, colliding with a differently-shaped
+> runtime-internal counters type of the same name in `04-providers.md`.
+> It is renamed `SourceHealthSnapshot` here to make clear this is a
+> derived, exportable observability view (fed by
+> `SourceHealthCounters`), distinct from the runtime-internal counters
+> and from `HealthResult`'s on-demand adapter probe. See
+> [`ADR-004`](../decisions/ADR-004-health-model-layering.md).
+
 ```ts
-export interface SourceHealth {
+export interface SourceHealthSnapshot {
   readonly adapterId: string;
 
   readonly requests: number;

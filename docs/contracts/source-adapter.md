@@ -15,35 +15,38 @@
 > **Status:** DESIGNED. No implementation of this interface exists in the
 > repository as of this revision (no `src/` directory exists yet).
 >
-> **Provenance of this shape (added during the 2026-09-29 audit pass).**
-> The original monolith stated at least **6 non-identical** `SourceAdapter`
-> shapes across its evolution (see "Known variants" below). The shape below
-> is a **reconciled synthesis**, not a verbatim quote of any single
-> section: it keeps `readonly id`/`readonly name` and
-> `Promise<readonly SourceCandidate[]>` because those converged across the
-> later majority of occurrences, and it keeps the optional `health()` probe
-> because it is the only field that gives the runtime a way to implement
-> the health/circuit-breaker model described in `06-runtime.md`. This
-> reconciliation is itself a decision, not a neutral extraction — it is
-> recorded as such rather than presented as if it were always frozen.
+> **RESOLVED by `ADR-001` (2026-09-29).** This contract previously froze a
+> minimal, `MediaRef`-based `SourceAdapter` shape as a placeholder pending
+> resolution of `OPEN-8`. Repository evidence (`03-resolution.md`'s
+> pipeline diagrams, `13-roadmap.md`'s explicit V0.1 scope) showed adapter
+> selection happens *after* identity resolution in V0.1, not before. The
+> shape below reflects that decision — see
+> [`ADR-001`](../decisions/ADR-001-source-adapter-identity-boundary.md)
+> for the full evidence and rationale.
 
 ## `SourceAdapter`
 
-The adapter interface is intentionally the smallest possible surface that
-lets a new source be added without modifying the resolver core.
+Adapters are selected **after** identity resolution: the resolver first
+produces a `CanonicalMedia` (see `docs/contracts/identity.md`), then
+filters adapters, then calls `resolve()` with that resolved identity —
+never with a raw, identity-unresolved `MediaRef`.
 
 ```ts
 export interface SourceAdapter {
   readonly id: string;
   readonly name: string;
+  readonly capabilities: SourceCapabilities;
 
-  /** Cheap, synchronous applicability check — no I/O. */
-  supports(media: MediaRef): boolean;
+  /** Cheap, pre-identity filter — no I/O (e.g. "I only handle movies"). */
+  supportsMedia(media: MediaRef): boolean;
 
-  /** Produce zero or more candidates for a media reference. */
+  /** Post-identity-resolution filter (e.g. "I require a TMDB id"). */
+  supportsIdentity(identities: readonly ExternalIdentity[]): boolean;
+
+  /** Only ever called once identity has been resolved. */
   resolve(
-    media: MediaRef,
-    ctx: ResolveContext
+    media: CanonicalMedia,
+    context: ResolveContext
   ): Promise<readonly SourceCandidate[]>;
 
   /** Optional liveness/capability probe, independent of any single request. */
@@ -51,31 +54,34 @@ export interface SourceAdapter {
 }
 ```
 
-### Known variants (audit findings, not part of the frozen shape)
+`SourceCapabilities` is a per-adapter declaration used for routing (see
+`docs/architecture/04-providers.md`, "Capability Routing"); its exact
+field list is PROPOSED, not yet frozen — treat it as an extension point,
+not a closed contract.
+
+### Known variants (audit findings, historical)
 
 The monolith contains five other `SourceAdapter` shapes that do **not**
-match the frozen contract above. None of them is silently discarded —
-they are classified here so implementers know which ones are dead ends
-and which one is a live open question:
+match the frozen contract above. All are HISTORICAL / SUPERSEDED per
+`ADR-001` — none is a live open question anymore:
 
 | Variant (source location) | Difference from frozen shape | Classification |
 |---|---|---|
-| `04-providers.md` — first "Adapter contract" occurrence | No `health()` | HISTORICAL — superseded, informational only |
-| `04-providers.md` — second occurrence | No `health()`, otherwise identical to frozen shape | HISTORICAL — superseded |
-| `04-providers.md` — third occurrence | `id` only (no `name`); `supports(media: CanonicalMedia)` not `MediaRef`; `resolve(query: SourceQuery, ctx)` not `resolve(media, ctx)` | HISTORICAL — a structurally different draft (query-object style), superseded |
-| `04-providers.md` — fifth occurrence | Adds `readonly capabilities: SourceCapabilities` | **OPEN — see decisions/README.md (OPEN-8)**: capability declaration may belong on the frozen contract |
-| `04-providers.md` — sixth/last occurrence | Splits `supports` into `supportsMedia(media)` / `supportsIdentity(identities)`; `resolve(media: CanonicalMedia, context)` operates on a **resolved identity**, not a raw `MediaRef` | **OPEN — see decisions/README.md (OPEN-8)**: this is the most-evolved shape in the monolith and was never reconciled with the frozen one |
-
-`OPEN-8` is the single most consequential open question in this contract:
-whether v0.1 ships the minimal `MediaRef`-based adapter above, or the
-later identity-aware/capability-aware shape. This must be resolved with
-an ADR before implementation starts, not inferred from "whichever occurs
-last in the document."
+| `04-providers.md` — first "Adapter contract" occurrence (`Model A`) | Raw `MediaRef`, single `supports()`, no `capabilities` | HISTORICAL — superseded by `ADR-001` |
+| `04-providers.md` — second occurrence | Same as Model A, no `health()` | HISTORICAL — superseded |
+| `04-providers.md` — third occurrence | `id` only (no `name`); `supports(media: CanonicalMedia)`; `resolve(query: SourceQuery, ctx)` (query-object style) | HISTORICAL — a structurally different, abandoned draft, superseded |
+| `04-providers.md` — fifth occurrence | Adds `readonly capabilities: SourceCapabilities` but keeps single `supports(MediaRef)` and `resolve(MediaRef, ...)` | HISTORICAL — an intermediate step toward the frozen shape, superseded |
+| `04-providers.md` — sixth/last occurrence | Matches the frozen shape exactly except omitting `health()` | **This is the frozen shape's primary source** — `health()` was added back in per `ADR-001`'s synthesis rationale |
 
 Invariants that bind every implementation of this interface (see
 `docs/architecture/04-providers.md` and `docs/architecture/05-policy.md`
 for the rationale behind each):
 
+- `supportsMedia()` MUST NOT perform I/O — it is a cheap, synchronous,
+  pre-identity filter.
+- `supportsIdentity()` is only ever called once identity resolution has
+  produced at least a candidate set of `ExternalIdentity` values for the
+  request (see `docs/architecture/03-resolution.md`, "identity filter").
 - `resolve()` MUST honor `ctx.signal` (abort) and `ctx.timeoutMs` — an
   adapter that ignores cancellation can stall the whole aggregation fan-out.
 - `resolve()` MUST NOT throw for "no results" — an empty array is a valid,
@@ -88,6 +94,7 @@ for the rationale behind each):
 - `health()` reports *liveness*, not permission — a healthy adapter is not
   automatically an authorized one (see `docs/architecture/05-policy.md`,
   "Trusted vs untrusted providers").
+
 - An adapter MUST NOT read ambient globals (env vars, filesystem, network
   config) directly; everything it needs arrives through `ResolveContext`
   or its own constructor-injected configuration (see
@@ -143,25 +150,45 @@ export interface HealthResult {
 }
 ```
 
-> **OPEN-1 — architectural contradiction, see `docs/decisions/README.md`.**
-> Two other, materially different "is this provider healthy" shapes exist
-> and are not reconciled with `HealthResult`:
-> `interface SourceHealth { successes; failures; timeouts; latencyMs }`
-> (`04-providers.md`, adapter-local counters) and a richer
-> `interface SourceHealth { adapterId; requests; successes; empty;
-> failures; timeoutCount; consecutiveFailures; latency: {p50,p95,p99} }`
-> (`10-observability.md`, an operational metrics snapshot). All three
-> could be the same concept at different layers (point-in-time probe vs.
-> running counters vs. exported metrics), or two of them could be
-> accidental duplicates. Do not treat them as interchangeable until an ADR
-> resolves the shape and the relationship between them.
+> **RESOLVED by `ADR-004` (2026-09-29).** Two other "is this provider
+> healthy" shapes exist and are legitimately distinct layers, not
+> duplicates or competitors of `HealthResult`:
+> `SourceHealthCounters` (`04-providers.md`, renamed from the former
+> `SourceHealth`; runtime-internal rolling counters that feed the circuit
+> breaker) and `SourceHealthSnapshot` (`10-observability.md`, renamed from
+> a second, differently-shaped `SourceHealth`; a derived, exported metrics
+> view). `HealthResult` is the adapter's own on-demand, point-in-time
+> self-report. See
+> [`ADR-004`](../decisions/ADR-004-health-model-layering.md) for the full
+> layering rationale — do not reintroduce the name `SourceHealth` for
+> either of the other two shapes.
 
 ## Provider / adapter registry
 
+> **RESOLVED by `ADR-003` (2026-09-29).** `SourceRegistry` (sources only)
+> is the V0.1-frozen registry. The generalized `ProviderRegistry<T>` below
+> is explicitly **PROPOSED / DEFERRED to V0.2+**, for when metadata,
+> subtitle, or catalog providers are introduced (none exist in V0.1 scope
+> — see `docs/architecture/13-roadmap.md`). See
+> [`ADR-003`](../decisions/ADR-003-provider-registry-ownership.md).
+
 Two shapes appear across the design's evolution:
 
+> **OPEN-11 — follow-up from `ADR-001`, non-blocking for freeze, blocking
+> for implementation.** The `SourceRegistry.applicable()` method below
+> still calls `adapter.supports(media)`, a method that no longer exists on
+> the frozen `SourceAdapter` (replaced by `supportsMedia`/
+> `supportsIdentity` per `ADR-001`). This code sample was not rewritten to
+> avoid inventing an unreviewed two-stage filtering method signature. An
+> implementer MUST NOT copy this method verbatim — a corresponding
+> `ADR-006` (or a straightforward two-method split, e.g.
+> `applicableByMedia(media: MediaRef)` and
+> `applicableByIdentity(identities: readonly ExternalIdentity[])`) is
+> needed before `SourceRegistry` can be implemented. See
+> `docs/decisions/README.md`.
+
 ```ts
-// Early, single-purpose shape (sources only)
+// Early, single-purpose shape (sources only) — see OPEN-11 above
 export class SourceRegistry {
   private readonly adapters = new Map<string, SourceAdapter>();
 

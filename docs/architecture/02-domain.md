@@ -602,6 +602,17 @@ Do not arbitrarily choose.
 
 Return:
 
+> **Note (`OPEN-10`, 2026-09-29, non-blocking):** this 3-state union
+> (`resolved`/`ambiguous`/`not_found`) does not list a `not_resolved`
+> state, while `IdentityReceipt.outcome`
+> (`docs/architecture/07-evidence.md`) has a 4th state, `not_resolved`
+> (distinct from `not_found` — e.g. a provider timeout vs. a genuine
+> negative match). This is a minor, low-severity inconsistency, not
+> resolved by any ADR in this pass — see `OPEN-10` in
+> `docs/decisions/README.md`. It does not block the V0.1 contract freeze
+> because no frozen V0.1 contract currently branches on a `not_resolved`
+> value of `IdentityResolution` itself.
+
 ```ts
 export type IdentityResolution =
   | {
@@ -736,6 +747,15 @@ export interface NamespacedId {
 ```
 
 ## Subtitle architecture
+
+> **DEFERRED by `ADR-005` (2026-09-29).** Subtitles are out of V0.1 freeze
+> scope entirely (`/subtitles` is `NOT YET ADVERTISED` per
+> `docs/architecture/13-roadmap.md`). This document contains **four**
+> non-identical `SubtitleCandidate` drafts (here, and further below);
+> none is chosen as canonical, since none has a V0.1 consumer. All four
+> are PROPOSED/EXPLORATORY material for a future V0.2+ subtitle contract.
+> See [`ADR-005`](../decisions/ADR-005-subtitle-v0.1-scope.md) and
+> `docs/contracts/stream.md`.
 
 Subtitles should not be bolted onto `SourceCandidate`.
 

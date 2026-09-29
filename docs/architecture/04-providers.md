@@ -169,8 +169,19 @@ Source
 
 Then maintain a bounded rolling score.
 
+> **Renamed by `ADR-004` (2026-09-29):** this type was originally also
+> called `SourceHealth`, colliding with a differently-shaped type of the
+> same name in `10-observability.md`. It is renamed
+> `SourceHealthCounters` here to make clear this is the runtime-internal,
+> per-call rolling counter state that feeds circuit-breaker decisions —
+> distinct from `SourceHealthSnapshot` (the exported observability view,
+> see `10-observability.md`) and from `HealthResult`
+> (`docs/contracts/source-adapter.md`, an adapter's own on-demand,
+> point-in-time probe). See
+> [`ADR-004`](../decisions/ADR-004-health-model-layering.md).
+
 ```ts
-interface SourceHealth {
+interface SourceHealthCounters {
   successes: number;
   failures: number;
   timeouts: number;
@@ -1343,6 +1354,12 @@ export interface IdentityResolveContext {
 
 Observation:
 
+> **Extended by `ADR-002` (2026-09-29):** gains optional `matchedBy` and
+> `confidence` fields, absorbing the confidence concept previously defined
+> separately (and disconnected) in `07-evidence.md`'s now-superseded
+> `MediaIdentity`/`IdentityEvidence` model. See
+> [`ADR-002`](../decisions/ADR-002-identity-confidence-ownership.md).
+
 ```ts
 export interface IdentityObservation {
   readonly status: "resolved" | "not_found" | "ambiguous" | "not_resolved";
@@ -1352,6 +1369,17 @@ export interface IdentityObservation {
   readonly source: string;
 
   readonly observedAt: string;
+
+  /** How this observation was matched, if known. */
+  readonly matchedBy?:
+    | "exact_id"
+    | "external_id"
+    | "title_year"
+    | "title_episode"
+    | "manual";
+
+  /** How much this specific observation should be trusted. */
+  readonly confidence?: "verified" | "probable" | "ambiguous";
 }
 ```
 
