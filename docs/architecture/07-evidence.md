@@ -53,6 +53,17 @@
 
 ## Adapter execution should produce evidence
 
+> **Historical (distinct, non-converged variant), per `ADR-007`
+> (2026-09-29, second session).** This `AdapterExecution` draft uses
+> `startedAt`/`completedAt` and a typed `failure?: SourceFailure` instead
+> of `durationMs`/`error?: string`, and its own 6-value `status` union.
+> The canonical `AdapterExecution` (fields converged independently across
+> `docs/architecture/04-providers.md` and `docs/architecture/06-runtime.md`)
+> is defined in [`docs/contracts/result.md`](../contracts/result.md). This
+> draft's timestamp/typed-failure approach is preserved as a plausible
+> future direction for a dedicated execution-receipt contract, not
+> discarded.
+
 Instead of:
 
 ```ts
@@ -62,6 +73,7 @@ Promise<SourceCandidate[]>
 I recommend:
 
 ```ts
+// HISTORICAL variant — see note above and docs/contracts/result.md
 export interface AdapterExecution {
   adapterId: string;
 
@@ -989,6 +1001,54 @@ If deleting a derived index destroys authoritative facts, the
 boundary has failed.
 
 ## Receipt architecture
+
+> **Receipt family audit note (2026-09-29, second session).** This is not
+> one duplicated concept but at least three legitimate layers, confirmed
+> by re-reading every field across the receipt/evidence family:
+>
+> ```text
+> EvidenceRecord<T>            (generic envelope: core fact + hash + provenance)
+>      ↓
+> domain-specific receipts     (fact-recording, each with its own `outcome`)
+>      ├── IdentityReceipt
+>      ├── MetadataReceipt
+>      └── SourceExecutionReceipt
+>      ↓
+> ReceiptEnvelope               (transport/storage metadata: receiptId,
+>                                generation, createdAt, kind, schemaVersion)
+> ```
+>
+> Two field-naming patterns were checked and found to be **intentional,
+> not contradictory**: (1) `observedAt` (a single point when evidence was
+> gathered — `IdentityReceipt`, `MetadataReceipt`, `EvidenceRecord`) is
+> deliberately distinct from `startedAt`/`completedAt` (a duration for
+> work actually performed — `SourceExecutionReceipt`, mirroring
+> `AdapterExecution`'s `durationMs`) and from `createdAt` (when the
+> envelope/record object itself was created, potentially later than the
+> observation — `ReceiptEnvelope`). (2) `outcome` (used consistently by
+> all three fact-recording receipts) is deliberately distinct from
+> `status` (used by `AdapterExecution` and `AdmissionDecision`, which
+> describe execution/decision state, not a recorded fact). Neither
+> distinction should be collapsed.
+>
+> One naming inconsistency **was** found and is not yet resolved:
+> `SourceExecutionReceipt.sourceId` and `AdapterExecution.adapterId`
+> (`docs/contracts/result.md`) both identify the same underlying
+> `SourceAdapter.id`, under two different field names. This is low
+> severity (neither type references the other's field, so no confusion
+> at the type level) but is recorded as `OPEN-14` for a future pass to
+> pick one name.
+>
+> A second, more substantive gap was also found: `ReceiptEnvelope` is
+> introduced as a common wrapper ("subsystem-specific payloads remain
+> strongly typed") but no example ever shows the actual composition (e.g.
+> a generic `ReceiptEnvelope<T> extends ... { payload: T }`, or each
+> receipt independently including its own copy of the envelope fields).
+> This is **not resolved** in this pass — it does not affect any V0.1
+> CORE-scope contract, but it does affect `docs/contracts/evidence.md`'s
+> receipt portion, which remains `NOT_FROZEN` for this reason among
+> others. See `OPEN-14` and the evidence-contract status in
+> `docs/architecture/documentation-audit.md`.
 
 We now have several receipts:
 

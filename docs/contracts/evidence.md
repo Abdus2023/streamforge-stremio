@@ -89,7 +89,26 @@ lowest or highest common level (see `docs/architecture/07-evidence.md`,
   model and the testing/CI process itself — see
   `docs/architecture/11-testing.md`.
 
+## Receipts (NOT FROZEN)
+
+`docs/architecture/13-roadmap.md`'s V0.1 `EVIDENCE` scope names
+"receipts" alongside observations and generation identity. The receipt
+family (`IdentityReceipt`, `SourceExecutionReceipt`, `MetadataReceipt`,
+`EvidenceRecord<T>`, `ReceiptEnvelope`) is documented in
+`docs/architecture/07-evidence.md`, "Receipt architecture," with a
+confirmed 3-layer model (`EvidenceRecord<T>` → domain receipts →
+`ReceiptEnvelope`) and confirmed-intentional field-naming distinctions
+(`observedAt` vs. `startedAt`/`completedAt` vs. `createdAt`; `outcome` vs.
+`status`). **It is not frozen here**: `ReceiptEnvelope`'s exact
+composition with the domain-specific receipt payloads is unspecified (see
+`OPEN-14` in `docs/decisions/README.md`), and `SourceExecutionReceipt.
+sourceId` vs. `docs/contracts/result.md`'s `AdapterExecution.adapterId`
+is an unreconciled naming inconsistency (same `OPEN-14`). Do not treat any
+receipt shape in `07-evidence.md` as frozen until `OPEN-14` is resolved.
+
 ## Related contracts
 
 - Identity observations that carry these levels: `docs/contracts/identity.md`
 - Candidate fields that carry these levels: `docs/contracts/stream.md`
+- `AdapterExecution`, the per-adapter execution evidence consumed to build
+  a `SourceExecutionReceipt`: `docs/contracts/result.md`
