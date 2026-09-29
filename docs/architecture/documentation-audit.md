@@ -61,7 +61,7 @@ repository's documentation must be `DESIGNED` or `PROPOSED`, never
 
 | Contract file | Owned concepts | Internally consistent? | Blocking `OPEN` items | Contract status |
 |---|---|---|---|---|
-| `contracts/source-adapter.md` | `SourceAdapter`, `ResolveContext`, `HealthResult`, `SourceHealthCounters`/`SourceHealthSnapshot`, `SourceRegistry`/`ProviderRegistry<T>` | `ResolveContext` converged (`RESOLVED-1`); `SourceAdapter` boundary resolved (`ADR-001`); health layering resolved (`ADR-004`); registry ownership resolved (`ADR-003`) | `OPEN-9` (low severity, additive); `OPEN-11` (registry `applicable()` needs re-specification — **blocks implementation, not the shape freeze**) | **FREEZE-READY** for the `SourceAdapter`/`HealthResult`/`SourceHealthCounters`/`SourceHealthSnapshot`/`SourceRegistry` shapes themselves; `OPEN-11` must still be closed before an implementer can write `SourceRegistry.applicable()` without guessing |
+| `contracts/source-adapter.md` | `SourceAdapter`, `ResolveContext`, `HealthResult`, `SourceHealthCounters`/`SourceHealthSnapshot`, `SourceRegistry`/`ProviderRegistry<T>` | `ResolveContext` converged (`RESOLVED-1`); `SourceAdapter` boundary resolved (`ADR-001`); health layering resolved (`ADR-004`); registry-vs-generic-registry ownership resolved (`ADR-003`); **but** an admission-lifecycle-integrated 6th `SourceRegistry` shape was found this pass and is unreconciled | `OPEN-9` (low severity, additive); `OPEN-11` (registry `applicable()` needs re-specification); `OPEN-13` (**newly discovered, BLOCKING** — admission-lifecycle registry vs. simple registry) | **FREEZE-READY** for `SourceAdapter`/`HealthResult`/`SourceHealthCounters`/`SourceHealthSnapshot` themselves; **`SourceRegistry` is NOT_FROZEN** — `OPEN-11` and `OPEN-13` are both open and `OPEN-13` was missed by the first two ADR-writing passes, found only on independent re-scan |
 | `contracts/identity.md` | `MediaRef`, `ExternalIdentity`, `CanonicalMedia` | Yes, after superseding 3 `MediaRef` and 3 `CanonicalMedia` drafts (`RESOLVED`); confidence ownership resolved (`ADR-002`) | `OPEN-10` (low severity, non-blocking — `IdentityResolution` vs. `IdentityReceipt.outcome` state-count mismatch) | **FROZEN** |
 | `contracts/stream.md` | `SourceCandidate`, `Stream`, `ResolutionResult`, subtitle candidates (deferred) | `SourceCandidate`/`Stream` consistent after superseding 1 draft; subtitles formally deferred, not a blocker (`ADR-005`); `ResolutionResult` has no canonical shape | `OPEN-7` (resolved, informational); `OPEN-12` (**blocking** — `ResolutionResult` has two non-identical drafts and no contract-file home) | **NOT_FROZEN** — `SourceCandidate`/`Stream` are freeze-ready; `ResolutionResult` (listed in V0.1 CORE scope) is the blocker |
 | `contracts/runtime.md` | `RuntimeSnapshot`, `ConfigurationTransaction`, `RuntimePolicy` | Yes — the only occurrence of each in `09-control-plane.md` matches this file exactly, no competing drafts found | none — its `SourceAdapter`-shaped dependency (`AdmittedSource`) is now resolved via `ADR-001` | **FROZEN** |
@@ -69,9 +69,12 @@ repository's documentation must be `DESIGNED` or `PROPOSED`, never
 
 Two contracts (`identity.md`, `runtime.md`) now qualify for
 `CONTRACT_FREEZE` per the 14-point checklist in `docs/architecture.md`.
-`source-adapter.md`'s shapes are freeze-ready but implementation is
-blocked by `OPEN-11`. `stream.md` and `evidence.md` remain `NOT_FROZEN`.
-See §7 for the precise remaining unblocking conditions.
+`source-adapter.md`'s `SourceAdapter`/health types are freeze-ready, but
+its `SourceRegistry` portion is blocked by `OPEN-11` and, more
+significantly, the newly-discovered `OPEN-13` (an unreconciled
+admission-lifecycle registry variant). `stream.md` and `evidence.md`
+remain `NOT_FROZEN`. See §7 for the precise remaining unblocking
+conditions.
 
 ---
 
@@ -85,7 +88,7 @@ See §7 for the precise remaining unblocking conditions.
 | `SourceAdapter` | `contracts/source-adapter.md` | `04-providers.md` ×6 (5 now HISTORICAL) | Resolved — adapter selection happens after identity resolution | `ADR-001` adopted the identity/capability-aware shape (`supportsMedia`/`supportsIdentity`/`resolve(CanonicalMedia, ...)`/`health?()`); all 5 other drafts marked HISTORICAL/SUPERSEDED | `RESOLVED` by `ADR-001` |
 | `ResolveContext` | `contracts/source-adapter.md` | `04-providers.md` ×3, `06-runtime.md` ×2 | Contract previously froze the minority (1×) shape instead of the converged (4×) shape | **Corrected** the contract to the converged shape; annotated the outlier; recorded as `RESOLVED-1` / `OPEN-9` | `RESOLVED` |
 | `HealthResult` / `SourceHealthCounters` / `SourceHealthSnapshot` | `contracts/source-adapter.md` (`HealthResult`); `04-providers.md` (`SourceHealthCounters`); `10-observability.md` (`SourceHealthSnapshot`) | Previously both non-`HealthResult` types were named `SourceHealth` | Resolved — three distinct layers, not duplicates | `ADR-004` renamed the two colliding `SourceHealth` types; all three now have distinct names and a stated relationship | `RESOLVED` by `ADR-004` |
-| `SourceRegistry` / `ProviderRegistry<T>` | `contracts/source-adapter.md` | `04-providers.md` ×4 | Resolved — chronological evolution, not competing designs | `ADR-003`: `SourceRegistry` is the V0.1-frozen registry; `ProviderRegistry<T>` explicitly deferred to V0.2+ | `RESOLVED` by `ADR-003` (see also `OPEN-11`: `SourceRegistry.applicable()`'s method signature needs re-specification post-`ADR-001`) |
+| `SourceRegistry` / `ProviderRegistry<T>` | `contracts/source-adapter.md` | `04-providers.md` ×5 (corrected count — an independent re-scan found a 5th, admission-lifecycle-integrated occurrence missed by the first count of 4) | `SourceRegistry` vs. `ProviderRegistry<T>` resolved (chronological evolution); the 5th, admission-lifecycle occurrence is a **new, unreconciled contradiction** | `ADR-003`: `SourceRegistry` is the V0.1-frozen registry; `ProviderRegistry<T>` deferred to V0.2+. **Not yet resolved:** whether the admission-lifecycle `RegisteredSource`-based registry is a V0.2+ evolution, the true V0.1 shape, or a distinct upstream layer | `PARTIALLY RESOLVED` — registry genericity resolved by `ADR-003`; `OPEN-11` and `OPEN-13` remain open and block `SourceRegistry`'s own freeze |
 | `SourceCandidate` | `contracts/stream.md` | `02-domain.md` ×4 (2 non-canonical), `03-resolution.md` (canonical match) | Yes — 1 draft uses `authorized: boolean`, violating the tri-state invariant | Annotated in place; superseded; recorded as `OPEN-7` | `RESOLVED` |
 | `Stream` | `contracts/stream.md` | none found duplicated | No | none needed | `RESOLVED` |
 | `SubtitleCandidate` | *(none — deferred, not frozen)* | `02-domain.md` ×4 (corrected count; was previously miscounted as 3) | Not diffed field-by-field — moot, since none is being frozen | `ADR-005`: subtitles deferred to V0.2+; all 4 drafts kept as PROPOSED/EXPLORATORY, none promoted | `RESOLVED` (deferred, not frozen) by `ADR-005` |
@@ -168,13 +171,16 @@ Five of the original nine blocking `OPEN` items (`OPEN-1`, `OPEN-2`,
 `OPEN-3`, `OPEN-4`, `OPEN-8`) were resolved this pass via `ADR-001`
 through `ADR-005`. Remaining conditions for full `CONTRACT_FREEZE`:
 
-1. **`source-adapter.md`**: shapes themselves are now freeze-ready
-   (`ADR-001`, `ADR-003`, `ADR-004`). `OPEN-11` must still be closed
-   (`SourceRegistry.applicable()`'s method signature needs re-specifying
-   into the two-stage `supportsMedia`/`supportsIdentity` filter implied
-   by `ADR-001`) before an implementer can build `SourceRegistry` without
-   guessing. `OPEN-9` remains open but is explicitly non-blocking
-   (additive, does not change the frozen shape).
+1. **`source-adapter.md`**: `SourceAdapter`/`HealthResult`/
+   `SourceHealthCounters`/`SourceHealthSnapshot` are now freeze-ready
+   (`ADR-001`, `ADR-004`). `SourceRegistry` is **not** freeze-ready:
+   `OPEN-11` (method signature needs re-specifying into the two-stage
+   `supportsMedia`/`supportsIdentity` filter implied by `ADR-001`) and
+   `OPEN-13` (an admission-lifecycle-integrated 6th registry shape, found
+   only on independent re-scan, not reconciled with the simple frozen
+   registry) both need a resolution — `OPEN-13` likely needs a dedicated
+   ADR, not just an edit. `OPEN-9` remains open but is explicitly
+   non-blocking (additive, does not change the frozen shape).
 2. **`identity.md`**: **FROZEN.** `OPEN-2` resolved by `ADR-002`.
    `OPEN-10` (a 3-state vs. 4-state mismatch between `IdentityResolution`
    and `IdentityReceipt.outcome`) remains open but does not block any

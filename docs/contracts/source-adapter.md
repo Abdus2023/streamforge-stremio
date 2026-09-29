@@ -228,6 +228,19 @@ dynamic/arbitrary adapter registration via HTTP or any other externally
 reachable interface — this is a standing security invariant, not just an
 implementation detail (see `docs/architecture/05-policy.md`).
 
+> **OPEN-13 — newly discovered, BLOCKING, not resolved this pass.**
+> `docs/architecture/04-providers.md`'s "Registry redesign" section
+> defines a materially different, admission-lifecycle-integrated
+> `SourceRegistry` that stores `RegisteredSource { declaration:
+> SourceDeclaration; admission: AdmissionDecision; adapter?: SourceAdapter
+> }` and exposes `executable(): SourceAdapter[]`, driven by
+> `docs/architecture/05-policy.md`'s `evaluateAdmission()`. This was not
+> reconciled with the simpler `register(adapter)/all()/applicable(media)`
+> shape frozen above. Do not assume the two are the same registry, and do
+> not assume one supersedes the other — an implementer must not guess
+> whether admission-lifecycle state belongs inside `SourceRegistry` or one
+> layer upstream of it. See `OPEN-13` in `docs/decisions/README.md`.
+
 ## Related contracts
 
 - Candidate/stream shapes produced by `resolve()`: `docs/contracts/stream.md`
