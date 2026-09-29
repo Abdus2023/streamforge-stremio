@@ -238,6 +238,12 @@ The Stremio mapper does not perform resolution, authorization, deduplication, or
 
 The internal unit of aggregation is a `SourceCandidate`.
 
+> The normative, frozen definition of `SourceCandidate` lives in
+> [`docs/contracts/stream.md`](docs/contracts/stream.md). The shape below
+> is a compatible illustration for README purposes (non-`readonly`, for
+> readability) — if it ever drifts from the contract file, the contract
+> file wins.
+
 Conceptually:
 
 ```ts
@@ -321,6 +327,12 @@ This architecture is designed for sources that are:
 StreamForge does not treat the existence of a publicly reachable URL as proof that its use is authorized.
 
 ## Source adapter contract
+
+> The normative, frozen definition of `SourceAdapter` (including the
+> optional `health()` probe and the still-open question of whether
+> capability/identity-aware adapters belong in this contract) lives in
+> [`docs/contracts/source-adapter.md`](docs/contracts/source-adapter.md).
+> The shape below is a simplified illustration for README purposes.
 
 Adapters implement a narrow interface:
 
@@ -602,6 +614,14 @@ An optional source becoming unavailable should normally produce degraded functio
 
 ## Repository structure
 
+> **Status: DESIGNED, not present.** No implementation exists in this
+> repository yet — there is no `src/`, `test/`, `Dockerfile`,
+> `compose.yaml`, `tsconfig.json`, or `package-lock.json` on disk today
+> (verified 2026-09-29). The tree below is the **target** layout the
+> architecture is designed against, not a description of what currently
+> exists. See [`docs/architecture/13-roadmap.md`](docs/architecture/13-roadmap.md)
+> for the authoritative implemented/planned breakdown.
+
 ```
 streamforge-stremio/
 │
@@ -665,6 +685,15 @@ streamforge-stremio/
 ```
 
 ## Development
+
+> **Status: DESIGNED, not present.** `package.json` in this repository
+> currently defines no `scripts` and no `dependencies` (verified
+> 2026-09-29). The commands below are the **intended** developer workflow
+> once implementation begins; running them today will fail with
+> "missing script" errors. This is not a documentation error to silently
+> fix by adding placeholder scripts — see
+> [`docs/architecture/13-roadmap.md`](docs/architecture/13-roadmap.md) for
+> the construction sequence that precedes real scripts existing.
 
 Requirements:
 
@@ -807,23 +836,34 @@ release tag
 
 ## Current scope
 
-The initial release focuses on the aggregation kernel:
+> **Status: all items below are DESIGNED, none are IMPLEMENTED.** The
+> checkmarks describe what the *initial release is designed to cover*,
+> not what exists in this repository today — there is no `src/` or
+> `test/` directory yet (verified 2026-09-29). See
+> [`docs/architecture/13-roadmap.md`](docs/architecture/13-roadmap.md) for
+> the authoritative, evidence-based implementation-status ledger.
+
+The initial release is designed to cover the aggregation kernel:
 
 ```
-✓ domain model
-✓ source adapter contract
-✓ registry
-✓ candidate validation
-✓ authorization policy
-✓ deduplication
-✓ deterministic ranking
-✓ timeout propagation
-✓ concurrency control
-✓ resolver result semantics
-✓ Stremio stream mapping
-✓ health model
-✓ test architecture
+✓ domain model            (DESIGNED)
+✓ source adapter contract (DESIGNED)
+✓ registry                (DESIGNED)
+✓ candidate validation    (DESIGNED)
+✓ authorization policy    (DESIGNED)
+✓ deduplication           (DESIGNED)
+✓ deterministic ranking   (DESIGNED)
+✓ timeout propagation     (DESIGNED)
+✓ concurrency control     (DESIGNED)
+✓ resolver result semantics (DESIGNED)
+✓ Stremio stream mapping  (DESIGNED)
+✓ health model            (DESIGNED)
+✓ test architecture       (DESIGNED)
 ```
+
+Here, "✓" means "the design for this is written down," not "this is
+built." Nothing in this list has a corresponding file in `src/` or `test/`
+yet.
 
 The following remain separate expansion stages:
 

@@ -59,6 +59,15 @@ and any future architecture decisions, are recorded in
 [`../decisions/README.md`](../decisions/README.md) rather than being
 silently resolved.
 
+## Audit
+
+A deep documentation verification / contract-freeze audit was performed on
+2026-09-29. Its findings (concept ownership matrix, contract-freeze status
+per contract, protocol-leakage check, and precise blocking conditions) are
+recorded in [`documentation-audit.md`](./documentation-audit.md). As of
+that audit, **no contract in this repository is fully frozen** — see that
+file and `../decisions/README.md` for exactly what remains open.
+
 ## Provenance of this structure
 
 This directory was produced by migrating `docs/architecture.md` (a single

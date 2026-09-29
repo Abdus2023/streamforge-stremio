@@ -81,6 +81,10 @@ Normative interface contracts (defined once, linked everywhere):
 Architecture decisions and open contradictions:
 [`docs/decisions/README.md`](./decisions/README.md).
 
+Contract-freeze audit evidence (concept ownership, protocol-leakage check,
+per-contract freeze status):
+[`docs/architecture/documentation-audit.md`](./architecture/documentation-audit.md).
+
 ## 5. Normative vs. explanatory
 
 Every document in `docs/architecture/` is labeled **Normative** or
@@ -139,15 +143,22 @@ authoritative implemented/partial/next/future/blocked breakdown, and
 [`architecture/11-testing.md`](./architecture/11-testing.md) for why local
 inspection is never treated as a substitute for real CI execution.
 
-## 8. Open questions
+## 8. Open questions and contract-freeze status
 
-See [`docs/decisions/README.md`](./decisions/README.md) for the full,
-current list of `OPEN — architectural contradiction` items surfaced while
-migrating this documentation (as of this revision: `HealthResult` vs. the
-provider health state machine, `CanonicalMedia` confidence, the
-unfrozen subtitle candidate shape, and the two coexisting provider
-registry shapes). Do not resolve any of these by silently editing a
-contract file — open or update an ADR first.
+A deep documentation audit (2026-09-29) field-diffed every occurrence of
+every contract-owned type across the documentation set. Result: **no
+contract in `docs/contracts/` is fully frozen yet.** See
+[`docs/architecture/documentation-audit.md`](./architecture/documentation-audit.md)
+for the full evidence and [`docs/decisions/README.md`](./decisions/README.md)
+for the itemized ledger (9 `OPEN` items, 5 `RESOLVED` with recorded
+rationale as of this revision — including one corrected contract shape,
+`ResolveContext`, where the frozen shape had picked a single-occurrence
+draft instead of the shape the design actually converged on four times).
+The single highest-priority open item is **`OPEN-8`**: the frozen
+`SourceAdapter` contract may be the wrong tier relative to the most
+evolved adapter shape found in the source material. Do not resolve any
+open item by silently editing a contract file — record the decision and
+rationale in `docs/decisions/README.md` first (or as a numbered ADR).
 
 ## 9. Provenance of this document set
 
