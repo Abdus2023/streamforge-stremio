@@ -8,8 +8,7 @@
 > explains the type's place in the domain model; `docs/architecture/08-protocols.md`
 > explains the Stremio-facing mapping; neither redefines the shapes below.
 >
-> **Status:** DESIGNED. No implementation exists in the repository as of
-> this revision.
+> **Status:** IMPLEMENTED IN V0.1 CORE. The executable TypeScript definitions are `src/domain/stream.ts`; runtime verification is not yet claimed.
 
 ## `SourceCandidate` (internal evidence object)
 

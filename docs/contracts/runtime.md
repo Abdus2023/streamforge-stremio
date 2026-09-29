@@ -9,9 +9,7 @@
 > configuration lifecycle that produces one. Neither redefines the shapes
 > below.
 >
-> **Status:** DESIGNED. No implementation exists in the repository as of
-> this revision. Field values shown (timeouts, limits) are illustrative,
-> not production-recommended defaults.
+> **Status:** CONTRACT DESIGNED; V0.1 RUNTIME IMPLEMENTATION NOT YET COMPLETE. `RuntimeSnapshot`, `ConfigurationTransaction`, and `RuntimePolicy` remain contract-only in this pass.
 
 ## `RuntimeSnapshot`
 

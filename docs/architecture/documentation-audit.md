@@ -1,4 +1,4 @@
-# Documentation Audit — Contract-Freeze Verification (2026-09-29, third pass)
+# Documentation Audit — Implementation Pass Verification (2026-09-29)
 
 [⇧ Architecture index](../architecture.md) · [⇆ Document map](./README.md)
 
@@ -9,17 +9,16 @@
 > re-run the checks described here (see "How this was produced") before
 > trusting it after further edits.
 >
-> **This revision (third pass, 2026-09-29, same day as the second pass):**
+> **This revision (implementation pass, 2026-09-29):**
 > wrote `ADR-006` and `ADR-007`, amended `ADR-001`, and created
 > `docs/contracts/result.md`, resolving the three items that blocked
 > freeze at the end of the second pass — `OPEN-11`, `OPEN-12`, and
 > `OPEN-13`. Also performed a dedicated receipt-family field audit
 > (previously an explicitly out-of-scope gap) and recorded one new,
-> **non-blocking** item, `OPEN-14`. Net result: **all previously-blocking
-> `OPEN` items are now resolved.** Remaining open items (`OPEN-9`,
-> `OPEN-10`, `OPEN-14`) are all explicitly low-severity/non-blocking. See
-> `docs/decisions/README.md` for the full, current ledger — it is the
-> source of truth; this file summarizes it.
+> **non-blocking** item, `OPEN-14`. The contract freeze remains intact. A first executable V0.1 core slice now exists under `src/`, with conformance tests under `test/`. Remaining open items (`OPEN-9`, `OPEN-10`, `OPEN-14`) are unchanged and non-blocking for the implemented core slice. See
+> `docs/decisions/README.md` for the full, current ledger — it is the source of truth; this file summarizes it.
+>
+> **Current implementation evidence:** HEAD `7b48b29cc601ff6d1b08dd62db6d671d2d7b0de0` contains `src/`, `test/`, `tsconfig.json`, and TypeScript tooling in `package.json`. Tests and typecheck have not been executed by CI; therefore implementation is present but runtime/build verification remains unverified.
 >
 > **Scope limitation, stated up front, carried over unchanged from prior
 > passes.** This repository declares ~150 distinct named interfaces/types

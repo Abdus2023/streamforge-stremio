@@ -8,8 +8,7 @@
 > resolution process around these types; they link here rather than
 > redefining the shapes.
 >
-> **Status:** DESIGNED. No implementation exists in the repository as of
-> this revision.
+> **Status:** IMPLEMENTED IN V0.1 CORE. The executable TypeScript definitions are `src/domain/identity.ts`; runtime verification is not yet claimed.
 
 ## `MediaRef`
 

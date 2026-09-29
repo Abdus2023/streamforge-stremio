@@ -12,18 +12,17 @@ stated decision *and* a stated rationale grounded in repository evidence
 evidence, it stays `OPEN` — see `docs/architecture.md`, "Maintenance
 rules."
 
-Last updated: 2026-09-29 (contract-normalization & pre-freeze execution
-pass — third pass; `ADR-006`/`ADR-007` added, `ADR-001` amended, resolving
+Last updated: 2026-09-29 (implementation pass; `ADR-006`/`ADR-007` added, `ADR-001` amended, resolving
 `OPEN-11`/`OPEN-12`/`OPEN-13`; `OPEN-14` newly recorded, non-blocking; a
 stale "three `SubtitleCandidate` drafts" wording (should be four, per
 `ADR-005`'s own corrected count) fixed in `ADR-005` and
 `docs/contracts/stream.md`; see "ADR index" below for all 7 ADRs).
 
-**Freeze-gate verdict as of this pass:** only `OPEN-9`, `OPEN-10`, and
+**Freeze-gate verdict carried into implementation:** only `OPEN-9`, `OPEN-10`, and
 `OPEN-14` remain `OPEN`, and all three are explicitly non-blocking for
 the V0.1 CORE/RUNTIME/PROVIDER scope named in
 `docs/architecture/13-roadmap.md`. No `OPEN` item blocks
-`CONTRACT_FREEZE` as of this revision — see
+`CONTRACT_FREEZE`; the first V0.1 core implementation now exists, but execution/CI verification remains open — see
 `docs/architecture/documentation-audit.md` §7 for the itemized
 resolution of each previously-blocking item (`OPEN-11`, `OPEN-12`,
 `OPEN-13`).

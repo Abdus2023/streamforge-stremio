@@ -12,8 +12,7 @@
 > filed as an `OPEN — architectural contradiction` note (see
 > `docs/decisions/README.md`).
 >
-> **Status:** DESIGNED. No implementation of this interface exists in the
-> repository as of this revision (no `src/` directory exists yet).
+> **Status:** IMPLEMENTED IN V0.1 CORE. The executable TypeScript implementation is `src/adapters/source-adapter.ts`; runtime verification is not yet claimed.
 >
 > **RESOLVED by `ADR-001` (2026-09-29), narrowed by `ADR-001`'s amendment
 > (2026-09-29, second session).** This contract previously froze a

@@ -12,8 +12,7 @@
 > redefining the types. If any other document appears to define these
 > types differently, that is a documentation defect — this file wins.
 >
-> **Status:** DESIGNED. No implementation exists in the repository as of
-> this revision (no `src/` directory exists yet).
+> **Status:** IMPLEMENTED IN V0.1 CORE. The executable TypeScript definitions are `src/domain/result.ts`; runtime verification is not yet claimed.
 >
 > **New file, created by `ADR-007` (2026-09-29, second session).**
 > `ResolutionResult` was named in `docs/architecture/13-roadmap.md`'s V0.1

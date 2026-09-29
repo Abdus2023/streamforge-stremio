@@ -2,7 +2,7 @@
 
 [⇧ Architecture index](../architecture.md) · [⇆ Document map](./README.md)
 
-> **Scope.** The construction sequence only: ARCHITECTURE → FORMAL CONTRACTS → IMPLEMENTATION → CONFORMANCE TESTS → INTEGRATION → CI EXECUTION → RELEASE GATE → TAG. Separates what is implemented, partially implemented, planned next, future, and blocked. As of this revision, the repository contains no source code, tests, or CI — so the entire V0.1 slice remains explicitly **PROPOSED/DESIGNED**, not implemented, unless a later revision of this document states otherwise with repo evidence (commit/file reference).
+> **Scope.** The construction sequence only: ARCHITECTURE → FORMAL CONTRACTS → IMPLEMENTATION → CONFORMANCE TESTS → INTEGRATION → CI EXECUTION → RELEASE GATE → TAG. The first V0.1 executable core slice now exists under `src/`, with conformance tests under `test/`. No CI workflow exists yet, and no execution evidence is claimed by this document.
 
 > **Primary dependencies:** `*`
 
