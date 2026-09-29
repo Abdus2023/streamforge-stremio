@@ -654,6 +654,15 @@ Therefore admission should retain its status.
 
 ## Admission status
 
+> **Cross-referenced by `ADR-006` (2026-09-29, second session).** This
+> `AdmissionDecision` model — and `evaluateAdmission()` below — is the
+> single authority for whether a declared source is allowed to run.
+> `docs/contracts/source-adapter.md`'s `SourceRegistry` never evaluates
+> admission itself; it only ever holds adapters that already passed
+> through this process. See
+> [`ADR-006`](../decisions/ADR-006-source-registry-admission-boundary.md)
+> for the full registry/admission boundary.
+
 Use an explicit state rather than a Boolean.
 
 ```ts

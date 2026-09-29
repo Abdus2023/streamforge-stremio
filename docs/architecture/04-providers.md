@@ -483,8 +483,17 @@ export class SourceRegistry {
 
 Now preserve failures rather than throwing them away.
 
+> **Historical (narrower draft), per `ADR-007` (2026-09-29, second
+> session).** `AdapterExecution`'s fields here match the canonical shape
+> in [`docs/contracts/result.md`](../contracts/result.md), but the
+> `AdapterStatus` union below has only 4 values — superseded by the
+> richer, 9-value, independently-converged union in
+> `docs/architecture/06-runtime.md` (mirrored in the contract file). The
+> illustrative `resolveMedia()`/`executeAdapter()` call below also predates
+> `ADR-001` (uses raw `MediaRef` instead of `CanonicalMedia`).
+
 ```ts
-// src/resolver/execute.ts
+// src/resolver/execute.ts (illustrative only — see note above)
 
 import type { SourceAdapter, ResolveContext } from "../adapters/interface.js";
 
@@ -492,6 +501,7 @@ import type { MediaRef } from "../domain/media.js";
 
 import type { SourceCandidate } from "../domain/candidate.js";
 
+// HISTORICAL — see docs/contracts/result.md for the canonical AdapterStatus
 export type AdapterStatus = "success" | "empty" | "timeout" | "error";
 
 export interface AdapterExecution {
@@ -1631,6 +1641,18 @@ Important:
 **Registered does not mean executable.**
 
 ## Registry redesign
+
+> **RESOLVED by `ADR-006` (2026-09-29, second session).** This section
+> describes the **admission process** (declaration → admission decision →
+> composition), not the `SourceRegistry` contract itself. The canonical
+> `SourceRegistry` — which holds only already-admitted, executable
+> adapters and never sees `SourceDeclaration`/`AdmissionDecision` directly
+> — is defined in
+> [`docs/contracts/source-adapter.md`](../contracts/source-adapter.md).
+> `RegisteredSource`/`executable()` below remain as historical/explanatory
+> material illustrating how admission is evaluated upstream, before an
+> adapter ever reaches `SourceRegistry.register()`. See
+> [`ADR-006`](../decisions/ADR-006-source-registry-admission-boundary.md).
 
 The previous registry stored only executable adapters.
 

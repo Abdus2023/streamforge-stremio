@@ -172,3 +172,105 @@ policy filter → rank → protocol mapping`.
 ## Status
 
 ACCEPTED. `OPEN-8` is now `RESOLVED` (see `docs/decisions/README.md`).
+
+## Amendment (2026-09-29, second session) — `name`, `capabilities`, `health()` removed from the core interface
+
+**Trigger:** a follow-up normalization pass explicitly directed keeping
+the V0.1 `SourceAdapter` surface minimal — no field or method should be
+added to the core contract unless repository evidence demonstrates it is
+required, per the standing principle "prefer one canonical contract" and
+"do not silently broaden V0.1 scope."
+
+**Re-examined evidence:**
+
+- `readonly name: string` — grepped for any consumer (`adapter.name`,
+  `.name` in a source-adapter context) across every `docs/contracts/*.md`
+  and the runtime/observability architecture docs: **no consumer exists**.
+  Nothing in the frozen contracts reads or displays this field. Removing
+  it loses nothing referenced elsewhere.
+- `readonly capabilities: SourceCapabilities` — this contract already
+  stated, in its own text, that `SourceCapabilities`'s "exact field list
+  is PROPOSED, not yet frozen." A required field of an unfrozen type
+  cannot itself be frozen. Moving it out of the core interface (as a
+  future, additive extension point) is more honest than keeping a
+  placeholder field that nothing currently depends on.
+- `health?(): Promise<HealthResult>` — `HealthResult`,
+  `SourceHealthCounters`, and `SourceHealthSnapshot` (see `ADR-004`) are
+  real, load-bearing, and stay frozen. What changes here is **only**
+  whether the probe method is a required-or-optional member of
+  `SourceAdapter` itself, versus a separate, adapter-optional capability
+  interface. No V0.1 CORE-scope consumer (per
+  `docs/architecture/13-roadmap.md`) requires every adapter to expose
+  `health()` — the runtime's health/circuit-breaker model
+  (`docs/architecture/06-runtime.md`) operates on `SourceHealthCounters`
+  derived from call outcomes, not from adapter self-reports, so
+  `health()` is genuinely optional, not core.
+- `supportsIdentity(identities: readonly ExternalIdentity[])` — **kept as
+  plural**, not narrowed to a single `ExternalIdentity`, because this is
+  the literal, repeatedly-converged shape in the only repository draft
+  this decision is based on (`docs/architecture/04-providers.md`, the
+  sixth/last `SourceAdapter` occurrence, the same draft `ADR-001`'s
+  original decision cites). A single-identity signature is not supported
+  by any repository evidence; per the standing rule "no evidence → no
+  verified claim," the plural, evidence-backed signature is retained.
+
+**Decision:** the frozen V0.1 `SourceAdapter` interface is narrowed to:
+
+```ts
+export interface SourceAdapter {
+  readonly id: string;
+
+  /** Cheap, pre-identity filter — no I/O. */
+  supportsMedia(media: MediaRef): boolean;
+
+  /** Post-identity-resolution filter. */
+  supportsIdentity(identities: readonly ExternalIdentity[]): boolean;
+
+  /** Only ever called once identity has been resolved. */
+  resolve(
+    media: CanonicalMedia,
+    context: ResolveContext
+  ): Promise<readonly SourceCandidate[]>;
+}
+```
+
+`name`, `capabilities`, and `health()` are **not part of the core
+contract**. They are preserved as documented, optional extension points:
+
+```ts
+/** Optional — adapters MAY implement this for a human-readable label. */
+export interface Named {
+  readonly name: string;
+}
+
+/** Optional — adapters MAY implement this for liveness probing. */
+export interface HealthCheckable {
+  health(): Promise<HealthResult>;
+}
+
+/** Optional, PROPOSED — capability declaration for future routing;
+ *  not part of the frozen V0.1 surface (see docs/architecture/04-providers.md,
+ *  "Capability Routing"). */
+export interface CapabilityDeclaring {
+  readonly capabilities: SourceCapabilities;
+}
+```
+
+The runtime and registry MUST NOT require any adapter to implement
+`Named`, `HealthCheckable`, or `CapabilityDeclaring` in V0.1 — they are
+feature-detected (`if ("health" in adapter)`), never assumed.
+
+**Rationale:** this is scope narrowing, not a new architectural claim —
+nothing was invented that isn't already documented elsewhere in the
+repository; three fields were moved from "required on every adapter" to
+"optional, adapter-declared." No `OPEN` item is closed or reopened by this
+amendment; `OPEN-8`/this ADR's core decision (identity-resolution-before-
+adapter-selection, and the `resolve(CanonicalMedia, ...)` signature) is
+unchanged.
+
+**Affected contracts:** `docs/contracts/source-adapter.md` — `SourceAdapter`
+interface narrowed; `Named`/`HealthCheckable`/`CapabilityDeclaring` added
+as separate, optional interfaces.
+
+**Status of amendment:** ACCEPTED.
+

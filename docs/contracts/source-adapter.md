@@ -15,14 +15,18 @@
 > **Status:** DESIGNED. No implementation of this interface exists in the
 > repository as of this revision (no `src/` directory exists yet).
 >
-> **RESOLVED by `ADR-001` (2026-09-29).** This contract previously froze a
+> **RESOLVED by `ADR-001` (2026-09-29), narrowed by `ADR-001`'s amendment
+> (2026-09-29, second session).** This contract previously froze a
 > minimal, `MediaRef`-based `SourceAdapter` shape as a placeholder pending
 > resolution of `OPEN-8`. Repository evidence (`03-resolution.md`'s
 > pipeline diagrams, `13-roadmap.md`'s explicit V0.1 scope) showed adapter
-> selection happens *after* identity resolution in V0.1, not before. The
-> shape below reflects that decision — see
+> selection happens *after* identity resolution in V0.1, not before. A
+> follow-up normalization pass then narrowed the interface further,
+> removing `name`, `capabilities`, and `health()` from the *core* contract
+> (no V0.1 consumer required them on every adapter) — they remain as
+> separate, optional extension interfaces. See
 > [`ADR-001`](../decisions/ADR-001-source-adapter-identity-boundary.md)
-> for the full evidence and rationale.
+> for the full evidence and rationale, including its amendment section.
 
 ## `SourceAdapter`
 
@@ -34,8 +38,6 @@ never with a raw, identity-unresolved `MediaRef`.
 ```ts
 export interface SourceAdapter {
   readonly id: string;
-  readonly name: string;
-  readonly capabilities: SourceCapabilities;
 
   /** Cheap, pre-identity filter — no I/O (e.g. "I only handle movies"). */
   supportsMedia(media: MediaRef): boolean;
@@ -48,16 +50,37 @@ export interface SourceAdapter {
     media: CanonicalMedia,
     context: ResolveContext
   ): Promise<readonly SourceCandidate[]>;
-
-  /** Optional liveness/capability probe, independent of any single request. */
-  health?(): Promise<HealthResult>;
 }
 ```
 
-`SourceCapabilities` is a per-adapter declaration used for routing (see
-`docs/architecture/04-providers.md`, "Capability Routing"); its exact
-field list is PROPOSED, not yet frozen — treat it as an extension point,
-not a closed contract.
+This is the entire required V0.1 surface. Nothing else is mandatory on an
+adapter.
+
+### Optional extension interfaces
+
+These are **not part of the core `SourceAdapter` contract**. An adapter
+MAY implement any subset of them; the runtime and registry MUST feature-
+detect them (e.g. `if (typeof adapter.health === "function")`) and MUST
+NOT assume any adapter implements them.
+
+```ts
+/** Optional — a human-readable label, e.g. for logs/diagnostics. */
+export interface Named {
+  readonly name: string;
+}
+
+/** Optional — liveness/capability probe, independent of any single request. */
+export interface HealthCheckable {
+  health(): Promise<HealthResult>;
+}
+
+/** Optional, PROPOSED — capability declaration for future routing; its
+ *  exact field list is not yet frozen (see docs/architecture/04-providers.md,
+ *  "Capability Routing"). Not required for V0.1. */
+export interface CapabilityDeclaring {
+  readonly capabilities: SourceCapabilities;
+}
+```
 
 ### Known variants (audit findings, historical)
 
@@ -67,11 +90,11 @@ match the frozen contract above. All are HISTORICAL / SUPERSEDED per
 
 | Variant (source location) | Difference from frozen shape | Classification |
 |---|---|---|
-| `04-providers.md` — first "Adapter contract" occurrence (`Model A`) | Raw `MediaRef`, single `supports()`, no `capabilities` | HISTORICAL — superseded by `ADR-001` |
+| `04-providers.md` — first "Adapter contract" occurrence (`Model A`) | Raw `MediaRef`, single `supports()`, no capability declaration | HISTORICAL — superseded by `ADR-001` |
 | `04-providers.md` — second occurrence | Same as Model A, no `health()` | HISTORICAL — superseded |
 | `04-providers.md` — third occurrence | `id` only (no `name`); `supports(media: CanonicalMedia)`; `resolve(query: SourceQuery, ctx)` (query-object style) | HISTORICAL — a structurally different, abandoned draft, superseded |
 | `04-providers.md` — fifth occurrence | Adds `readonly capabilities: SourceCapabilities` but keeps single `supports(MediaRef)` and `resolve(MediaRef, ...)` | HISTORICAL — an intermediate step toward the frozen shape, superseded |
-| `04-providers.md` — sixth/last occurrence | Matches the frozen shape exactly except omitting `health()` | **This is the frozen shape's primary source** — `health()` was added back in per `ADR-001`'s synthesis rationale |
+| `04-providers.md` — sixth/last occurrence | Matches the frozen shape exactly, plus `readonly name`/`readonly capabilities` (now split into the optional `Named`/`CapabilityDeclaring` interfaces above) | **This is the frozen shape's primary source** — `health()`/`name`/`capabilities` were moved to optional extension interfaces per `ADR-001`'s amendment |
 
 Invariants that bind every implementation of this interface (see
 `docs/architecture/04-providers.md` and `docs/architecture/05-policy.md`
@@ -91,9 +114,10 @@ for the rationale behind each):
   candidate unless the adapter holds real evidence; the default for
   unknown status is `"unknown"`, never a silently-upgraded `"authorized"`
   (see `docs/architecture/05-policy.md`).
-- `health()` reports *liveness*, not permission — a healthy adapter is not
-  automatically an authorized one (see `docs/architecture/05-policy.md`,
-  "Trusted vs untrusted providers").
+- If an adapter implements `HealthCheckable`, `health()` reports
+  *liveness*, not permission — a healthy adapter is not automatically an
+  authorized one (see `docs/architecture/05-policy.md`, "Trusted vs
+  untrusted providers").
 
 - An adapter MUST NOT read ambient globals (env vars, filesystem, network
   config) directly; everything it needs arrives through `ResolveContext`
@@ -165,49 +189,66 @@ export interface HealthResult {
 
 ## Provider / adapter registry
 
-> **RESOLVED by `ADR-003` (2026-09-29).** `SourceRegistry` (sources only)
-> is the V0.1-frozen registry. The generalized `ProviderRegistry<T>` below
-> is explicitly **PROPOSED / DEFERRED to V0.2+**, for when metadata,
-> subtitle, or catalog providers are introduced (none exist in V0.1 scope
-> — see `docs/architecture/13-roadmap.md`). See
-> [`ADR-003`](../decisions/ADR-003-provider-registry-ownership.md).
+> **RESOLVED by `ADR-003` (2026-09-29) and `ADR-006` (2026-09-29, second
+> session).** `SourceRegistry` (sources only) is the V0.1-frozen registry.
+> The generalized `ProviderRegistry<T>` below is explicitly **PROPOSED /
+> DEFERRED to V0.2+**, for when metadata, subtitle, or catalog providers
+> are introduced (none exist in V0.1 scope — see
+> `docs/architecture/13-roadmap.md`). Separately, `ADR-006` fixed the
+> registry's own method signatures (they previously referenced a removed
+> method) and drew an explicit boundary between the registry and
+> admission. See
+> [`ADR-003`](../decisions/ADR-003-provider-registry-ownership.md) and
+> [`ADR-006`](../decisions/ADR-006-source-registry-admission-boundary.md).
 
-Two shapes appear across the design's evolution:
+### Semantic model
 
-> **OPEN-11 — follow-up from `ADR-001`, non-blocking for freeze, blocking
-> for implementation.** The `SourceRegistry.applicable()` method below
-> still calls `adapter.supports(media)`, a method that no longer exists on
-> the frozen `SourceAdapter` (replaced by `supportsMedia`/
-> `supportsIdentity` per `ADR-001`). This code sample was not rewritten to
-> avoid inventing an unreviewed two-stage filtering method signature. An
-> implementer MUST NOT copy this method verbatim — a corresponding
-> `ADR-006` (or a straightforward two-method split, e.g.
-> `applicableByMedia(media: MediaRef)` and
-> `applicableByIdentity(identities: readonly ExternalIdentity[])`) is
-> needed before `SourceRegistry` can be implemented. See
-> `docs/decisions/README.md`.
+```
+DECLARATION
+     ↓
+ADMISSION       (docs/architecture/05-policy.md: SourceDeclaration → evaluateAdmission() → AdmissionDecision)
+     ↓
+COMPOSITION     (only admitted adapters are ever constructed/registered)
+     ↓
+EXECUTION       (SourceRegistry, below)
+```
+
+`SourceRegistry` holds only adapters that have already been admitted —
+admission itself is decided upstream, in the control plane
+(`docs/architecture/05-policy.md`), before an adapter is ever constructed
+or passed to `register()`. Explicitly:
+
+```text
+SourceRegistry ≠ Admission Authority
+SourceRegistry ≠ Policy Engine
+SourceRegistry ≠ Health Authority
+SourceRegistry ≠ Provider Discovery System
+```
+
+### `SourceRegistry` (V0.1-frozen)
 
 ```ts
-// Early, single-purpose shape (sources only) — see OPEN-11 above
-export class SourceRegistry {
-  private readonly adapters = new Map<string, SourceAdapter>();
+export interface SourceRegistry {
+  register(adapter: SourceAdapter): void;
 
-  register(adapter: SourceAdapter): void {
-    if (this.adapters.has(adapter.id)) {
-      throw new Error(`duplicate_adapter:${adapter.id}`);
-    }
-    this.adapters.set(adapter.id, adapter);
-  }
+  all(): readonly SourceAdapter[];
 
-  all(): readonly SourceAdapter[] {
-    return [...this.adapters.values()];
-  }
+  /** Pre-identity-resolution filter, using SourceAdapter.supportsMedia(). */
+  applicableByMedia(media: MediaRef): readonly SourceAdapter[];
 
-  applicable(media: MediaRef): readonly SourceAdapter[] {
-    return this.all().filter(adapter => adapter.supports(media));
-  }
+  /** Post-identity-resolution filter, using SourceAdapter.supportsIdentity(). */
+  applicableByIdentity(
+    identities: readonly ExternalIdentity[]
+  ): readonly SourceAdapter[];
 }
 ```
+
+This replaces an earlier code sample whose single `applicable(media)`
+method called a `supports()` method that no longer exists on
+`SourceAdapter` after `ADR-001` — see `ADR-006` for the full history
+(`OPEN-11`).
+
+### `ProviderRegistry<T>` (deferred, V0.2+)
 
 ```ts
 // Later, generalized shape (any provider kind: source, metadata, subtitle)
@@ -228,22 +269,23 @@ dynamic/arbitrary adapter registration via HTTP or any other externally
 reachable interface — this is a standing security invariant, not just an
 implementation detail (see `docs/architecture/05-policy.md`).
 
-> **OPEN-13 — newly discovered, BLOCKING, not resolved this pass.**
-> `docs/architecture/04-providers.md`'s "Registry redesign" section
-> defines a materially different, admission-lifecycle-integrated
-> `SourceRegistry` that stores `RegisteredSource { declaration:
-> SourceDeclaration; admission: AdmissionDecision; adapter?: SourceAdapter
-> }` and exposes `executable(): SourceAdapter[]`, driven by
-> `docs/architecture/05-policy.md`'s `evaluateAdmission()`. This was not
-> reconciled with the simpler `register(adapter)/all()/applicable(media)`
-> shape frozen above. Do not assume the two are the same registry, and do
-> not assume one supersedes the other — an implementer must not guess
-> whether admission-lifecycle state belongs inside `SourceRegistry` or one
-> layer upstream of it. See `OPEN-13` in `docs/decisions/README.md`.
+### Admission (not part of this contract, cross-referenced)
+
+`docs/architecture/04-providers.md`'s "Registry redesign" section and
+`docs/architecture/05-policy.md`'s `SourceDeclaration`/`AdmissionDecision`/
+`evaluateAdmission()` describe the **admission process** — how the
+composition root decides which declared sources are allowed to become
+registered adapters. This is a real, load-bearing part of the
+architecture, but it is not the `SourceRegistry` contract itself; see
+`ADR-006` for why these are different layers, not competing registry
+designs.
 
 ## Related contracts
 
 - Candidate/stream shapes produced by `resolve()`: `docs/contracts/stream.md`
-- Identity types passed in via `MediaRef`: `docs/contracts/identity.md`
+- Identity types passed in via `MediaRef`/`CanonicalMedia`: `docs/contracts/identity.md`
 - Runtime primitives that construct `ResolveContext`: `docs/contracts/runtime.md`
 - Evidence semantics for anything an adapter reports: `docs/contracts/evidence.md`
+- Per-adapter execution evidence (`AdapterExecution`) and the final
+  request-level outcome (`ResolutionResult`) that consumes `resolve()`'s
+  output: `docs/contracts/result.md`
