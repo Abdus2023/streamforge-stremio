@@ -3,13 +3,21 @@
 This directory packages the repeatable processes used across this
 repository's multi-pass documentation/contract normalization work
 (Tasks 1–4: initial monolith split, contradiction audits, ADR authoring,
-registry/result/evidence boundary decisions, and freeze-gate reporting)
-into reusable [Agent Skills](https://agentskills.io/specification) —
-each a self-contained `SKILL.md` plus, where useful, real executable
-scripts and templates. They are generic: nothing in them is specific to
-StreamForge, so the whole `.claude/skills/` directory can be copied into
-any other "documentation-as-contract" repository (architecture docs that
-specify interfaces before code exists) and reused as-is.
+registry/result/evidence boundary decisions, and freeze-gate reporting),
+plus a second layer of general-purpose repository-hygiene skills found by
+researching common gaps across public repositories and Agent Skill
+libraries more broadly (git-sync verification, dependency vulnerability
+auditing, secret-leak scanning, agent-onboarding-file auditing), into
+reusable [Agent Skills](https://agentskills.io/specification) — each a
+self-contained `SKILL.md` plus, where useful, real executable scripts and
+templates. They are generic: nothing in them is specific to StreamForge,
+so the whole `.claude/skills/` directory can be copied into any other
+repository and reused as-is — the documentation-normalization skills are
+most relevant to a "documentation-as-contract" repository specifically
+(architecture docs that specify interfaces before code exists), while the
+repository-hygiene skills (`session-git-sync-check`,
+`dependency-vulnerability-audit`, `secret-leak-scan`,
+`repo-onboarding-audit`) apply to essentially any git repository.
 
 ## What's here
 
@@ -22,6 +30,9 @@ specify interfaces before code exists) and reused as-is.
 | [`adr-writer`](./adr-writer/) | Writes an Architecture Decision Record resolving a found contradiction and keeps the decision ledger in sync. Templates + a status-discipline reference. | `doc-symbol-audit` |
 | [`contract-freeze-gate`](./contract-freeze-gate/) | Regenerates a documentation-audit artifact from current `HEAD` and evaluates a named freeze-gate checklist to a `READY`/`BLOCKED` verdict. | `docs-integrity-check`, `adr-writer` |
 | [`authorization-boundary-scan`](./authorization-boundary-scan/) | Heuristically scans source + dependencies (never docs) for unauthorized-distribution/access-control-bypass patterns — a proactive compliance gate for the project's explicit legal/authorization boundary. Real, tested script (`scan_authorization_boundary.py`), verified clean on this repo's actual `src/` and confirmed to correctly flag injected violations. | — |
+| [`secret-leak-scan`](./secret-leak-scan/) | Zero-dependency heuristic scanner (`scan_secrets.py`) for hardcoded credentials (AWS/GitHub/Slack/Stripe/Google keys, private key blocks, generic password/token assignments) in the current working tree. Verified clean on this repo's real `src/test/docs`, and confirmed to correctly flag injected AWS/GitHub/private-key secrets while suppressing an env-var-sourced value and an obvious placeholder. Not a replacement for gitleaks/trufflehog in real CI — see its Notes. | — |
+| [`dependency-vulnerability-audit`](./dependency-vulnerability-audit/) | Detects a project's package manager from its lockfile and runs the matching native audit tool (`npm audit`/`pip-audit`/`cargo audit`), normalizing the result to a severity summary. Real script (`run_dependency_audit.sh`), verified against this repo's real `package-lock.json` (0 vulnerabilities) and against a deliberately pinned known-vulnerable package in a throwaway project (correctly flagged `critical: 1`, exit 1). | — |
+| [`repo-onboarding-audit`](./repo-onboarding-audit/) | Checks for an agent-onboarding file (`AGENTS.md`/`AGENT.md`/`CLAUDE.md`), flags documented commands that no longer match real `package.json` scripts, and can generate a draft from real manifest facts only. Real script (`audit_agents_md.py`) — confirmed this very repo had no onboarding file (a genuine gap), generated its actual `AGENTS.md` (hand-reviewed and extended afterward), and separately verified drift detection against an injected stale file. | — |
 | [`docs-normalization-commit-plan`](./docs-normalization-commit-plan/) | Plans and executes a coherent, ordered git commit sequence for a normalization pass, docs-only, no fabricated test/CI evidence. | `docs-integrity-check`, `session-git-sync-check` |
 | [`contract-implementation-sync`](./contract-implementation-sync/) | Bridges a frozen contract to its implementation: a real field-for-field parity checker (`check_contract_parity.py`) catching drift between `docs/contracts/*.md` and actual source, plus the `DESIGNED`→`IMPLEMENTED`→`VERIFIED` status-update discipline. Verified against this repo's real V0.1 implementation slice — all 11 checked symbols pass field-for-field, and the tool was confirmed to correctly detect an injected mismatch. | `doc-symbol-audit`, `adr-writer` |
 | [`contract-normalization-pass`](./contract-normalization-pass/) | Top-level orchestrator tying all of the above into the full end-to-end pass (repo sync check → monolith migration → audit → freeze → implementation sync), plus the two final-report templates (short/long) actually used this session. | all of the above |
@@ -30,13 +41,38 @@ specify interfaces before code exists) and reused as-is.
 ## Where each process from this session ended up
 
 - **The sandboxed environment silently re-cloning the repository onto a
-  stale base commit mid-session** (discovered and manually diagnosed/
-  recovered from three separate times across this session — via
-  `git fetch` + `git log` comparison + `git reset --hard`/`git
-  cherry-pick`, each time catching it before any push could go wrong) →
-  `session-git-sync-check`'s script and its three-outcome diagnosis
-  (stale/ancestor, ahead-of-remote, genuinely diverged), reproducing all
-  three scenarios in test clones before being trusted.
+  stale base commit mid-session** (this recurred a fourth time while
+  researching this very layer of skills — that time with a genuinely
+  dirty working tree sitting on the stale base, not a clean one,
+  requiring a new WIP-snapshot-and-diff recovery path; root-caused to
+  `.git/config` not reliably persisting across turns in this sandbox,
+  consistent with credential-related files being excluded from cross-turn
+  snapshots) → `session-git-sync-check`'s script and its diagnosis
+  branches (clean stale/ancestor, dirty stale/ancestor, ahead-of-remote,
+  genuinely diverged), each reproduced faithfully in throwaway test
+  clones — including using `git update-ref` rather than `git reset
+  --hard` to simulate the dirty case accurately, after an initial,
+  less-faithful test with `reset --hard` revealed the recovery recipe
+  would be destructive if blindly applied to a *genuinely* stale working
+  tree (not just stale git metadata) — hence the mandatory `git diff
+  --stat` safety check the script now prints before its apply step.
+- **Researching public conventions for how other repositories guide
+  coding agents** (the open `AGENTS.md` standard, adopted by tens of
+  thousands of public repositories) surfaced that this repository itself
+  had no onboarding file at all → `repo-onboarding-audit`, whose
+  `generate` mode was used to create this repo's real `AGENTS.md` from
+  its actual `package.json` facts, then hand-extended with pointers into
+  `docs/contracts/`, the legal/authorization boundary, and this skills
+  directory.
+- **Checking this repo's own dependency tree and source tree for two
+  extremely common public-repository gaps** (known-vulnerable pinned
+  dependencies, and accidentally committed credentials) → both came back
+  genuinely clean here (`npm audit`: 0 vulnerabilities;
+  `secret-leak-scan`: 0 hits), but both checks were verified as
+  real/working via deliberately injected true-positive cases (a pinned
+  `minimist@0.0.8` with a public critical CVE; fake AWS/GitHub/private
+  keys) before trusting the clean result → `dependency-vulnerability-audit`
+  and `secret-leak-scan`.
 - **Verifying the actual V0.1 implementation slice** (running `npm
   install`/`npm run typecheck`/`npm test` for real and getting genuine
   evidence — 0 typecheck errors, 5/5 tests passing — plus finding that
@@ -107,11 +143,24 @@ trigger the specific skill directly (e.g. "check the docs for broken
 links" → `docs-integrity-check`; "does this interface get redefined
 anywhere?" → `doc-symbol-audit`; "does the code still match the frozen
 contracts?" → `contract-implementation-sync`; "check for
-piracy/DRM-bypass code" → `authorization-boundary-scan`; "make this
-workflow into a skill" → `skill-creator`).
+piracy/DRM-bypass code" → `authorization-boundary-scan`; "check for
+leaked secrets/API keys" → `secret-leak-scan`; "any known-vulnerable
+dependencies?" → `dependency-vulnerability-audit`; "does this repo have
+an AGENTS.md?" → `repo-onboarding-audit`; "make this workflow into a
+skill" → `skill-creator`).
 
-All scripts are dependency-free (bash + Python 3 standard library only)
-and have been smoke-tested against this repository's own `docs/` tree as
-part of building this skill set. Every skill in this directory passes
-`skill-creator/scripts/validate_skill.py --all .claude/skills` with zero
-errors.
+For a first look at any unfamiliar repository (not just this one), a
+reasonable general-purpose opening sequence is: `session-git-sync-check`
+→ `repo-onboarding-audit check` → `dependency-vulnerability-audit` →
+`secret-leak-scan` — none of the four depend on the documentation-
+normalization skills or on this being a "documentation-as-contract"
+project specifically.
+
+All scripts are dependency-free (bash + Python 3 standard library only,
+using each ecosystem's own native tool for `dependency-vulnerability-
+audit` specifically) and have been tested against this repository's own
+real `docs/`, `src/`, `package.json`, and git history as part of building
+this skill set — including deliberately injected true-positive cases for
+every scanner-shaped skill, not just clean-pass smoke tests. Every skill
+in this directory passes `skill-creator/scripts/validate_skill.py --all
+.claude/skills` with zero errors.

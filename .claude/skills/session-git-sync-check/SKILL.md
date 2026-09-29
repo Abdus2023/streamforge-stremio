@@ -46,19 +46,33 @@ discard real history. It can also make a final report describe a
 
 2. **If it reports a mismatch, read the diagnosis before acting** — it
    distinguishes three cases and gives the exact next commands for each:
-   - **Local is an ancestor of remote** (the stale-clone bug): check
-     `git status --short` for uncommitted local work first. If clean,
-     `git reset --hard <remote-tip>` is safe. If you already made a new
-     commit on top of the stale base this turn, back it up with
-     `git branch backup-<label> <local-head>` first, reset, then
-     `git cherry-pick` the backed-up commit forward.
+   - **Local is an ancestor of remote** (the stale-clone bug — by
+     definition no new local commit exists yet in this case, since a new
+     commit would break the ancestor relationship): check
+     `git status --short` for uncommitted local work first.
+     - If clean, `git reset --hard <remote-tip>` is safe.
+     - **If dirty** (uncommitted edits/untracked files sitting on top of
+       the stale base — this happened for real, not just clean-ancestor,
+       in the session this addition was extracted from): snapshot
+       everything into a throwaway commit first (`git add -A && git
+       commit -m 'WIP...'`), back that commit up to a branch, diff it
+       against the remote tip, **read the `git diff --stat` output as a
+       mandatory safety check** (it should show only small
+       additions/changes — this turn's real new work; if it instead shows
+       large-scale deletions of files that obviously belong in the
+       project, STOP, don't apply, fall back to manual file-by-file
+       inspection instead), then reset to the remote tip and apply just
+       that diff. The script prints the exact commands.
    - **Local is ahead of remote** (normal case — just hasn't been pushed
      yet): just push.
-   - **Diverged** (neither is an ancestor of the other): this is more
-     serious and script-based auto-recovery isn't safe — inspect both
-     tips manually with the printed `git log` commands before deciding
-     how to reconcile. Never force-push out of this state without
-     understanding exactly what would be discarded.
+   - **Diverged** (neither is an ancestor of the other, including the
+     case of a genuinely new local commit made on top of a now-stale
+     base): this is more serious and script-based auto-recovery isn't
+     safe — inspect both tips manually with the printed `git log`
+     commands, then back up the new commit(s) to a branch, reset to the
+     remote tip, and `git cherry-pick` them forward. Never force-push out
+     of this state without understanding exactly what would be
+     discarded.
 
 3. **After any recovery action, re-run the script** to confirm local
    `HEAD` now matches the remote tip exactly before doing anything else.
@@ -83,3 +97,25 @@ discard real history. It can also make a final report describe a
   changes as untracked/modified relative to the correct tip, those are
   genuine new edits made this turn (not a re-clone artifact) — proceed to
   commit them normally.
+- **A fourth real occurrence, with a likely root cause identified.** This
+  bug recurred again, mid-session, while building this very skill's
+  sibling skills — and that time `git status --short` was *dirty*, not
+  clean, requiring the WIP-snapshot-and-diff recovery above (verified
+  safe in a faithful throwaway-clone simulation using `git update-ref` to
+  move only the ref, not `git reset --hard`, which would incorrectly also
+  reset the working tree and not reproduce the real bug). Investigating
+  that occurrence found the local `.git/config` had reverted to a bare
+  fresh-clone shape (only a fetch refspec for `main`, no tracking
+  configuration for the actual working branch) even though `origin`'s URL
+  was still correct — consistent with a sandboxed session-restore
+  mechanism that doesn't reliably persist `.git/config` (this platform's
+  own tooling explicitly excludes `.git/config`, `.git/credentials`,
+  `.git-credentials`, and `.netrc` from cross-turn snapshots, for
+  credential-safety reasons) while the ordinary tracked working-tree files
+  persist normally. Practical upshot: `scripts/git_sync_check.sh` already
+  fetches by explicit branch name (`git fetch origin <branch>`, populating
+  `FETCH_HEAD`) rather than relying on a pre-configured remote-tracking
+  ref, specifically so it keeps working even if `.git/config`'s branch
+  tracking has gone stale — don't "simplify" it to a bare `git fetch`
+  followed by reading `origin/<branch>`, since that silently returns wrong
+  (or missing-ref) results exactly when this bug is active.
